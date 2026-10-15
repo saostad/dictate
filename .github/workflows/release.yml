@@ -33,10 +33,6 @@ jobs:
           - asset: dictate-linux-x86_64
             os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
-            flags: ""
-          - asset: dictate-linux-x86_64-system-ort
-            os: ubuntu-24.04
-            target: x86_64-unknown-linux-gnu
             flags: --no-default-features --features system-ort
           - asset: dictate-linux-aarch64
             os: ubuntu-24.04-arm
@@ -62,6 +58,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: release-${{ matrix.asset }}
+      - uses: actions/cache@v4
+        with:
+          path: .model
+          key: parakeet-tdt-0.6b-v2-int8-0bbb45a
+      - name: Download ONNX Runtime (Linux x86_64)
+        if: matrix.asset == 'dictate-linux-x86_64'
+        run: |
+          set -eu
+          URL="https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz"
+          EXPECTED="cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57"
+          curl -fsSL -o /tmp/ort.tgz "$URL"
+          ACTUAL="$(shasum -a 256 /tmp/ort.tgz | awk '{print $1}')"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "SHA256 mismatch for $URL: expected $EXPECTED, got $ACTUAL"
+            exit 1
+          fi
+          mkdir -p /tmp/ort
+          tar -xzf /tmp/ort.tgz -C /tmp/ort
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.flags }}
       - name: Smoke test (Unix)
@@ -71,7 +85,7 @@ jobs:
         if: runner.os == 'Windows'
         run: .\target\${{ matrix.target }}\release\dictate.exe help
       - name: Show linked libraries (Linux bundled builds)
-        if: runner.os == 'Linux' && !contains(matrix.asset, 'system-ort')
+        if: runner.os == 'Linux' && matrix.asset != 'dictate-linux-x86_64'
         run: ldd target/${{ matrix.target }}/release/dictate
       - name: Package archive (Unix)
         if: runner.os != 'Windows'
@@ -92,6 +106,12 @@ jobs:
           done
           if [ "$found" = 0 ]; then
             echo "  (none)"
+          fi
+          if [ "$ASSET" = "dictate-linux-x86_64" ]; then
+            cp /tmp/ort/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so.1.31.0 "$ASSET/libonnxruntime.so"
+            cp /tmp/ort/onnxruntime-linux-x64-1.31.0/LICENSE "$ASSET/LICENSE-onnxruntime"
+            echo "  libonnxruntime.so (from Microsoft onnxruntime-linux-x64-1.31.0)"
+            echo "  LICENSE-onnxruntime (MIT, Microsoft)"
           fi
           tar -czf "$ASSET.tar.gz" "$ASSET"
       - name: Package archive (Windows)
@@ -126,6 +146,46 @@ jobs:
           $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
           "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
           Get-Content "$archive.sha256"
+      - name: Check packaged binary transcribes (Unix)
+        if: runner.os != 'Windows'
+        env:
+          DICTATE_MODEL_DIR: ${{ github.workspace }}/.model
+        run: |
+          set -eu
+          ASSET="${{ matrix.asset }}"
+          if [ ! -f .model/encoder-model.int8.onnx ]; then
+            ./target/${{ matrix.target }}/release/dictate download
+          fi
+          rm -rf e2e-check
+          mkdir e2e-check
+          tar -xzf "$ASSET.tar.gz" -C e2e-check
+          if [ "$ASSET" = "dictate-linux-x86_64" ]; then
+            unset ORT_DYLIB_PATH
+          fi
+          OUT="$(./e2e-check/"$ASSET"/dictate transcribe tests/fixtures/jfk.wav)"
+          echo "$OUT"
+          echo "$OUT" | tr '[:upper:]' '[:lower:]' | grep -q "ask not what your country" || {
+            echo "transcription check failed: expected 'ask not what your country' in stdout"
+            exit 1
+          }
+      - name: Check packaged binary transcribes (Windows)
+        if: runner.os == 'Windows'
+        env:
+          DICTATE_MODEL_DIR: ${{ github.workspace }}/.model
+        run: |
+          $target = "${{ matrix.target }}"
+          if (-not (Test-Path ".model/encoder-model.int8.onnx")) {
+            & ".\target\$target\release\dictate.exe" download
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          }
+          Remove-Item -Recurse -Force e2e-check -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path e2e-check | Out-Null
+          Expand-Archive -Path "${{ matrix.asset }}.zip" -DestinationPath e2e-check
+          $out = & ".\e2e-check\${{ matrix.asset }}\dictate.exe" transcribe tests/fixtures/jfk.wav
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          echo $out
+          $lower = ($out | Out-String).ToLower()
+          if ($lower -notmatch "ask not what your country") { Write-Error "transcription check failed: expected 'ask not what your country' in stdout"; exit 1 }
       - uses: actions/upload-artifact@v4
         if: runner.os != 'Windows'
         with:
@@ -165,8 +225,7 @@ jobs:
 
             | Your system | File |
             |---|---|
-            | Linux, x86_64 (most PCs) | `dictate-linux-x86_64.tar.gz` |
-            | Linux, x86_64, CPU without AVX2 | `dictate-linux-x86_64-system-ort.tar.gz` (needs a system ONNX Runtime, see below) |
+            | Linux, x86_64 (most PCs) | `dictate-linux-x86_64.tar.gz` (works on any x86_64 CPU, no ONNX Runtime install needed) |
             | Linux, aarch64 | `dictate-linux-aarch64.tar.gz` |
             | macOS, Apple Silicon | `dictate-macos-aarch64.tar.gz` |
             | Windows, x86_64 | `dictate-windows-x86_64.zip` |
@@ -174,12 +233,6 @@ jobs:
             There is no Intel macOS build (ONNX Runtime ships no prebuilt library for it).
 
             The Linux binaries need glibc 2.39+ (Ubuntu 24.04+, Fedora 40+, Arch).
-
-            **CPUs without AVX2:** if the regular Linux x86_64 binary exits with
-            "This CPU has no AVX2, but this build bundles an ONNX Runtime that needs AVX2",
-            use the `-system-ort` archive instead and install ONNX Runtime first
-            (`sudo pacman -S onnxruntime-cpu`, or download ONNX Runtime and set
-            `ORT_DYLIB_PATH` to the full path of the library file).
 
             ## First run
 

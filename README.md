@@ -13,8 +13,7 @@ Download the archive for your OS from
 
 | OS | CPU | File |
 |---|---|---|
-| Linux | x86_64 | `dictate-linux-x86_64.tar.gz` |
-| Linux (CPUs without AVX2) | x86_64 | `dictate-linux-x86_64-system-ort.tar.gz` |
+| Linux | x86_64 | `dictate-linux-x86_64.tar.gz` (works on any x86_64 CPU, no ONNX Runtime install needed) |
 | Linux | aarch64 | `dictate-linux-aarch64.tar.gz` |
 | macOS | Apple Silicon | `dictate-macos-aarch64.tar.gz` |
 | Windows | x86_64 | `dictate-windows-x86_64.zip` |
@@ -71,22 +70,8 @@ global hotkey (Ctrl+Shift+Space by default).
 On Wayland, bind `dictate toggle` (or `start`/`stop`) in your compositor;
 see [Use it](#use-it).
 
-Most x86_64 PCs want `dictate-linux-x86_64.tar.gz`. If your CPU has no
-AVX2, that binary exits with:
-
-```text
-This CPU has no AVX2, but this build bundles an ONNX Runtime that needs AVX2. Download the prebuilt Linux release from https://github.com/saostad/dictate/releases/latest (it works on any x86_64 CPU), or rebuild with: cargo build --release --no-default-features --features system-ort
-```
-
-In that case use `dictate-linux-x86_64-system-ort.tar.gz` instead,
-together with a system ONNX Runtime:
-
-```sh
-sudo pacman -S onnxruntime-cpu
-```
-
-or download ONNX Runtime and set ORT_DYLIB_PATH to the full path of the
-onnxruntime library file.
+The x86_64 binary bundles ONNX Runtime and works on any x86_64 CPU, no
+ONNX Runtime install needed.
 
 ## Build
 
