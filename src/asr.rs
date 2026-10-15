@@ -131,13 +131,149 @@ pub(crate) fn decapitalize_continuation(piece: &str) -> String {
     }
 }
 
-/// True when the piece ends a sentence (previous piece ended, so the next one
-/// keeps the model's capitalization).
-pub(crate) fn ends_sentence(piece: &str) -> bool {
-    piece
-        .chars()
+/// Punctuation held back between streaming pieces.
+const BOUNDARY_PUNCT: &[char] = &['.', ',', '!', '?', ';', ':'];
+
+/// Trailing punctuation of one word (`.,?!;:`), if any.
+pub(crate) fn trailing_punct(word: &str) -> Option<char> {
+    word.chars()
         .last()
-        .is_some_and(|last| matches!(last, '.' | '?' | '!'))
+        .filter(|last| BOUNDARY_PUNCT.contains(last))
+}
+
+/// Punctuation the context decode attaches to the last context word before
+/// the boundary (None when the context region holds no words or no trailing
+/// punctuation).
+pub(crate) fn boundary_punct_before(words: &[Word], context_s: f32) -> Option<char> {
+    words
+        .iter()
+        .rfind(|word| (word.start + word.end) / 2.0 < context_s)
+        .and_then(|word| trailing_punct(&word.text))
+}
+
+/// Join one streaming piece onto already-typed text.
+///
+/// `prev_tail_words` are the last up to 2 typed words (for overlap dedupe).
+/// `pending_punct` is the previous piece's held trailing punctuation: it is
+/// superseded by `context_boundary_punct` (typed instead, or dropped when the
+/// context has none) and only reaches the page at `End`, so this function
+/// takes it to make the replacement explicit and then ignores it.
+/// `context_boundary_punct` is the punctuation from the context decode on the
+/// last context word before the boundary. `kept_words` are the current
+/// piece's decoded word texts (at/after the boundary).
+///
+/// Returns the text to type (boundary punctuation plus spacing included) and
+/// the new pending trailing punctuation (held for the next boundary or `End`).
+pub(crate) fn join_piece(
+    prev_tail_words: &[String],
+    pending_punct: Option<char>,
+    context_boundary_punct: Option<char>,
+    kept_words: &[String],
+) -> (String, Option<char>) {
+    let _ = pending_punct;
+    let mut kept: Vec<String> = kept_words.to_vec();
+    // Strip leading punctuation (standalone tokens and prefixes).
+    while !kept.is_empty() {
+        let stripped = kept[0].trim_start_matches(BOUNDARY_PUNCT).to_string();
+        if stripped.is_empty() {
+            kept.remove(0);
+        } else {
+            if stripped.len() != kept[0].len() {
+                kept[0] = stripped;
+            }
+            break;
+        }
+    }
+    // Overlap dedupe: drop the first 1-2 kept words when they equal the last
+    // 1-2 typed words (case and punctuation-insensitive).
+    dedupe_overlap(prev_tail_words, &mut kept);
+    // Hold back the new trailing punctuation.
+    let mut new_pending = None;
+    if let Some(last) = kept.last_mut()
+        && let Some(punct) = trailing_punct(last)
+    {
+        new_pending = Some(punct);
+        last.pop();
+        if last.is_empty() {
+            kept.pop();
+        }
+    }
+    // Mid-sentence continuations keep the model's capitalization only after a
+    // sentence-ending boundary; the first piece keeps it always.
+    if !prev_tail_words.is_empty()
+        && !kept.is_empty()
+        && !matches!(context_boundary_punct, Some('.' | '?' | '!'))
+    {
+        kept[0] = decapitalize_continuation(&kept[0]);
+    }
+    let dummy: Vec<Word> = kept
+        .iter()
+        .map(|text| Word {
+            text: text.clone(),
+            start: 0.0,
+            end: 0.0,
+        })
+        .collect();
+    let joined = join_words(&dummy);
+    if prev_tail_words.is_empty() {
+        return (joined, new_pending);
+    }
+    if joined.is_empty() {
+        let boundary = context_boundary_punct
+            .map(|c| c.to_string())
+            .unwrap_or_default();
+        return (boundary, new_pending);
+    }
+    match context_boundary_punct {
+        Some(boundary) => (format!("{boundary} {joined}"), new_pending),
+        None => (format!(" {joined}"), new_pending),
+    }
+}
+
+/// Drop the first 1-2 kept words when they repeat the last typed words.
+/// Comparison is lowercase with punctuation removed; empty normalizations
+/// never match.
+fn dedupe_overlap(prev_tail_words: &[String], kept: &mut Vec<String>) {
+    fn norm(word: &str) -> String {
+        word.chars()
+            .filter(|c| c.is_alphanumeric())
+            .collect::<String>()
+            .to_lowercase()
+    }
+    if kept.is_empty() || prev_tail_words.is_empty() {
+        return;
+    }
+    if kept.len() >= 2 && prev_tail_words.len() >= 2 {
+        let prev_len = prev_tail_words.len();
+        let kept0 = norm(&kept[0]);
+        let kept1 = norm(&kept[1]);
+        let prev0 = norm(&prev_tail_words[prev_len - 2]);
+        let prev1 = norm(&prev_tail_words[prev_len - 1]);
+        if !kept0.is_empty() && !kept1.is_empty() && kept0 == prev0 && kept1 == prev1 {
+            kept.drain(..2);
+            return;
+        }
+    }
+    let Some(prev_last) = prev_tail_words.last() else {
+        return;
+    };
+    let kept0 = norm(&kept[0]);
+    if !kept0.is_empty() && kept0 == norm(prev_last) {
+        kept.drain(..1);
+    }
+}
+
+/// Record the words a successful `type_text` call added: split on whitespace,
+/// dropping a leading boundary-punctuation token (it attaches to the previous
+/// word rather than starting a new one).
+pub(crate) fn append_typed_words(typed_words: &mut Vec<String>, to_type: &str) {
+    let mut words = to_type.split_whitespace();
+    if let Some(first) = words.clone().next()
+        && first.chars().all(|c| BOUNDARY_PUNCT.contains(&c))
+    {
+        words.next();
+    }
+    typed_words.extend(words.map(|word| word.to_string()));
 }
 
 fn decapitalize_word(word: &str) -> String {
@@ -189,33 +325,35 @@ impl Asr {
             .collect())
     }
 
-    /// Transcribe one streaming segment. Segments after the first are decoded
-    /// with left `context` audio (the trailing audio before the segment) for
-    /// accuracy at the cut, then trimmed to the words at/after the context
-    /// boundary. The first segment (empty context) decodes alone, exactly as
-    /// before. `mid_sentence` lowercases the first word unless it is "I" or
-    /// an I-contraction.
-    pub(crate) fn transcribe_segment(
+    /// Transcribe one streaming segment, returning the kept word texts plus
+    /// the boundary punctuation from the context decode. Segments after the
+    /// first are decoded with left `context` audio for accuracy at the cut,
+    /// then trimmed to the words at/after the context boundary; the boundary
+    /// is the trailing punctuation on the last context word before it. The
+    /// first segment (empty context) decodes alone via plain transcribe, split
+    /// into words. Empty results are `(empty, None)` and skipped silently.
+    pub(crate) fn transcribe_segment_pieces(
         &mut self,
         context: &[f32],
         segment: &[f32],
-        mid_sentence: bool,
-    ) -> anyhow::Result<String> {
+    ) -> anyhow::Result<(Vec<String>, Option<char>)> {
         if context.is_empty() {
-            return self.transcribe(segment);
+            let text = self.transcribe(segment)?;
+            if is_empty_transcript(&text) {
+                return Ok((Vec::new(), None));
+            }
+            let words = text.split_whitespace().map(str::to_string).collect();
+            return Ok((words, None));
         }
         let mut audio = Vec::with_capacity(context.len() + segment.len());
         audio.extend_from_slice(context);
         audio.extend_from_slice(segment);
         let words = self.transcribe_words(&audio)?;
         let context_s = context.len() as f32 / 16_000.0;
+        let boundary = boundary_punct_before(&words, context_s);
         let kept = keep_words_after(&words, context_s);
-        let piece = join_words(&kept);
-        if mid_sentence {
-            Ok(decapitalize_continuation(&piece))
-        } else {
-            Ok(piece)
-        }
+        let texts = kept.into_iter().map(|word| word.text).collect();
+        Ok((texts, boundary))
     }
 }
 
@@ -317,14 +455,115 @@ mod tests {
         assert_eq!(decapitalize_continuation("I, for one"), "I, for one");
     }
 
+    fn texts(words: &[&str]) -> Vec<String> {
+        words.iter().map(|word| (*word).to_string()).collect()
+    }
+
     #[test]
-    fn ends_sentence_checks_final_punctuation() {
-        assert!(ends_sentence("you."));
-        assert!(ends_sentence("you?"));
-        assert!(ends_sentence("you!"));
-        assert!(!ends_sentence("you,"));
-        assert!(!ends_sentence("you"));
-        assert!(!ends_sentence(""));
+    fn trailing_punct_finds_final_punctuation() {
+        assert_eq!(trailing_punct("you,"), Some(','));
+        assert_eq!(trailing_punct("you."), Some('.'));
+        assert_eq!(trailing_punct(","), Some(','));
+        assert_eq!(trailing_punct("you"), None);
+        assert_eq!(trailing_punct(""), None);
+    }
+
+    #[test]
+    fn boundary_punct_comes_from_last_context_word() {
+        let words = vec![
+            word("country", 0.5, 0.9),
+            word("you,", 1.0, 1.4),
+            word("ask", 1.6, 1.9),
+        ];
+        assert_eq!(boundary_punct_before(&words, 1.5), Some(','));
+        assert_eq!(boundary_punct_before(&words, 0.4), None);
+        assert!(boundary_punct_before(&[], 1.5).is_none());
+    }
+
+    #[test]
+    fn join_piece_first_piece_holds_trailing_punctuation() {
+        let (text, pending) = join_piece(&[], None, None, &texts(&["And", "so"]));
+        assert_eq!((text.as_str(), pending), ("And so", None));
+        let (text, pending) = join_piece(&[], None, None, &texts(&["hello", "you."]));
+        assert_eq!((text.as_str(), pending), ("hello you", Some('.')));
+    }
+
+    #[test]
+    fn join_piece_segmented_fixture_has_no_double_punctuation() {
+        // `--segmented jfk.wav` joined as `... for you., ask what ...`: the
+        // pending `.` plus a leading `,` both reached the page.
+        let prev = texts(&["for", "you"]);
+        let kept = texts(&[",", "ask", "what"]);
+        let (text, pending) = join_piece(&prev, Some('.'), Some(','), &kept);
+        assert_eq!((text.as_str(), pending), (", ask what", None));
+    }
+
+    #[test]
+    fn join_piece_live_run_keeps_non_overlap_words() {
+        // Live run 1: `... for you, and what ...` ("and" is mis-heard, but the
+        // join must keep it rather than drop or garble it).
+        let prev = texts(&["for", "you"]);
+        let kept = texts(&["and", "what"]);
+        let (text, pending) = join_piece(&prev, Some(','), Some(','), &kept);
+        assert_eq!((text.as_str(), pending), (", and what", None));
+    }
+
+    #[test]
+    fn join_piece_live_run_dedupes_repeated_word() {
+        // Live run 2: `... for you. you, and what ...` (the leading `you,`
+        // repeats the typed `you`).
+        let prev = texts(&["for", "you"]);
+        let kept = texts(&["you,", "and", "what"]);
+        let (text, pending) = join_piece(&prev, Some('.'), Some('.'), &kept);
+        assert_eq!((text.as_str(), pending), (". and what", None));
+    }
+
+    #[test]
+    fn join_piece_live_run_drops_pending_without_context_punct() {
+        // Live run 3: `... country. can do ...` (a period typed mid-sentence;
+        // the context decode has no punctuation, so none is typed).
+        let prev = texts(&["your", "country"]);
+        let kept = texts(&["can", "do"]);
+        let (text, pending) = join_piece(&prev, Some('.'), None, &kept);
+        assert_eq!((text.as_str(), pending), (" can do", None));
+    }
+
+    #[test]
+    fn join_piece_dedupes_two_word_overlap() {
+        let prev = texts(&["can", "do"]);
+        let kept = texts(&["Can", "do", "for"]);
+        let (text, pending) = join_piece(&prev, None, None, &kept);
+        assert_eq!((text.as_str(), pending), (" for", None));
+    }
+
+    #[test]
+    fn join_piece_capitalization_follows_boundary_punctuation() {
+        let prev = texts(&["you"]);
+        let (text, _) = join_piece(&prev, None, Some('.'), &texts(&["Ask"]));
+        assert_eq!(text, ". Ask");
+        let (text, _) = join_piece(&prev, None, Some(','), &texts(&["Ask"]));
+        assert_eq!(text, ", ask");
+        let (text, _) = join_piece(&prev, None, Some(','), &texts(&["I'm", "here"]));
+        assert_eq!(text, ", I'm here");
+    }
+
+    #[test]
+    fn join_piece_deduped_to_empty_types_boundary_only() {
+        let prev = texts(&["for", "you"]);
+        let (text, pending) = join_piece(&prev, Some('.'), Some(','), &texts(&["you"]));
+        assert_eq!((text.as_str(), pending), (",", None));
+    }
+
+    #[test]
+    fn append_typed_words_skips_boundary_token() {
+        let mut typed = texts(&["hello"]);
+        append_typed_words(&mut typed, ", ask what");
+        assert_eq!(typed, texts(&["hello", "ask", "what"]));
+        append_typed_words(&mut typed, ",");
+        assert_eq!(typed, texts(&["hello", "ask", "what"]));
+        let mut fresh = Vec::new();
+        append_typed_words(&mut fresh, "And so");
+        assert_eq!(fresh, texts(&["And", "so"]));
     }
 }
 

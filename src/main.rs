@@ -110,10 +110,13 @@ fn transcribe_segmented(path: &Path) -> anyhow::Result<()> {
     }
     let segments = feeder.finish()?;
     transcribe_segments(&mut asr, &segments, &mut run)?;
-    if !run.has_text {
+    if run.joined.is_empty() {
         let seconds = mono.len() as f32 / rate.max(1) as f32;
         eprintln!("{}", asr::no_speech_message(seconds));
         return Ok(());
+    }
+    if let Some(punct) = run.pending {
+        run.joined.push(punct);
     }
     println!("{}", run.joined);
     Ok(())
@@ -124,8 +127,8 @@ fn transcribe_segmented(path: &Path) -> anyhow::Result<()> {
 struct SegmentRun {
     seq: usize,
     joined: String,
-    has_text: bool,
-    prev_ends_sentence: bool,
+    typed_words: Vec<String>,
+    pending: Option<char>,
 }
 
 /// Transcribe feeder segments like the daemon worker: decode with left
@@ -141,20 +144,29 @@ fn transcribe_segments(
         let seconds = segment.audio.len() as f32 / 16_000.0;
         let context_s = segment.context.len() as f32 / 16_000.0;
         let start = std::time::Instant::now();
-        let mid_sentence = run.has_text && !run.prev_ends_sentence;
-        let text = asr.transcribe_segment(&segment.context, &segment.audio, mid_sentence)?;
+        let (kept_texts, boundary) =
+            asr.transcribe_segment_pieces(&segment.context, &segment.audio)?;
         let ms = start.elapsed().as_millis();
-        if asr::is_empty_transcript(&text) {
+        if kept_texts.is_empty() {
             continue;
         }
         eprintln!(
             "segment {}: {seconds:.1} s audio (context {context_s:.1} s), transcribed in {ms} ms",
             run.seq
         );
-        run.joined
-            .push_str(&daemon::join_segment_text(run.has_text, &text));
-        run.prev_ends_sentence = asr::ends_sentence(&text);
-        run.has_text = true;
+        let tail_start = run.typed_words.len().saturating_sub(2);
+        let (to_type, new_pending) = asr::join_piece(
+            &run.typed_words[tail_start..],
+            run.pending,
+            boundary,
+            &kept_texts,
+        );
+        run.pending = new_pending;
+        if to_type.is_empty() {
+            continue;
+        }
+        run.joined.push_str(&to_type);
+        asr::append_typed_words(&mut run.typed_words, &to_type);
     }
     Ok(())
 }

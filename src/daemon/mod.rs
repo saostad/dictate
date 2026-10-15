@@ -957,33 +957,13 @@ fn feeder_failed(to_worker: &mpsc::Sender<Job>, err: anyhow::Error) {
     }
 }
 
-/// Join one streaming segment onto already-typed text: prepend a space unless
-/// the new text starts with closing punctuation. Shared with `transcribe
-/// --segmented`, which replays the feeder path on a file.
-pub(crate) fn join_segment_text(already_typed: bool, text: &str) -> String {
-    if !already_typed {
-        return text.to_string();
-    }
-    let starts_with_closing = text.chars().next().is_some_and(|first| {
-        matches!(
-            first,
-            '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '\'' | '…'
-        )
-    });
-    if starts_with_closing {
-        text.to_string()
-    } else {
-        format!(" {text}")
-    }
-}
-
 /// Owns the `Asr`: transcribes queued recordings and signals completion.
 /// Never exits while the daemon runs; every failure is logged.
 ///
 /// `Full` is the streaming-off path (today's exact behavior).
 /// `Segment`/`End`/`Cancel` are the streaming path: each segment is typed
-/// as it finishes, at `End` the latency line goes out, and `Cancel`
-/// discards queued segments without typing anything more.
+/// as it finishes, at `End` the pending punctuation plus the latency line go
+/// out, and `Cancel` discards queued segments without typing anything more.
 fn transcribe_worker(
     rx: mpsc::Receiver<Job>,
     proxy: EventLoopProxy<UserEvent>,
@@ -998,8 +978,8 @@ fn transcribe_worker(
     // them before anything more is typed.
     let mut queue: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
     // Per-recording streaming state.
-    let mut typed_any = false;
-    let mut prev_ends_sentence = false;
+    let mut typed_words: Vec<String> = Vec::new();
+    let mut pending_punct: Option<char> = None;
     let mut segments: usize = 0;
     let mut failures: usize = 0;
     let worker_done =
@@ -1026,10 +1006,9 @@ fn transcribe_worker(
                 let seconds = segment.audio.len() as f32 / 16_000.0;
                 let context_s = segment.context.len() as f32 / 16_000.0;
                 let start = Instant::now();
-                let mid_sentence = typed_any && !prev_ends_sentence;
-                let text =
-                    match asr.transcribe_segment(&segment.context, &segment.audio, mid_sentence) {
-                        Ok(text) => text,
+                let (kept_texts, boundary) =
+                    match asr.transcribe_segment_pieces(&segment.context, &segment.audio) {
+                        Ok(pieces) => pieces,
                         Err(err) => {
                             dlog!("error: {err:#}");
                             crate::notify::show(
@@ -1042,7 +1021,7 @@ fn transcribe_worker(
                         }
                     };
                 let transcribe_ms = start.elapsed().as_millis();
-                if crate::asr::is_empty_transcript(&text) {
+                if kept_texts.is_empty() {
                     continue;
                 }
                 // A `Cancel` that arrived mid-transcription discards this
@@ -1054,8 +1033,8 @@ fn transcribe_worker(
                     for _ in 0..=position {
                         queue.pop_front();
                     }
-                    typed_any = false;
-                    prev_ends_sentence = false;
+                    typed_words.clear();
+                    pending_punct = None;
                     segments = 0;
                     failures = 0;
                     if worker_done(&proxy) {
@@ -1063,7 +1042,19 @@ fn transcribe_worker(
                     }
                     continue;
                 }
-                let to_type = join_segment_text(typed_any, &text);
+                let tail_start = typed_words.len().saturating_sub(2);
+                let (to_type, new_pending) = crate::asr::join_piece(
+                    &typed_words[tail_start..],
+                    pending_punct,
+                    boundary,
+                    &kept_texts,
+                );
+                if to_type.is_empty() {
+                    // Deduped to nothing with no boundary: drop the old
+                    // pending without typing.
+                    pending_punct = new_pending;
+                    continue;
+                }
                 let type_start = Instant::now();
                 let typed = match typer.as_mut() {
                     Ok(typer) => typer.type_text(&to_type),
@@ -1072,8 +1063,8 @@ fn transcribe_worker(
                 let type_ms = type_start.elapsed().as_millis();
                 match typed {
                     Ok(()) => {
-                        typed_any = true;
-                        prev_ends_sentence = crate::asr::ends_sentence(&text);
+                        crate::asr::append_typed_words(&mut typed_words, &to_type);
+                        pending_punct = new_pending;
                         dlog!(
                             "segment {seq}: {seconds:.1} s audio (context {context_s:.1} s), transcribed in {transcribe_ms} ms, typed {} chars in {type_ms} ms",
                             to_type.chars().count()
@@ -1095,7 +1086,23 @@ fn transcribe_worker(
                 total_seconds,
                 stop_time,
             } => {
-                if typed_any {
+                if !typed_words.is_empty() {
+                    if let Some(punct) = pending_punct {
+                        let text = punct.to_string();
+                        let typed = match typer.as_mut() {
+                            Ok(typer) => typer.type_text(&text),
+                            Err(err) => Err(anyhow::anyhow!("{err:#}")),
+                        };
+                        if let Err(err) = typed {
+                            dlog!("error: {err:#}");
+                            dlog!("Text that was not typed: {text}");
+                            crate::notify::show(
+                                crate::notify::Kind::Error,
+                                "dictate: could not type the text",
+                                &crate::notify::typing_failure_body(&format!("{err:#}"), &text),
+                            );
+                        }
+                    }
                     dlog!(
                         "done {} ms after stop (total {total_seconds:.1} s audio, {segments} segments)",
                         stop_time.elapsed().as_millis()
@@ -1115,8 +1122,8 @@ fn transcribe_worker(
                         crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
                     }
                 }
-                typed_any = false;
-                prev_ends_sentence = false;
+                typed_words.clear();
+                pending_punct = None;
                 segments = 0;
                 failures = 0;
                 if worker_done(&proxy) {
@@ -1124,8 +1131,8 @@ fn transcribe_worker(
                 }
             }
             Job::Cancel => {
-                typed_any = false;
-                prev_ends_sentence = false;
+                typed_words.clear();
+                pending_punct = None;
                 segments = 0;
                 failures = 0;
                 if worker_done(&proxy) {
@@ -1268,14 +1275,5 @@ mod tests {
             daemon_log_path_for(Path::new("/data")),
             PathBuf::from("/data/daemon.log")
         );
-    }
-
-    #[test]
-    fn segment_joining_spaces_words_but_not_punctuation() {
-        assert_eq!(join_segment_text(false, "hello"), "hello");
-        assert_eq!(join_segment_text(true, "world"), " world");
-        assert_eq!(join_segment_text(true, ", world"), ", world");
-        assert_eq!(join_segment_text(true, ". Next"), ". Next");
-        assert_eq!(join_segment_text(true, "(aside)"), " (aside)");
     }
 }
