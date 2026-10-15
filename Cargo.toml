@@ -30,3 +30,8 @@ winit = "0.30.13"
 default = ["bundled-ort"]
 bundled-ort = ["parakeet-rs/ort-defaults"]
 system-ort = ["parakeet-rs/load-dynamic"]
+
+[target.'cfg(target_os = "linux")'.dependencies]
+wayland-client = "0.31.15"
+wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
+tempfile = "3.27.0"

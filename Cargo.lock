@@ -758,8 +758,11 @@ dependencies = [
  "notify-rust",
  "parakeet-rs",
  "rubato",
+ "tempfile",
  "tray-icon",
  "ureq",
+ "wayland-client",
+ "wayland-protocols-misc",
  "winit",
 ]
 
