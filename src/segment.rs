@@ -4,8 +4,9 @@
 //! each piece while the user keeps talking. Energy VAD on 30 ms frames (RMS)
 //! with an adaptive threshold; cuts at ≥ 450 ms of silence after speech
 //! (segment ≥ 1.2 s) in the middle of the silence, force-cuts at 8 s at the
-//! quietest frame in the last 2 s, drops pure-silence segments, and keeps
-//! 300 ms of pre-roll before the first speech frame.
+//! quietest frame in the last 2 s. Segments are a contiguous partition of the
+//! whole recording: the first starts at sample 0, each cut is in the middle
+//! of a pause, and only all-silence segments are skipped.
 //!
 //! `Feeder` is the shared streaming path (daemon + `transcribe --segmented`):
 //! it resamples the continuous stream to 16 kHz once (stateful, so there are
@@ -19,16 +20,14 @@ const SILENCE_CUT_MS: u32 = 450;
 const MIN_SEGMENT_MS: u32 = 1200;
 /// Segment length that triggers a force-cut.
 const MAX_SEGMENT_MS: u32 = 8000;
-/// Pre-roll kept before the first speech frame.
-const PREROLL_MS: u32 = 300;
 /// Search window for the force-cut point.
 const FORCE_SEARCH_MS: u32 = 2000;
 /// Floor of the adaptive speech threshold.
 const MIN_THRESHOLD: f32 = 0.008;
 /// Speech threshold is this multiple of the noise floor.
 const THRESHOLD_RATIO: f32 = 3.0;
-/// Starting noise floor (frame RMS). Low on purpose: a high start reads soft
-/// word onsets as silence and the leading trim then eats them.
+/// Starting noise floor (frame RMS). Low on purpose so soft word onsets
+/// classify as speech from the start.
 const INITIAL_NOISE_FLOOR: f32 = 0.002;
 /// Downward adaptation toward new lows (fast: the threshold must reach a
 /// quiet room before the first word ends).
@@ -99,7 +98,6 @@ pub(crate) struct Segmenter {
     speech: Vec<bool>,
     has_speech: bool,
     trailing_silence: usize,
-    preroll_frames: usize,
     silence_cut_frames: usize,
     min_segment_samples: usize,
     max_segment_samples: usize,
@@ -110,8 +108,6 @@ impl Segmenter {
     /// New segmenter for `sample_rate` Hz mono audio.
     pub(crate) fn new(sample_rate: u32) -> Self {
         let frame_len = ((sample_rate as usize * FRAME_MS as usize) / 1000).max(1);
-        let preroll_frames =
-            ((sample_rate as usize * PREROLL_MS as usize) / 1000 / frame_len).max(1);
         let silence_cut_frames =
             ((sample_rate as usize * SILENCE_CUT_MS as usize) / 1000 / frame_len).max(1);
         let min_segment_samples = sample_rate as usize * MIN_SEGMENT_MS as usize / 1000;
@@ -127,7 +123,6 @@ impl Segmenter {
             speech: Vec::new(),
             has_speech: false,
             trailing_silence: 0,
-            preroll_frames,
             silence_cut_frames,
             min_segment_samples,
             max_segment_samples,
@@ -167,12 +162,11 @@ impl Segmenter {
     }
 
     /// Finish the recording; returns the tail when it holds speech.
-    /// Pure-silence tails are dropped.
+    /// Pure-silence tails are skipped (the only audio ever dropped).
     pub(crate) fn finish(&mut self) -> Option<Vec<f32>> {
         if !self.has_speech {
             return None;
         }
-        let first = self.speech.iter().position(|&speech| speech);
         let mut tail = std::mem::take(&mut self.samples);
         tail.extend_from_slice(&self.pending);
         self.pending.clear();
@@ -180,7 +174,7 @@ impl Segmenter {
         self.speech.clear();
         self.has_speech = false;
         self.trailing_silence = 0;
-        trim_leading_by(tail, first, self.frame_len, self.preroll_frames)
+        Some(tail)
     }
 
     /// Classify one complete frame and maybe emit a segment.
@@ -206,15 +200,8 @@ impl Segmenter {
             self.trailing_silence += 1;
         }
         if !self.has_speech {
-            // Bound leading silence to the pre-roll window.
-            let frames = self.speech.len();
-            if frames > self.preroll_frames {
-                let drop_frames = frames - self.preroll_frames;
-                self.samples.drain(..drop_frames * self.frame_len);
-                self.rms.drain(..drop_frames);
-                self.speech.drain(..drop_frames);
-                self.trailing_silence = self.speech.len();
-            }
+            // No speech yet: keep everything so the first segment starts at
+            // sample 0, and never cut silence alone.
             return None;
         }
         if self.trailing_silence >= self.silence_cut_frames
@@ -229,24 +216,15 @@ impl Segmenter {
     }
 
     /// Cut in the middle of the trailing silence; the remainder carries over.
-    /// The caller guarantees the segment holds speech.
+    /// The caller guarantees the segment holds speech. Nothing is trimmed:
+    /// the head plus the remainder exactly partition the buffered audio.
     fn cut_pause(&mut self) -> Vec<f32> {
         let silence = self.trailing_silence;
         let keep_in_first = silence / 2;
         let remainder_frames = silence - keep_in_first;
         let cut = self.samples.len() - remainder_frames * self.frame_len;
         let first_frames = self.speech.len() - remainder_frames;
-        let first_speech = self.speech[..first_frames]
-            .iter()
-            .position(|&speech| speech);
         let head = self.samples[..cut].to_vec();
-        // The head holds the segment's speech by construction (the trailing
-        // run is silence), so trimming always yields `Some`; fall back to the
-        // untrimmed head rather than panic on the unreachable `None`.
-        let head = match trim_leading_by(head, first_speech, self.frame_len, self.preroll_frames) {
-            Some(head) => head,
-            None => self.samples[..cut].to_vec(),
-        };
         let remainder = self.samples[cut..].to_vec();
         let remainder_rms = self.rms[first_frames..].to_vec();
         let remainder_speech = self.speech[first_frames..].to_vec();
@@ -259,7 +237,8 @@ impl Segmenter {
     }
 
     /// Force-cut a long segment at the end of the quietest frame in the last
-    /// 2 s. A first half with no speech frames is dropped (`None`).
+    /// 2 s. A first half with no speech frames is skipped (`None`); otherwise
+    /// nothing is trimmed.
     fn cut_force(&mut self) -> Option<Vec<f32>> {
         let frames = self.speech.len();
         let window = self.force_search_frames.min(frames);
@@ -274,7 +253,6 @@ impl Segmenter {
         let cut = cut_frames * self.frame_len;
         let cut = cut.min(self.samples.len());
         let first_has_speech = self.speech[..cut_frames].iter().any(|&speech| speech);
-        let first_speech = self.speech[..cut_frames].iter().position(|&speech| speech);
         let head = self.samples[..cut].to_vec();
         let remainder = self.samples[cut..].to_vec();
         let remainder_rms = self.rms[cut_frames..].to_vec();
@@ -287,7 +265,7 @@ impl Segmenter {
         if !first_has_speech {
             return None;
         }
-        trim_leading_by(head, first_speech, self.frame_len, self.preroll_frames)
+        Some(head)
     }
 }
 
@@ -303,22 +281,6 @@ fn rms(frame: &[f32]) -> f32 {
 /// Count trailing non-speech frames.
 fn trailing_count(speech: &[bool]) -> usize {
     speech.iter().rev().take_while(|&&speech| !speech).count()
-}
-
-/// Trim leading silence beyond the pre-roll window, keeping whole frames.
-/// `first_speech` is the index of the first speech frame in `samples`.
-/// A segment with no speech frames yields `None` (dropped, never sent).
-fn trim_leading_by(
-    mut samples: Vec<f32>,
-    first_speech: Option<usize>,
-    frame_len: usize,
-    preroll_frames: usize,
-) -> Option<Vec<f32>> {
-    let first = first_speech?;
-    if first > preroll_frames {
-        samples.drain(..(first - preroll_frames) * frame_len);
-    }
-    Some(samples)
 }
 
 #[cfg(test)]
@@ -456,35 +418,56 @@ mod tests {
     }
 
     #[test]
-    fn leading_silence_is_trimmed_to_preroll() {
+    fn leading_silence_starts_at_sample_zero() {
         let mut audio = silence(1.0);
         audio.extend(tone(2.0));
         let mut segmenter = Segmenter::new(RATE);
         let segments = push_chunked(&mut segmenter, &audio);
         assert!(segments.is_empty(), "no pause, so no mid-stream cut");
         let tail = segmenter.finish().expect("speech tail");
-        // Leading silence kept: 300 ms ± one frame (hardcoded to pin the
-        // constant, not PREROLL_MS itself).
-        let frame = RATE as usize * FRAME_MS as usize / 1000;
-        let preroll = RATE as usize * 300 / 1000;
-        let leading = tail
-            .iter()
-            .take_while(|sample| sample.abs() <= 0.05)
-            .count();
-        assert!(
-            leading <= preroll + frame,
-            "leading silence is {leading} samples, over 300 ms + one frame"
-        );
-        assert!(
-            leading >= preroll.saturating_sub(frame),
-            "pre-roll keeps about 300 ms, got {leading} samples"
+        assert_eq!(
+            tail, audio,
+            "segment 1 starts at sample 0: no VAD trim at the start"
         );
     }
 
+    /// Segments are a contiguous partition of the whole recording: emitted
+    /// segments plus the tail equal the input sample-exact (only all-silence
+    /// segments are ever skipped, and none of these fixtures has one).
+    #[test]
+    fn segments_partition_the_whole_recording() {
+        let mut pause = tone(2.0);
+        pause.extend(silence(0.6));
+        pause.extend(tone(2.0));
+        let mut short = tone(2.0);
+        short.extend(silence(0.3));
+        short.extend(tone(2.0));
+        let mut leading = silence(1.0);
+        leading.extend(tone(2.0));
+        let fixtures = vec![
+            ("pause split", pause),
+            ("short pause", short),
+            ("leading silence", leading),
+            ("long tone", tone(12.0)),
+        ];
+        for (name, audio) in &fixtures {
+            let mut segmenter = Segmenter::new(RATE);
+            let segments = push_chunked(&mut segmenter, audio);
+            let tail = segmenter.finish();
+            let out = concat(segments, tail);
+            assert_eq!(out, *audio, "{name}: concatenation must equal the input");
+        }
+        // Pure silence is the skipped case: nothing emitted, nothing lost.
+        let audio = silence(3.0);
+        let mut segmenter = Segmenter::new(RATE);
+        let segments = push_chunked(&mut segmenter, &audio);
+        assert!(segments.is_empty(), "silence must emit no segments");
+        assert_eq!(segmenter.finish(), None, "a silent tail is skipped");
+    }
+
     /// Regression test for lost word onsets (round 19): a soft start (RMS
-    /// ~0.014) read as silence by the old initial threshold (0.03) was
-    /// eaten by the leading trim. It must survive now. The soft speech
-    /// starts after 0.2 s, before the old floor could adapt down.
+    /// ~0.014) read as silence by the old initial threshold (0.03) lost its
+    /// first samples. It must survive now.
     #[test]
     fn soft_onset_at_recording_start_is_kept() {
         let mut audio = silence(0.2);
@@ -498,14 +481,13 @@ mod tests {
         assert!(input_soft > 0, "the fixture must contain soft speech");
         assert_eq!(
             output_soft, input_soft,
-            "every soft onset sample must survive the trim"
+            "every soft onset sample must survive"
         );
     }
 
-    /// Segment-2 onsets: a soft ramp after a pause must survive the cut and
-    /// the next segment's leading trim. The ramp (RMS ~0.003) sits below both
-    /// thresholds, so this pins the 300 ms pre-roll: the old 150 ms window
-    /// kept only part of it.
+    /// Segment-2 onsets: a soft ramp after a pause must survive the cut. The
+    /// ramp (RMS ~0.003) sits below both thresholds, so it only survives
+    /// because cuts keep every sample on both sides.
     #[test]
     fn soft_ramp_after_pause_is_kept() {
         let ramp = tone_at(RATE, 0.004, 0.25);
@@ -580,7 +562,7 @@ mod tests {
         segments.extend(feeder.finish().unwrap());
         assert_eq!(segments.len(), 2, "the pause must cut once");
         let pieces = segments;
-        // 16 kHz output: ~4.6 s total (input starts with tone, so no trim).
+        // 16 kHz output: ~4.6 s total (nothing is trimmed).
         let total: usize = pieces.iter().map(Vec::len).sum();
         let expected = 16_000.0 * 4.6;
         assert!(
