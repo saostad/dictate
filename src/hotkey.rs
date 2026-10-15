@@ -48,6 +48,23 @@ pub(crate) fn resolve_hotkey(env: Option<&str>) -> Result<HotkeyConfig, String> 
     }
 }
 
+/// Resolve a hotkey from the settings file. An empty value means the default.
+pub(crate) fn resolve_file_hotkey(value: &str) -> Result<HotkeyConfig, String> {
+    if value.is_empty() {
+        return resolve_hotkey(None);
+    }
+    HotKey::from_str(value)
+        .map(|hotkey| HotkeyConfig {
+            hotkey,
+            display: value.to_string(),
+        })
+        .map_err(|err| {
+            format!(
+                "Invalid hotkey \"{value}\" in the settings file: {err}. Example: Ctrl+Shift+Space"
+            )
+        })
+}
+
 /// True on Linux in a Wayland session, where apps cannot register global
 /// hotkeys. Never true on other systems.
 pub(crate) fn wayland_session() -> bool {
@@ -175,6 +192,28 @@ mod tests {
         assert_eq!(config.display, "Alt+F9");
         assert_eq!(config.hotkey.key, Code::F9);
         assert!(config.hotkey.mods.contains(Modifiers::ALT));
+    }
+
+    #[test]
+    fn file_hotkey_resolves_and_defaults_when_empty() {
+        let config = resolve_file_hotkey("F8").unwrap();
+        assert_eq!(config.display, "F8");
+        assert_eq!(config.hotkey.key, Code::F8);
+        let config = resolve_file_hotkey("").unwrap();
+        assert_eq!(config.display, "Ctrl+Shift+Space");
+    }
+
+    #[test]
+    fn file_hotkey_rejects_bad_value_with_example() {
+        let err = resolve_file_hotkey("Shift+Foo").unwrap_err();
+        assert!(
+            err.starts_with("Invalid hotkey \"Shift+Foo\" in the settings file: "),
+            "unexpected: {err}"
+        );
+        assert!(
+            err.ends_with(". Example: Ctrl+Shift+Space"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]

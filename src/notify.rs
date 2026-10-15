@@ -20,21 +20,16 @@ pub(crate) enum Kind {
 /// Set once the first notification failure has been reported.
 static WARNED: AtomicBool = AtomicBool::new(false);
 
-/// True unless `DICTATE_NOTIFY` is exactly `"0"`.
-pub(crate) fn notifications_enabled(env: Option<&str>) -> bool {
-    !matches!(env, Some("0"))
-}
-
 /// Body of the typing-failure notification: the error plus the untyped text,
 /// so the text can be recovered from the notification.
 pub(crate) fn typing_failure_body(err: &str, text: &str) -> String {
     format!("{err}\n\nText: {text}")
 }
 
-/// True unless `DICTATE_NOTIFY=0` in the process environment. Both `show`
-/// and `show_now` share this check.
+/// The effective notification switch (file + env, resolved at startup).
+/// Both `show` and `show_now` share this check.
 fn enabled_now() -> bool {
-    notifications_enabled(std::env::var("DICTATE_NOTIFY").ok().as_deref())
+    crate::config::notifications_on()
 }
 
 /// Warn about a notification failure, at most once per process.
@@ -96,14 +91,6 @@ fn show_blocking(kind: Kind, summary: &str, body: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn notifications_disable_only_on_zero() {
-        assert!(!notifications_enabled(Some("0")));
-        assert!(notifications_enabled(None));
-        assert!(notifications_enabled(Some("")));
-        assert!(notifications_enabled(Some("1")));
-    }
 
     #[test]
     fn typing_failure_body_keeps_error_and_text() {

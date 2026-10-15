@@ -55,6 +55,8 @@ pub(crate) fn socket_path() -> anyhow::Result<PathBuf> {
 /// Failures (except `status`) also pop a desktop notification, since keybind
 /// runs show no stderr; the error is still returned for the exit code.
 pub(crate) fn client_command(cmd: &str) -> anyhow::Result<()> {
+    // Short-lived process: no settings file, but DICTATE_NOTIFY=0 must apply.
+    crate::config::init_effective(&crate::config::Settings::default());
     if let Err(err) = client_command_inner(cmd) {
         if cmd != "status" {
             crate::notify::show_now(crate::notify::Kind::Error, "dictate", &format!("{err:#}"));

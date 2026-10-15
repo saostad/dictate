@@ -26,11 +26,6 @@ const PEAK: f32 = 0.3;
 /// Set once the first cue failure has been reported.
 static WARNED: AtomicBool = AtomicBool::new(false);
 
-/// True unless `DICTATE_SOUNDS` is exactly `"0"`.
-pub(crate) fn sounds_enabled(env: Option<&str>) -> bool {
-    !matches!(env, Some("0"))
-}
-
 /// Generate a sine tone of `freq_hz` lasting `duration_ms` at `sample_rate`,
 /// with a short linear fade in/out.
 pub(crate) fn tone(freq_hz: f32, duration_ms: u32, sample_rate: u32) -> Vec<f32> {
@@ -66,7 +61,7 @@ pub(crate) fn play_stop() {
 }
 
 fn play_cue(freq_hz: f32) {
-    if !sounds_enabled(std::env::var("DICTATE_SOUNDS").ok().as_deref()) {
+    if !crate::config::sounds_on() {
         return;
     }
     std::thread::spawn(move || {
@@ -203,13 +198,5 @@ mod tests {
                 .fold(0.0, f32::max);
             assert!(peak <= 0.3 + 1e-6, "peak {peak} at {freq} Hz/{rate} Hz");
         }
-    }
-
-    #[test]
-    fn sounds_disable_only_on_zero() {
-        assert!(!sounds_enabled(Some("0")));
-        assert!(sounds_enabled(None));
-        assert!(sounds_enabled(Some("")));
-        assert!(sounds_enabled(Some("1")));
     }
 }

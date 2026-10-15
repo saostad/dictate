@@ -92,9 +92,25 @@ enum UserEvent {
 
 /// Run `dictate daemon`: load the model, bind the socket (Unix), serve commands.
 pub(crate) fn run_daemon() -> anyhow::Result<()> {
+    let (file_settings, settings_problem) = crate::config::load();
+    crate::config::init_effective(&file_settings);
+    if let Some(problem) = settings_problem {
+        let message = format!("{problem} Using defaults.");
+        eprintln!("error: {message}");
+        crate::notify::show(
+            crate::notify::Kind::Error,
+            "dictate: settings file has an error",
+            &message,
+        );
+    }
     let dir = crate::model::model_dir_checked()?;
-    let hotkey = crate::hotkey::resolve_hotkey(std::env::var("DICTATE_HOTKEY").ok().as_deref())
-        .map_err(|message| anyhow::anyhow!("{message}"))?;
+    // Env wins; an unset or empty DICTATE_HOTKEY falls back to the file.
+    let hotkey = match std::env::var("DICTATE_HOTKEY").ok() {
+        Some(value) if !value.is_empty() => crate::hotkey::resolve_hotkey(Some(&value))
+            .map_err(|message| anyhow::anyhow!("{message}"))?,
+        _ => crate::hotkey::resolve_file_hotkey(&file_settings.hotkey)
+            .map_err(|message| anyhow::anyhow!("{message}"))?,
+    };
     let start = Instant::now();
     let asr = crate::asr::Asr::load(&dir)?;
     eprintln!(
