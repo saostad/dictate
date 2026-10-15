@@ -328,6 +328,7 @@ fn run_action(
             Ok(started) => {
                 *recorder = Some(started);
                 *state = new_state;
+                crate::cue::play_start();
                 ok_reply.to_string()
             }
             Err(err) => {
@@ -340,6 +341,7 @@ fn run_action(
                 Ok(samples) => match to_worker.send(samples) {
                     Ok(()) => {
                         *state = new_state;
+                        crate::cue::play_stop();
                         ok_reply.to_string()
                     }
                     Err(err) => {

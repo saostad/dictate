@@ -31,6 +31,8 @@ dictate toggle   # start/stop recording
 dictate status   # idle, recording or transcribing
 ```
 
+The daemon plays a short tone when recording starts and stops; set `DICTATE_SOUNDS=0` to silence it.
+
 Bind keys to the control commands in your compositor or desktop. Hyprland
 (`~/.config/hypr/hyprland.conf`):
 

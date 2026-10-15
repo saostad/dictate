@@ -10,6 +10,7 @@ compile_error!(
 
 mod asr;
 mod audio;
+mod cue;
 mod daemon;
 mod hotkey;
 mod mic;
