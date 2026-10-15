@@ -1,9 +1,10 @@
 //! Long-running dictation daemon, controlled over a Unix socket or hotkey.
 //!
-//! `dictate daemon` keeps the speech model loaded. `dictate
+//! `dictate daemon` keeps the speech model loaded. On Unix, `dictate
 //! toggle|start|stop|cancel|status` sends one line to the socket and prints the
-//! one-line reply; a global hotkey (tap to toggle, hold to talk) triggers the
-//! same commands without a terminal.
+//! one-line reply; everywhere, a global hotkey (tap to toggle, hold to talk)
+//! triggers the same commands without a terminal. On Windows there is no
+//! socket yet, so the daemon is hotkey-only.
 //!
 //! The main thread runs a windowless winit event loop. It owns the state, the
 //! [`Recorder`](crate::mic::Recorder) and the hotkey manager (cpal streams are
@@ -12,11 +13,11 @@
 //! events; one worker thread owns the [`Asr`](crate::asr::Asr) and transcribes
 //! audio sent over an mpsc channel.
 
-use std::io::{BufRead, BufReader, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
-use std::path::{Path, PathBuf};
+#[cfg(unix)]
+pub(crate) mod socket;
+
 use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use anyhow::Context;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
@@ -25,8 +26,11 @@ use winit::event::WindowEvent;
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
 
-/// A control command sent by a client (one line on the socket).
+/// A control command sent by a client (one line on the socket, or one hotkey
+/// press). Some variants are only constructed by the Unix socket parser and
+/// the tests, hence the allowance on other systems.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(not(unix), allow(dead_code))]
 pub(crate) enum Command {
     Toggle,
     Start,
@@ -74,46 +78,11 @@ pub(crate) fn next(state: State, cmd: Command) -> (State, Action, &'static str) 
     }
 }
 
-/// Parse one client line into a command.
-pub(crate) fn parse_command(line: &str) -> Option<Command> {
-    match line.trim() {
-        "toggle" => Some(Command::Toggle),
-        "start" => Some(Command::Start),
-        "stop" => Some(Command::Stop),
-        "cancel" => Some(Command::Cancel),
-        "status" => Some(Command::Status),
-        _ => None,
-    }
-}
-
-/// The error message of a daemon reply, if it is one (`err <message>`).
-fn reply_error(reply: &str) -> Option<&str> {
-    if reply == "err" {
-        return Some("");
-    }
-    reply.strip_prefix("err ")
-}
-
-/// Pure socket-path choice: the runtime dir when there is one, else the data
-/// dir, joined with `dictate.sock`.
-pub(crate) fn socket_path_for(runtime_dir: Option<&Path>, data_dir: &Path) -> PathBuf {
-    match runtime_dir {
-        Some(dir) => dir.join("dictate.sock"),
-        None => data_dir.join("dictate.sock"),
-    }
-}
-
-/// Path of the daemon socket.
-pub(crate) fn socket_path() -> anyhow::Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("", "", "dictate")
-        .ok_or_else(|| anyhow::anyhow!("Could not find a home/data directory for this user"))?;
-    Ok(socket_path_for(dirs.runtime_dir(), dirs.data_dir()))
-}
-
 /// Events handled on the daemon's event-loop thread.
 #[derive(Debug)]
 enum UserEvent {
     /// A command from a socket client; the reply goes back on the channel.
+    #[cfg(unix)]
     Command(Command, mpsc::Sender<String>),
     /// The worker finished one transcription; back to Idle.
     WorkerDone,
@@ -121,7 +90,7 @@ enum UserEvent {
     HotKey(GlobalHotKeyEvent),
 }
 
-/// Run `dictate daemon`: load the model, bind the socket, serve commands.
+/// Run `dictate daemon`: load the model, bind the socket (Unix), serve commands.
 pub(crate) fn run_daemon() -> anyhow::Result<()> {
     let dir = crate::model::model_dir_checked()?;
     let hotkey = crate::hotkey::resolve_hotkey(std::env::var("DICTATE_HOTKEY").ok().as_deref())
@@ -132,30 +101,43 @@ pub(crate) fn run_daemon() -> anyhow::Result<()> {
         "model loaded in {} ms. Ready: run \"dictate toggle\" to start/stop recording.",
         start.elapsed().as_millis()
     );
-    let path = socket_path()?;
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).with_context(|| {
-            format!(
-                "Could not create daemon socket directory {}",
-                parent.display()
-            )
-        })?;
-    }
-    let listener = bind_listener(&path)?;
+    #[cfg(unix)]
+    let socket_file = {
+        let path = socket::socket_path()?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "Could not create daemon socket directory {}",
+                    parent.display()
+                )
+            })?;
+        }
+        path
+    };
+    #[cfg(unix)]
+    let listener = socket::bind_listener(&socket_file)?;
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("Could not start the daemon event loop")?;
     let (to_worker, worker_rx) = mpsc::channel::<Vec<f32>>();
     let worker_proxy = event_loop.create_proxy();
     let worker = std::thread::spawn(move || transcribe_worker(worker_rx, worker_proxy, asr));
-    let socket_proxy = event_loop.create_proxy();
-    std::thread::spawn(move || serve_socket(listener, socket_proxy));
+    #[cfg(unix)]
+    {
+        let socket_proxy = event_loop.create_proxy();
+        std::thread::spawn(move || socket::serve_socket(listener, socket_proxy));
+    }
+    #[cfg(not(unix))]
+    eprintln!(
+        "Socket commands (dictate toggle/start/stop) are not available on Windows yet; use the hotkey."
+    );
     let mut app = DaemonApp::new(to_worker, worker);
     setup_hotkey(&event_loop, &hotkey, &mut app);
     event_loop
         .run_app(&mut app)
         .context("The daemon event loop failed")?;
-    remove_socket_file(&path);
+    #[cfg(unix)]
+    socket::remove_socket_file(&socket_file);
     Ok(())
 }
 
@@ -311,6 +293,7 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
 
     fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
+            #[cfg(unix)]
             UserEvent::Command(cmd, reply_tx) => {
                 let reply = self.handle_command(cmd);
                 if reply_tx.send(reply).is_err() {
@@ -323,159 +306,6 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
             }
             UserEvent::HotKey(event) => self.handle_hotkey(event),
         }
-    }
-}
-
-/// Run one client command: send it to the daemon and print the reply.
-pub(crate) fn client_command(cmd: &str) -> anyhow::Result<()> {
-    let path = socket_path()?;
-    let mut stream = UnixStream::connect(&path).map_err(|err| {
-        anyhow::anyhow!(
-            "Could not reach the dictate daemon at {}: {err}. Start it with \"dictate daemon\".",
-            path.display()
-        )
-    })?;
-    writeln!(stream, "{cmd}").with_context(|| {
-        format!(
-            "Could not send {cmd} to the dictate daemon at {}",
-            path.display()
-        )
-    })?;
-    let reader = stream.try_clone().with_context(|| {
-        format!(
-            "Could not read the reply from the dictate daemon at {}",
-            path.display()
-        )
-    })?;
-    let mut line = String::new();
-    BufReader::new(reader)
-        .read_line(&mut line)
-        .with_context(|| {
-            format!(
-                "Could not read the reply from the dictate daemon at {}",
-                path.display()
-            )
-        })?;
-    if line.is_empty() {
-        anyhow::bail!(
-            "The dictate daemon at {} closed the connection without a reply.",
-            path.display()
-        );
-    }
-    let reply = line.trim();
-    if let Some(message) = reply_error(reply) {
-        if message.is_empty() {
-            anyhow::bail!(
-                "The dictate daemon at {} returned an error without details.",
-                path.display()
-            );
-        }
-        anyhow::bail!("{message}");
-    }
-    println!("{reply}");
-    Ok(())
-}
-
-/// Bind the daemon socket, handling the already-running and stale cases.
-fn bind_listener(path: &Path) -> anyhow::Result<UnixListener> {
-    match UnixListener::bind(path) {
-        Ok(listener) => Ok(listener),
-        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => {
-            if UnixStream::connect(path).is_ok() {
-                anyhow::bail!(
-                    "dictate daemon is already running (socket {}).",
-                    path.display()
-                );
-            }
-            std::fs::remove_file(path)
-                .with_context(|| format!("Could not remove stale socket {}", path.display()))?;
-            eprintln!("Removed stale socket {}", path.display());
-            UnixListener::bind(path)
-                .with_context(|| format!("Could not bind the daemon socket {}", path.display()))
-        }
-        Err(err) => {
-            Err(err).with_context(|| format!("Could not bind the daemon socket {}", path.display()))
-        }
-    }
-}
-
-/// Delete the socket file; failures are warnings, never silent.
-fn remove_socket_file(path: &Path) {
-    match std::fs::remove_file(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => eprintln!(
-            "warning: could not delete daemon socket {}: {err}",
-            path.display()
-        ),
-    }
-}
-
-/// Socket accept loop, on its own thread: blocking accept (an idle daemon
-/// sleeps), one command per connection, forwarded to the event loop.
-fn serve_socket(listener: UnixListener, proxy: EventLoopProxy<UserEvent>) {
-    for stream in listener.incoming() {
-        match stream {
-            Ok(stream) => handle_connection(stream, &proxy),
-            Err(err) => eprintln!("error: Could not accept a daemon connection: {err:#}"),
-        }
-    }
-}
-
-/// Serve one client connection: read one line, forward the command to the
-/// event loop, write back the reply. Failures are logged, never fatal.
-fn handle_connection(stream: UnixStream, proxy: &EventLoopProxy<UserEvent>) {
-    if let Err(err) = handle_connection_inner(stream, proxy) {
-        eprintln!("error: {err:#}");
-    }
-}
-
-fn handle_connection_inner(
-    stream: UnixStream,
-    proxy: &EventLoopProxy<UserEvent>,
-) -> anyhow::Result<()> {
-    // `accept()` inherits O_NONBLOCK from the listener on macOS/BSD, which
-    // would make `read_line` fail with WouldBlock; force blocking mode. The
-    // read timeout keeps a client that sends nothing from blocking us forever.
-    stream
-        .set_nonblocking(false)
-        .context("Could not use blocking mode on a daemon client connection")?;
-    stream
-        .set_read_timeout(Some(Duration::from_secs(2)))
-        .context("Could not set a read timeout on a daemon client connection")?;
-    let reader = stream
-        .try_clone()
-        .context("Could not read from a daemon client connection")?;
-    let mut line = String::new();
-    let bytes = BufReader::new(reader)
-        .read_line(&mut line)
-        .context("Could not read from a daemon client connection")?;
-    if bytes == 0 {
-        // EOF with zero bytes: an already-running probe from a second
-        // `dictate daemon`. Close it with no reply and no log.
-        return Ok(());
-    }
-    let reply = match parse_command(&line) {
-        None => {
-            let text = line.trim();
-            format!("err unknown command \"{text}\"")
-        }
-        Some(cmd) => forward_command(cmd, proxy),
-    };
-    let mut stream = stream;
-    writeln!(stream, "{reply}").context("Could not reply to a daemon client")?;
-    Ok(())
-}
-
-/// Send a command to the event loop and wait for its reply.
-fn forward_command(cmd: Command, proxy: &EventLoopProxy<UserEvent>) -> String {
-    let (reply_tx, reply_rx) = mpsc::channel::<String>();
-    if proxy.send_event(UserEvent::Command(cmd, reply_tx)).is_err() {
-        return "err daemon did not answer".to_string();
-    }
-    match reply_rx.recv_timeout(Duration::from_secs(2)) {
-        Ok(reply) => reply,
-        Err(_) => "err daemon did not answer".to_string(),
     }
 }
 
@@ -602,39 +432,6 @@ fn type_and_log(
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn socket_path_prefers_runtime_dir() {
-        let path = socket_path_for(Some(Path::new("/run/user/1000")), Path::new("/data"));
-        assert_eq!(path, PathBuf::from("/run/user/1000/dictate.sock"));
-    }
-
-    #[test]
-    fn socket_path_falls_back_to_data_dir() {
-        let path = socket_path_for(None, Path::new("/data"));
-        assert_eq!(path, PathBuf::from("/data/dictate.sock"));
-    }
-
-    #[test]
-    fn commands_parse_and_reject() {
-        assert_eq!(parse_command("toggle\n"), Some(Command::Toggle));
-        assert_eq!(parse_command("start"), Some(Command::Start));
-        assert_eq!(parse_command("stop"), Some(Command::Stop));
-        assert_eq!(parse_command("cancel"), Some(Command::Cancel));
-        assert_eq!(parse_command("status"), Some(Command::Status));
-        assert_eq!(parse_command("bogus"), None);
-        assert_eq!(parse_command(""), None);
-    }
-
-    #[test]
-    fn reply_errors_split() {
-        assert_eq!(reply_error("ok recording"), None);
-        assert_eq!(
-            reply_error("err busy transcribing"),
-            Some("busy transcribing")
-        );
-        assert_eq!(reply_error("err"), Some(""));
-    }
 
     #[test]
     fn state_machine_covers_every_pair() {

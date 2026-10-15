@@ -10,13 +10,10 @@ compile_error!(
 
 mod asr;
 mod audio;
-#[cfg(unix)]
 mod daemon;
-#[cfg(unix)]
 mod hotkey;
 mod mic;
 mod model;
-#[cfg(unix)]
 mod typer;
 
 use std::path::Path;
@@ -115,19 +112,13 @@ fn listen() -> anyhow::Result<()> {
     Ok(())
 }
 
-#[cfg(unix)]
 fn run_daemon() -> anyhow::Result<()> {
     daemon::run_daemon()
 }
 
-#[cfg(not(unix))]
-fn run_daemon() -> anyhow::Result<()> {
-    anyhow::bail!("\"dictate daemon\" is not supported on this OS yet.")
-}
-
 #[cfg(unix)]
 fn run_client(cmd: &str) -> anyhow::Result<()> {
-    daemon::client_command(cmd)
+    daemon::socket::client_command(cmd)
 }
 
 #[cfg(not(unix))]
