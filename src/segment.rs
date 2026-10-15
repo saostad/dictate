@@ -544,8 +544,8 @@ mod tests {
         let mut audio = tone_at(RATE, 0.1, 2.0);
         let mut pause = tone_at(RATE, 0.005, 0.6);
         for (index, sample) in pause.iter_mut().enumerate().take(4000).skip(3520) {
-            *sample = 0.0001
-                * (index as f32 * 440.0 * 2.0 * std::f32::consts::PI / RATE as f32).sin();
+            *sample =
+                0.0001 * (index as f32 * 440.0 * 2.0 * std::f32::consts::PI / RATE as f32).sin();
         }
         audio.extend(pause);
         audio.extend(tone_at(RATE, 0.1, 2.0));

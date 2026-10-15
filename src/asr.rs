@@ -567,8 +567,7 @@ mod tests {
         // Dedupe dropping "you" exposes a standalone `,`: it becomes the
         // boundary (`, and`), never a space-separated `you , and`.
         let prev = texts(&["for", "you"]);
-        let (text, pending) =
-            join_piece(&prev, None, Some('.'), &texts(&["you", ",", "and"]));
+        let (text, pending) = join_piece(&prev, None, Some('.'), &texts(&["you", ",", "and"]));
         assert_eq!((text.as_str(), pending), (", and", None));
     }
 
