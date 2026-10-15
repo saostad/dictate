@@ -138,10 +138,14 @@ compositor keybinds instead), opens the settings file, and quits the daemon.
 Without a tray host the daemon logs `dictate: no tray icon` once and keeps
 running headless.
 
-Type-while-speaking is an optional mode (off by default): when on, each
-pause segment is transcribed and typed while you keep talking, so only the
-last short piece remains after release. Cancel can't un-type pieces already
-typed. Leave it off to type once at stop, as before.
+## Type while speaking
+
+An optional mode (off by default): each pause segment is transcribed and
+typed while you keep talking, so only the last short piece remains after
+release. Turn it on with the tray menu's "Type while speaking" checkbox or
+`streaming = true` in the settings file. Cancel can't un-type pieces already
+typed. Leave it off to type once at stop, as before. It's faster on long
+dictations: most of the text is already typed when you stop.
 
 ## Settings file
 
