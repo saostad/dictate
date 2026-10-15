@@ -109,17 +109,22 @@ fn segmented_transcribe_at_48k_keeps_word_onsets() {
         "stderr: {}",
         String::from_utf8_lossy(&output.stderr)
     );
-    let text = String::from_utf8_lossy(&output.stdout).to_lowercase();
-    for phrase in [
-        "and so",
-        "ask not what your country can do for you",
-        "ask what you can do for your country",
-    ] {
-        assert!(
-            text.contains(phrase),
-            "missing {phrase:?} in segmented transcription: {text}"
-        );
-    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    // Exact sentence: lowercased, with `.`/`,` normalized away (punctuation
+    // at the cut may differ between runs).
+    let normalize = |s: &str| {
+        s.to_lowercase()
+            .chars()
+            .filter(|c| *c != '.' && *c != ',')
+            .collect::<String>()
+    };
+    assert_eq!(
+        normalize(text.trim()),
+        normalize(
+            "and so, my fellow americans, ask not what your country can do for you, ask what you can do for your country."
+        ),
+        "segmented transcription differs: {text}"
+    );
     // The onset check is only meaningful if segmentation actually happened
     // (one segment would equal plain transcribe, already covered above).
     let stderr = String::from_utf8_lossy(&output.stderr);

@@ -125,30 +125,35 @@ struct SegmentRun {
     seq: usize,
     joined: String,
     has_text: bool,
+    prev_ends_sentence: bool,
 }
 
-/// Transcribe feeder segments like the daemon worker: skip empties silently,
-/// join with the same rule, log per-segment timings to stderr.
+/// Transcribe feeder segments like the daemon worker: decode with left
+/// context, skip empties silently, join with the same rule, log per-segment
+/// timings to stderr.
 fn transcribe_segments(
     asr: &mut asr::Asr,
-    segments: &[Vec<f32>],
+    segments: &[segment::Segment],
     run: &mut SegmentRun,
 ) -> anyhow::Result<()> {
     for segment in segments {
         run.seq += 1;
-        let seconds = segment.len() as f32 / 16_000.0;
+        let seconds = segment.audio.len() as f32 / 16_000.0;
+        let context_s = segment.context.len() as f32 / 16_000.0;
         let start = std::time::Instant::now();
-        let text = asr.transcribe(segment)?;
+        let mid_sentence = run.has_text && !run.prev_ends_sentence;
+        let text = asr.transcribe_segment(&segment.context, &segment.audio, mid_sentence)?;
         let ms = start.elapsed().as_millis();
         if asr::is_empty_transcript(&text) {
             continue;
         }
         eprintln!(
-            "segment {}: {seconds:.1} s audio, transcribed in {ms} ms",
+            "segment {}: {seconds:.1} s audio (context {context_s:.1} s), transcribed in {ms} ms",
             run.seq
         );
         run.joined
             .push_str(&daemon::join_segment_text(run.has_text, &text));
+        run.prev_ends_sentence = asr::ends_sentence(&text);
         run.has_text = true;
     }
     Ok(())

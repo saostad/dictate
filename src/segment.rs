@@ -10,7 +10,9 @@
 //!
 //! `Feeder` is the shared streaming path (daemon + `transcribe --segmented`):
 //! it resamples the continuous stream to 16 kHz once (stateful, so there are
-//! no per-segment resample edges) and drives a `Segmenter` at 16 kHz.
+//! no per-segment resample edges) and drives a `Segmenter` at 16 kHz. Each
+//! emitted segment also carries up to `CONTEXT_S` of trailing audio before
+//! it (empty for the first), decoded as left context.
 
 /// Length of one VAD frame.
 const FRAME_MS: u32 = 30;
@@ -35,12 +37,31 @@ const NOISE_FLOOR_DOWN: f32 = 0.25;
 /// Upward drift on silence only (slow: speech must not raise the floor).
 const NOISE_FLOOR_UP: f32 = 0.002;
 
+/// Left context decoded ahead of every segment after the first: seconds of
+/// trailing 16 kHz audio before the segment, for accuracy at the cut.
+pub(crate) const CONTEXT_S: f32 = 1.5;
+
+/// Samples of [`CONTEXT_S`] at the feeder's 16 kHz output rate.
+const CONTEXT_SAMPLES: usize = (CONTEXT_S * crate::audio::TARGET_SAMPLE_RATE as f32) as usize;
+
+/// One finished streaming segment at 16 kHz, plus the trailing audio
+/// immediately before it (empty for the first segment), decoded as left
+/// context.
+#[derive(Debug)]
+pub(crate) struct Segment {
+    pub(crate) audio: Vec<f32>,
+    pub(crate) context: Vec<f32>,
+}
+
 /// Streaming feeder path shared by the daemon and `transcribe --segmented`:
 /// resamples the continuous device-rate stream to 16 kHz once (stateful) and
 /// segments at 16 kHz, so live segmentation equals file segmentation.
 pub(crate) struct Feeder {
     resampler: Option<crate::audio::StreamResampler>,
     segmenter: Segmenter,
+    /// Trailing audio of previously emitted segments (at most
+    /// `CONTEXT_SAMPLES`), attached as left context to the next one.
+    history: Vec<f32>,
 }
 
 impl Feeder {
@@ -57,33 +78,54 @@ impl Feeder {
         Ok(Self {
             resampler,
             segmenter: Segmenter::new(crate::audio::TARGET_SAMPLE_RATE),
+            history: Vec::new(),
         })
     }
 
     /// Push device-rate samples; returns finished 16 kHz segments.
-    pub(crate) fn push(&mut self, samples: &[f32]) -> anyhow::Result<Vec<Vec<f32>>> {
+    pub(crate) fn push(&mut self, samples: &[f32]) -> anyhow::Result<Vec<Segment>> {
         match &mut self.resampler {
             Some(resampler) => {
                 let mono16 = resampler.push(samples)?;
-                Ok(self.segmenter.push(&mono16))
+                let audios = self.segmenter.push(&mono16);
+                Ok(self.wrap(audios))
             }
-            None => Ok(self.segmenter.push(samples)),
+            None => {
+                let audios = self.segmenter.push(samples);
+                Ok(self.wrap(audios))
+            }
         }
     }
 
     /// Finish the recording: returns finished segments, including the tail
     /// when it holds speech. (The flushed tail audio can still complete a
     /// segment, which is why this returns a list and not just the tail.)
-    pub(crate) fn finish(&mut self) -> anyhow::Result<Vec<Vec<f32>>> {
+    pub(crate) fn finish(&mut self) -> anyhow::Result<Vec<Segment>> {
         let tail16 = match &mut self.resampler {
             Some(resampler) => resampler.finish()?,
             None => Vec::new(),
         };
-        let mut segments = self.segmenter.push(&tail16);
+        let mut audios = self.segmenter.push(&tail16);
         if let Some(tail) = self.segmenter.finish() {
-            segments.push(tail);
+            audios.push(tail);
         }
-        Ok(segments)
+        Ok(self.wrap(audios))
+    }
+
+    /// Attach left context to freshly emitted segments, in order: the first
+    /// ever emitted gets none, each later one gets the trailing audio of all
+    /// previously emitted segments (segments partition the stream, so that is
+    /// exactly the audio before it).
+    fn wrap(&mut self, audios: Vec<Vec<f32>>) -> Vec<Segment> {
+        let mut out = Vec::with_capacity(audios.len());
+        for audio in audios {
+            let context = self.history.clone();
+            self.history.extend_from_slice(&audio);
+            let drop = self.history.len().saturating_sub(CONTEXT_SAMPLES);
+            self.history.drain(..drop);
+            out.push(Segment { audio, context });
+        }
+        out
     }
 }
 
@@ -563,7 +605,7 @@ mod tests {
         assert_eq!(segments.len(), 2, "the pause must cut once");
         let pieces = segments;
         // 16 kHz output: ~4.6 s total (nothing is trimmed).
-        let total: usize = pieces.iter().map(Vec::len).sum();
+        let total: usize = pieces.iter().map(|segment| segment.audio.len()).sum();
         let expected = 16_000.0 * 4.6;
         assert!(
             (total as f32 - expected).abs() / expected < 0.02,
@@ -573,12 +615,40 @@ mod tests {
         let input_speech = audio.iter().filter(|sample| sample.abs() > 0.05).count();
         let output_speech: usize = pieces
             .iter()
-            .map(|piece| piece.iter().filter(|sample| sample.abs() > 0.05).count())
+            .map(|segment| {
+                segment
+                    .audio
+                    .iter()
+                    .filter(|sample| sample.abs() > 0.05)
+                    .count()
+            })
             .sum();
         let expected_speech = input_speech as f32 / 3.0;
         assert!(
             (output_speech as f32 - expected_speech).abs() / expected_speech < 0.05,
             "speech lost: {output_speech} vs {expected_speech:.0} expected"
+        );
+    }
+
+    #[test]
+    fn feeder_attaches_left_context_after_the_first_segment() {
+        let mut audio = tone(2.0);
+        audio.extend(silence(0.6));
+        audio.extend(tone(2.0));
+        let mut feeder = Feeder::new(RATE).unwrap();
+        let mut segments = Vec::new();
+        for piece in audio.chunks(RATE as usize / 10) {
+            segments.extend(feeder.push(piece).unwrap());
+        }
+        segments.extend(feeder.finish().unwrap());
+        assert_eq!(segments.len(), 2, "the pause must cut once");
+        assert!(segments[0].context.is_empty(), "segment 1 has no context");
+        // Segment 1 is ~2.3 s, so the context is capped at 1.5 s of its tail.
+        assert_eq!(segments[1].context.len(), CONTEXT_SAMPLES);
+        let tail = &segments[0].audio[segments[0].audio.len() - CONTEXT_SAMPLES..];
+        assert_eq!(
+            segments[1].context, tail,
+            "segment 2 context must be the trailing 1.5 s before it"
         );
     }
 

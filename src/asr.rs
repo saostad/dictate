@@ -3,7 +3,7 @@ use std::sync::OnceLock;
 
 use anyhow::Context;
 use parakeet_rs::ort::environment::Environment;
-use parakeet_rs::{ExecutionConfig, ParakeetTDT, Transcriber};
+use parakeet_rs::{ExecutionConfig, ParakeetTDT, TimestampMode, Transcriber};
 
 pub struct Asr {
     model: ParakeetTDT,
@@ -85,6 +85,78 @@ pub(crate) fn no_speech_message(seconds: f32) -> String {
     format!("No speech recognized in {seconds:.1} s of audio.")
 }
 
+/// One word with its timestamps in seconds.
+#[derive(Debug, Clone)]
+pub struct Word {
+    pub text: String,
+    pub start: f32,
+    pub end: f32,
+}
+
+/// Keep the words decoded at/after the context boundary: a word belongs to
+/// the segment when its midpoint is at or past `context_s` (seconds).
+pub(crate) fn keep_words_after(words: &[Word], context_s: f32) -> Vec<Word> {
+    words
+        .iter()
+        .filter(|word| (word.start + word.end) / 2.0 >= context_s)
+        .cloned()
+        .collect()
+}
+
+/// Join kept words exactly as the model spells them: single spaces, with
+/// standalone punctuation attached to the preceding word (mirrors parakeet-rs
+/// `rebuild_text` for `TimestampMode::Words`).
+pub(crate) fn join_words(words: &[Word]) -> String {
+    let mut out = String::new();
+    for (index, word) in words.iter().enumerate() {
+        let text = word.text.as_str();
+        let is_standalone_punct = text.len() == 1
+            && text
+                .chars()
+                .all(|c| matches!(c, '.' | ',' | '!' | '?' | ';' | ':' | ')'));
+        if index > 0 && !is_standalone_punct {
+            out.push(' ');
+        }
+        out.push_str(text);
+    }
+    out
+}
+
+/// Lowercase the first word of a mid-sentence continuation piece, except "I"
+/// and I-contractions.
+pub(crate) fn decapitalize_continuation(piece: &str) -> String {
+    match piece.split_once(' ') {
+        None => decapitalize_word(piece),
+        Some((first, rest)) => format!("{} {rest}", decapitalize_word(first)),
+    }
+}
+
+/// True when the piece ends a sentence (previous piece ended, so the next one
+/// keeps the model's capitalization).
+pub(crate) fn ends_sentence(piece: &str) -> bool {
+    piece
+        .chars()
+        .last()
+        .is_some_and(|last| matches!(last, '.' | '?' | '!'))
+}
+
+fn decapitalize_word(word: &str) -> String {
+    if is_capital_i(word) {
+        word.to_string()
+    } else {
+        word.to_lowercase()
+    }
+}
+
+/// "I" (possibly with trailing punctuation attached) or an I-contraction.
+fn is_capital_i(word: &str) -> bool {
+    if word == "I" || word.starts_with("I'") || word.starts_with("I\u{2019}") {
+        return true;
+    }
+    word.strip_prefix('I')
+        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| !c.is_alphabetic()))
+}
+
 impl Asr {
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
         load_inner(dir)
@@ -96,6 +168,54 @@ impl Asr {
             .model
             .transcribe_samples(samples.to_vec(), 16_000, 1, None)?;
         Ok(result.text.trim().to_string())
+    }
+
+    /// Transcribe with word-level timestamps (seconds).
+    pub fn transcribe_words(&mut self, samples: &[f32]) -> anyhow::Result<Vec<Word>> {
+        let result = self.model.transcribe_samples(
+            samples.to_vec(),
+            16_000,
+            1,
+            Some(TimestampMode::Words),
+        )?;
+        Ok(result
+            .tokens
+            .into_iter()
+            .map(|token| Word {
+                text: token.text,
+                start: token.start,
+                end: token.end,
+            })
+            .collect())
+    }
+
+    /// Transcribe one streaming segment. Segments after the first are decoded
+    /// with left `context` audio (the trailing audio before the segment) for
+    /// accuracy at the cut, then trimmed to the words at/after the context
+    /// boundary. The first segment (empty context) decodes alone, exactly as
+    /// before. `mid_sentence` lowercases the first word unless it is "I" or
+    /// an I-contraction.
+    pub(crate) fn transcribe_segment(
+        &mut self,
+        context: &[f32],
+        segment: &[f32],
+        mid_sentence: bool,
+    ) -> anyhow::Result<String> {
+        if context.is_empty() {
+            return self.transcribe(segment);
+        }
+        let mut audio = Vec::with_capacity(context.len() + segment.len());
+        audio.extend_from_slice(context);
+        audio.extend_from_slice(segment);
+        let words = self.transcribe_words(&audio)?;
+        let context_s = context.len() as f32 / 16_000.0;
+        let kept = keep_words_after(&words, context_s);
+        let piece = join_words(&kept);
+        if mid_sentence {
+            Ok(decapitalize_continuation(&piece))
+        } else {
+            Ok(piece)
+        }
     }
 }
 
@@ -123,6 +243,88 @@ mod tests {
             no_speech_message(3.9),
             "No speech recognized in 3.9 s of audio."
         );
+    }
+
+    fn word(text: &str, start: f32, end: f32) -> Word {
+        Word {
+            text: text.to_string(),
+            start,
+            end,
+        }
+    }
+
+    fn kept_texts(words: &[Word], context_s: f32) -> Vec<String> {
+        keep_words_after(words, context_s)
+            .iter()
+            .map(|word| word.text.clone())
+            .collect()
+    }
+
+    #[test]
+    fn keep_words_after_drops_context_words() {
+        let words = vec![
+            word("country", 0.5, 0.9),
+            word("can", 1.0, 1.2),
+            word("ask", 1.6, 1.9),
+            word("what", 2.0, 2.2),
+        ];
+        assert_eq!(kept_texts(&words, 1.5), vec!["ask", "what"]);
+    }
+
+    #[test]
+    fn keep_words_after_keeps_boundary_word() {
+        // Midpoint exactly on the boundary belongs to the segment.
+        let words = vec![word("ask", 1.4, 1.6)];
+        assert_eq!(kept_texts(&words, 1.5), vec!["ask"]);
+    }
+
+    #[test]
+    fn keep_words_after_drops_straddling_word() {
+        // A word straddling the cut with its midpoint before it is context.
+        let words = vec![word("you,", 1.2, 1.6), word("ask", 1.7, 1.9)];
+        assert_eq!(kept_texts(&words, 1.5), vec!["ask"]);
+    }
+
+    #[test]
+    fn keep_words_after_empty_is_empty() {
+        assert!(keep_words_after(&[], 1.5).is_empty());
+    }
+
+    #[test]
+    fn join_words_attaches_standalone_punctuation() {
+        let words = vec![
+            word("you", 1.6, 1.8),
+            word(",", 1.8, 1.9),
+            word("ask", 1.9, 2.1),
+        ];
+        assert_eq!(join_words(&words), "you, ask");
+        assert_eq!(join_words(&[]), "");
+    }
+
+    #[test]
+    fn decapitalize_continuation_lowercases_first_word() {
+        assert_eq!(decapitalize_continuation("Ask what"), "ask what");
+        assert_eq!(decapitalize_continuation("Ask"), "ask");
+        assert_eq!(decapitalize_continuation("ask what"), "ask what");
+        assert_eq!(decapitalize_continuation(""), "");
+    }
+
+    #[test]
+    fn decapitalize_continuation_keeps_capital_i() {
+        assert_eq!(decapitalize_continuation("I ask"), "I ask");
+        assert_eq!(decapitalize_continuation("I'm asking"), "I'm asking");
+        assert_eq!(decapitalize_continuation("I'll go"), "I'll go");
+        assert_eq!(decapitalize_continuation("I, for one"), "I, for one");
+    }
+
+    #[test]
+    fn ends_sentence_checks_final_punctuation() {
+        assert!(ends_sentence("you."));
+        assert!(ends_sentence("you?"));
+        assert!(ends_sentence("you!"));
+        assert!(!ends_sentence("you,"));
+        assert!(!ends_sentence("you"));
+        assert!(!ends_sentence(""));
     }
 }
 

@@ -97,8 +97,8 @@ pub(crate) fn next(state: State, cmd: Command) -> (State, Action, &'static str) 
 pub(crate) enum Job {
     /// Whole recording at 16 kHz (streaming off): today's exact path.
     Full(Vec<f32>),
-    /// One pause segment at 16 kHz (streaming on).
-    Segment(Vec<f32>),
+    /// One pause segment at 16 kHz plus its left context (streaming on).
+    Segment(crate::segment::Segment),
     /// End of a streaming recording: whole-recording duration plus the moment
     /// Stop was handled, so the worker can log latency after release.
     End {
@@ -932,8 +932,8 @@ fn feeder_loop(
 }
 
 /// Queue one 16 kHz segment for transcription.
-fn send_segment(to_worker: &mpsc::Sender<Job>, segment: Vec<f32>) {
-    if segment.is_empty() {
+fn send_segment(to_worker: &mpsc::Sender<Job>, segment: crate::segment::Segment) {
+    if segment.audio.is_empty() {
         return;
     }
     if to_worker.send(Job::Segment(segment)).is_err() {
@@ -999,6 +999,7 @@ fn transcribe_worker(
     let mut queue: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
     // Per-recording streaming state.
     let mut typed_any = false;
+    let mut prev_ends_sentence = false;
     let mut segments: usize = 0;
     let mut failures: usize = 0;
     let worker_done =
@@ -1019,24 +1020,27 @@ fn transcribe_worker(
                     break;
                 }
             }
-            Job::Segment(samples) => {
+            Job::Segment(segment) => {
                 segments += 1;
                 let seq = segments;
-                let seconds = samples.len() as f32 / 16_000.0;
+                let seconds = segment.audio.len() as f32 / 16_000.0;
+                let context_s = segment.context.len() as f32 / 16_000.0;
                 let start = Instant::now();
-                let text = match asr.transcribe(&samples) {
-                    Ok(text) => text,
-                    Err(err) => {
-                        dlog!("error: {err:#}");
-                        crate::notify::show(
-                            crate::notify::Kind::Error,
-                            "dictate: transcription failed",
-                            &format!("{err:#}"),
-                        );
-                        failures += 1;
-                        continue;
-                    }
-                };
+                let mid_sentence = typed_any && !prev_ends_sentence;
+                let text =
+                    match asr.transcribe_segment(&segment.context, &segment.audio, mid_sentence) {
+                        Ok(text) => text,
+                        Err(err) => {
+                            dlog!("error: {err:#}");
+                            crate::notify::show(
+                                crate::notify::Kind::Error,
+                                "dictate: transcription failed",
+                                &format!("{err:#}"),
+                            );
+                            failures += 1;
+                            continue;
+                        }
+                    };
                 let transcribe_ms = start.elapsed().as_millis();
                 if crate::asr::is_empty_transcript(&text) {
                     continue;
@@ -1051,6 +1055,7 @@ fn transcribe_worker(
                         queue.pop_front();
                     }
                     typed_any = false;
+                    prev_ends_sentence = false;
                     segments = 0;
                     failures = 0;
                     if worker_done(&proxy) {
@@ -1068,8 +1073,9 @@ fn transcribe_worker(
                 match typed {
                     Ok(()) => {
                         typed_any = true;
+                        prev_ends_sentence = crate::asr::ends_sentence(&text);
                         dlog!(
-                            "segment {seq}: {seconds:.1} s audio, transcribed in {transcribe_ms} ms, typed {} chars in {type_ms} ms",
+                            "segment {seq}: {seconds:.1} s audio (context {context_s:.1} s), transcribed in {transcribe_ms} ms, typed {} chars in {type_ms} ms",
                             to_type.chars().count()
                         );
                     }
@@ -1110,6 +1116,7 @@ fn transcribe_worker(
                     }
                 }
                 typed_any = false;
+                prev_ends_sentence = false;
                 segments = 0;
                 failures = 0;
                 if worker_done(&proxy) {
@@ -1118,6 +1125,7 @@ fn transcribe_worker(
             }
             Job::Cancel => {
                 typed_any = false;
+                prev_ends_sentence = false;
                 segments = 0;
                 failures = 0;
                 if worker_done(&proxy) {
