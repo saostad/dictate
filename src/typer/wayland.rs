@@ -32,16 +32,17 @@ struct State {
     manager: Option<zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1>,
 }
 
-/// One virtual keyboard on a Wayland connection, reused across `type_text`.
+/// Wayland typing state: the connection, seat and manager are reused across
+/// `type_text` calls; the virtual keyboard itself is fresh per call (see
+/// [`WaylandTyper::type_text`]).
 pub(crate) struct WaylandTyper {
     queue: EventQueue<State>,
     state: State,
-    keyboard: Option<zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1>,
     time: u32,
 }
 
 impl WaylandTyper {
-    /// Connect to the compositor and create one virtual keyboard.
+    /// Connect to the compositor and bind the seat and manager.
     pub(crate) fn new() -> anyhow::Result<Self> {
         let display = std::env::var("WAYLAND_DISPLAY").unwrap_or_default();
         let connection = Connection::connect_to_env().map_err(|err| {
@@ -56,26 +57,20 @@ impl WaylandTyper {
         queue
             .roundtrip(&mut state)
             .map_err(|err| anyhow::anyhow!("Wayland roundtrip failed: {err}"))?;
-        let (seat, manager) = match (state.seat, state.manager) {
-            (Some(seat), Some(manager)) => (seat, manager),
+        match (&state.seat, &state.manager) {
+            (Some(_), Some(_)) => {}
             (None, _) => {
                 anyhow::bail!("Could not type on Wayland: the compositor offers no seat (wl_seat)")
             }
             (_, None) => anyhow::bail!(
                 "This compositor does not support virtual keyboards (zwp_virtual_keyboard_v1)"
             ),
-        };
-        let keyboard = manager.create_virtual_keyboard(&seat, &queue.handle(), ());
+        }
         // The seat and manager proxies must stay alive: dropping them would
-        // release the binding the keyboard was created from.
-        let state = State {
-            seat: Some(seat),
-            manager: Some(manager),
-        };
+        // release the bindings each keyboard is created from.
         Ok(Self {
             queue,
             state,
-            keyboard: Some(keyboard),
             time: 0,
         })
     }
@@ -86,12 +81,16 @@ impl WaylandTyper {
         if text.is_empty() {
             return Ok(());
         }
-        // Owned (one Arc bump per call): a borrow would conflict with the
-        // timestamp counter below.
-        let Some(keyboard) = self.keyboard.clone() else {
-            anyhow::bail!("the Wayland virtual keyboard is gone")
-        };
         for batch in split_batches(text) {
+            // A fresh virtual keyboard per call (and per batch): the
+            // compositor applies a new keymap only after already-queued keys,
+            // so reusing one keyboard decodes the next call with the previous
+            // keymap. wtype avoids this with one keyboard per run.
+            let (Some(seat), Some(manager)) = (self.state.seat.clone(), self.state.manager.clone())
+            else {
+                anyhow::bail!("the Wayland seat or virtual keyboard manager is gone")
+            };
+            let keyboard = manager.create_virtual_keyboard(&seat, &self.queue.handle(), ());
             let (keymap, keycodes) = build_keymap(batch);
             self.upload_keymap(&keyboard, &keymap)?;
             let mut keys = Vec::with_capacity(batch.chars().count());
@@ -110,11 +109,16 @@ impl WaylandTyper {
                     wl_keyboard::KeyState::Released as u32,
                 );
             }
+            self.queue.flush().map_err(|err| {
+                anyhow::anyhow!("Could not send key events to the Wayland compositor: {err}")
+            })?;
+            self.roundtrip()?;
+            keyboard.destroy();
+            self.queue.flush().map_err(|err| {
+                anyhow::anyhow!("Could not release the Wayland virtual keyboard: {err}")
+            })?;
         }
-        self.queue.flush().map_err(|err| {
-            anyhow::anyhow!("Could not send key events to the Wayland compositor: {err}")
-        })?;
-        self.roundtrip()
+        Ok(())
     }
 
     /// Upload one keymap: write it to an anonymous file, send it, roundtrip
@@ -154,9 +158,6 @@ impl WaylandTyper {
 
 impl Drop for WaylandTyper {
     fn drop(&mut self) {
-        if let Some(keyboard) = self.keyboard.take() {
-            keyboard.destroy();
-        }
         if self.queue.flush().is_err() {
             // The connection is closing anyway; nothing more can be done.
         }
