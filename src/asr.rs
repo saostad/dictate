@@ -274,10 +274,27 @@ pub(crate) fn append_typed_words(typed_words: &mut Vec<String>, to_type: &str) {
     typed_words.extend(words.map(|word| word.to_string()));
 }
 
+/// ONNX Runtime intra-op threads: use all cores, clamped to a sane range.
+/// Falls back to parakeet-rs's default (4) when the count is unavailable.
+pub(crate) fn thread_count(parallelism: Option<usize>) -> usize {
+    parallelism.unwrap_or(4).clamp(1, 16)
+}
+
+fn intra_threads() -> usize {
+    thread_count(
+        std::thread::available_parallelism()
+            .ok()
+            .map(|threads| threads.get()),
+    )
+}
+
 impl Asr {
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
-        load_inner(dir)
-            .with_context(|| format!("Loading speech model from {} failed", dir.display()))
+        let threads = intra_threads();
+        let asr = load_inner(dir, threads)
+            .with_context(|| format!("Loading speech model from {} failed", dir.display()))?;
+        eprintln!("using {threads} threads");
+        Ok(asr)
     }
 
     pub fn transcribe(&mut self, samples: &[f32]) -> anyhow::Result<String> {
@@ -338,9 +355,11 @@ impl Asr {
     }
 }
 
-fn load_inner(dir: &Path) -> anyhow::Result<Asr> {
+fn load_inner(dir: &Path, threads: usize) -> anyhow::Result<Asr> {
     let env = shared_environment()?;
-    let config = ExecutionConfig::new().with_environment(env);
+    let config = ExecutionConfig::new()
+        .with_environment(env)
+        .with_intra_threads(threads);
     let model = ParakeetTDT::from_pretrained(dir, Some(config))?;
     Ok(Asr { model })
 }
@@ -362,6 +381,21 @@ mod tests {
             no_speech_message(3.9),
             "No speech recognized in 3.9 s of audio."
         );
+    }
+
+    #[test]
+    fn thread_count_clamps_parallelism() {
+        assert_eq!(thread_count(Some(8)), 8);
+        assert_eq!(thread_count(Some(1)), 1);
+        assert_eq!(thread_count(Some(16)), 16);
+        assert_eq!(thread_count(Some(64)), 16);
+        assert_eq!(thread_count(Some(0)), 1);
+        assert_eq!(thread_count(None), 4);
+    }
+
+    #[test]
+    fn intra_threads_stays_in_range() {
+        assert!((1..=16).contains(&intra_threads()));
     }
 
     fn word(text: &str, start: f32, end: f32) -> Word {
