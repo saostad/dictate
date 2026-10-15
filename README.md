@@ -21,6 +21,8 @@ Download the archive for your OS from
 
 There is no Intel macOS build (ONNX Runtime ships no prebuilt library for it).
 
+The Linux binaries need glibc 2.39+ (Ubuntu 24.04+, Fedora 40+, Arch).
+
 1. Unpack the archive:
 
    ```sh

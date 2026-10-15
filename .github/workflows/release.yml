@@ -28,15 +28,15 @@ jobs:
       matrix:
         include:
           - asset: dictate-linux-x86_64
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             flags: ""
           - asset: dictate-linux-x86_64-system-ort
-            os: ubuntu-22.04
+            os: ubuntu-24.04
             target: x86_64-unknown-linux-gnu
             flags: --no-default-features --features system-ort
           - asset: dictate-linux-aarch64
-            os: ubuntu-22.04-arm
+            os: ubuntu-24.04-arm
             target: aarch64-unknown-linux-gnu
             flags: ""
           - asset: dictate-macos-aarch64
@@ -168,6 +168,8 @@ jobs:
             | Windows, x86_64 | `dictate-windows-x86_64.zip` |
 
             There is no Intel macOS build (ONNX Runtime ships no prebuilt library for it).
+
+            The Linux binaries need glibc 2.39+ (Ubuntu 24.04+, Fedora 40+, Arch).
 
             **CPUs without AVX2:** if the regular Linux x86_64 binary exits with
             "This CPU has no AVX2, but this build bundles an ONNX Runtime that needs AVX2",
