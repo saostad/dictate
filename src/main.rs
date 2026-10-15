@@ -14,6 +14,8 @@ mod audio;
 mod daemon;
 mod mic;
 mod model;
+#[cfg(unix)]
+mod typer;
 
 use std::path::Path;
 

@@ -20,6 +20,34 @@ dictate transcribe x.wav
 dictate listen
 ```
 
+## Use it
+
+Start the daemon once (it keeps the model loaded), then trigger recordings
+with the control commands:
+
+```sh
+dictate daemon
+dictate toggle   # start/stop recording
+dictate status   # idle, recording or transcribing
+```
+
+Bind keys to the control commands in your compositor or desktop. Hyprland
+(`~/.config/hypr/hyprland.conf`):
+
+```conf
+bind = SUPER, D, exec, dictate toggle
+```
+
+Push-to-talk:
+
+```conf
+bind = SUPER, D, exec, dictate start
+bindr = SUPER, D, exec, dictate stop
+```
+
+On GNOME or KDE, bind the same commands in Settings → Keyboard → Custom
+Shortcuts.
+
 ## Model
 
 Speech recognition uses NVIDIA Parakeet TDT 0.6B v2 (English), released under

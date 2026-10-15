@@ -13,6 +13,7 @@ panic = "abort"
 anyhow = "1.0.104"
 cpal = "0.18.2"
 directories = "6.0.0"
+enigo = { version = "0.6.1", features = ["wayland", "x11rb"] }
 hound = "3.5.1"
 parakeet-rs = { version = "0.4.1", default-features = false, features = ["cpu", "api-28"] }
 rubato = "5.0.1"

@@ -348,6 +348,10 @@ fn transcribe_worker(
     done: mpsc::Sender<()>,
     mut asr: crate::asr::Asr,
 ) {
+    let mut typer = crate::typer::Typer::new();
+    if let Err(err) = &typer {
+        eprintln!("error: {err:#}");
+    }
     for samples in rx {
         let seconds = samples.len() as f32 / 16_000.0;
         if crate::mic::recording_too_short(&samples) {
@@ -360,10 +364,7 @@ fn transcribe_worker(
                     if crate::asr::is_empty_transcript(&text) {
                         eprintln!("{}", crate::asr::no_speech_message(seconds));
                     } else {
-                        eprintln!(
-                            "recorded {seconds:.1} s, transcribed in {} ms",
-                            start.elapsed().as_millis()
-                        );
+                        type_and_log(&text, seconds, start, typer.as_mut());
                     }
                 }
                 Err(err) => eprintln!("error: {err:#}"),
@@ -371,6 +372,31 @@ fn transcribe_worker(
         }
         if done.send(()).is_err() {
             break;
+        }
+    }
+}
+
+/// Type one transcript and log the outcome. A failed setup or a failed
+/// keystroke keeps the text on stderr so it is never lost.
+fn type_and_log(
+    text: &str,
+    seconds: f32,
+    start: std::time::Instant,
+    typer: Result<&mut crate::typer::Typer, &mut anyhow::Error>,
+) {
+    let typed = match typer {
+        Ok(typer) => typer.type_text(text),
+        Err(err) => Err(anyhow::anyhow!("{err:#}")),
+    };
+    match typed {
+        Ok(()) => eprintln!(
+            "recorded {seconds:.1} s, transcribed in {} ms, typed {} chars",
+            start.elapsed().as_millis(),
+            text.chars().count()
+        ),
+        Err(err) => {
+            eprintln!("error: {err:#}");
+            eprintln!("Text that was not typed: {text}");
         }
     }
 }
