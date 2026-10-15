@@ -132,10 +132,16 @@ Shortcuts.
 
 `dictate daemon` shows a tray icon: grey when idle, red while recording,
 amber while transcribing. Its menu shows the live state, starts/stops/cancels
-dictation, toggles sound cues and notifications (saved to the settings file),
-switches the global shortcut (on Wayland it explains the compositor keybinds
-instead), opens the settings file, and quits the daemon. Without a tray host
-the daemon logs `dictate: no tray icon` once and keeps running headless.
+dictation, toggles sound cues, notifications and type-while-speaking (saved to
+the settings file), switches the global shortcut (on Wayland it explains the
+compositor keybinds instead), opens the settings file, and quits the daemon.
+Without a tray host the daemon logs `dictate: no tray icon` once and keeps
+running headless.
+
+With type-while-speaking on (the default), each pause segment is transcribed
+and typed while you keep talking, so only the last short piece remains after
+release. Cancel can't un-type pieces already typed; turn it off to type once
+at stop, as before.
 
 ## Settings file
 
@@ -152,12 +158,14 @@ All keys are optional; a missing file means defaults:
 ```toml
 sounds = true                 # short tone when recording starts/stops
 notifications = true          # desktop notifications for errors
+streaming = true              # type each pause segment while speaking
 hotkey = "Ctrl+Shift+Space"   # global shortcut: tap to toggle, hold to talk
 ```
 
-The environment wins: `DICTATE_SOUNDS=0`, `DICTATE_NOTIFY=0` and
-`DICTATE_HOTKEY=...` override the file. The tray menu edits the file for you;
-`Open settings file` creates it with defaults when missing.
+The environment wins: `DICTATE_SOUNDS=0`, `DICTATE_NOTIFY=0`,
+`DICTATE_STREAMING=0` and `DICTATE_HOTKEY=...` override the file. The tray
+menu edits the file for you; `Open settings file` creates it with defaults
+when missing.
 
 ## Global hotkey
 

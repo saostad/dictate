@@ -122,10 +122,9 @@ struct FeederSession {
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-/// True unless `DICTATE_STREAMING=0`. (Item 3 adds the config file key and the
-/// tray checkbox; the worker/feeder protocol here is unchanged.)
+/// Effective streaming switch (settings file + `DICTATE_STREAMING`).
 fn streaming_enabled() -> bool {
-    std::env::var("DICTATE_STREAMING").as_deref() != Ok("0")
+    crate::config::streaming_on()
 }
 
 /// Events handled on the daemon's event-loop thread.
@@ -479,6 +478,7 @@ impl DaemonApp {
             }
             Some(crate::tray::TrayAction::Sounds) => self.flip_sounds(),
             Some(crate::tray::TrayAction::Notifications) => self.flip_notifications(),
+            Some(crate::tray::TrayAction::Streaming) => self.flip_streaming(),
             Some(crate::tray::TrayAction::Shortcut(display)) => self.switch_hotkey(&display),
             Some(crate::tray::TrayAction::HowTo) => self.open_how_to(),
             Some(crate::tray::TrayAction::OpenConfig) => self.open_settings_file(),
@@ -504,6 +504,17 @@ impl DaemonApp {
         crate::config::refresh_notifications(new);
         if let Some(tray) = &self.tray {
             tray.set_notifications_checked(new);
+        }
+        self.report_save_error(crate::config::save(&self.settings));
+    }
+
+    /// Flip the `Type while speaking` check, update the effective switch, save.
+    fn flip_streaming(&mut self) {
+        let new = !self.settings.streaming;
+        self.settings.streaming = new;
+        crate::config::refresh_streaming(new);
+        if let Some(tray) = &self.tray {
+            tray.set_streaming_checked(new);
         }
         self.report_save_error(crate::config::save(&self.settings));
     }

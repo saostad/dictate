@@ -86,6 +86,7 @@ pub(crate) enum TrayAction {
     Cancel,
     Sounds,
     Notifications,
+    Streaming,
     Shortcut(String),
     HowTo,
     OpenConfig,
@@ -110,6 +111,7 @@ pub(crate) struct Tray {
     cancel: MenuItem,
     sounds: CheckMenuItem,
     notifications: CheckMenuItem,
+    streaming: CheckMenuItem,
     shortcut: ShortcutMenu,
     open_config: MenuItem,
     quit: MenuItem,
@@ -143,6 +145,13 @@ pub(crate) fn build_tray(
         "Notifications",
         true,
         settings.notifications,
+        None,
+    );
+    let streaming = CheckMenuItem::with_id(
+        "dictate-streaming",
+        "Type while speaking",
+        true,
+        settings.streaming,
         None,
     );
     let submenu = Submenu::with_id("dictate-shortcut", "Shortcut", true);
@@ -184,6 +193,8 @@ pub(crate) fn build_tray(
         .context("Could not build the tray menu")?;
     menu.append(&notifications)
         .context("Could not build the tray menu")?;
+    menu.append(&streaming)
+        .context("Could not build the tray menu")?;
     menu.append(&submenu)
         .context("Could not build the tray menu")?;
     menu.append(&open_config)
@@ -218,6 +229,7 @@ pub(crate) fn build_tray(
         cancel,
         sounds,
         notifications,
+        streaming,
         shortcut,
         open_config,
         quit,
@@ -254,6 +266,9 @@ impl Tray {
         if *id == *self.notifications.id() {
             return Some(TrayAction::Notifications);
         }
+        if *id == *self.streaming.id() {
+            return Some(TrayAction::Streaming);
+        }
         if *id == *self.open_config.id() {
             return Some(TrayAction::OpenConfig);
         }
@@ -283,6 +298,11 @@ impl Tray {
     /// Set the `Notifications` check explicitly.
     pub(crate) fn set_notifications_checked(&self, checked: bool) {
         self.notifications.set_checked(checked);
+    }
+
+    /// Set the `Type while speaking` check explicitly.
+    pub(crate) fn set_streaming_checked(&self, checked: bool) {
+        self.streaming.set_checked(checked);
     }
 
     /// Check exactly the current shortcut (radio behavior).

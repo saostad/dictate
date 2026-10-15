@@ -2,13 +2,14 @@
 //!
 //! A tiny TOML subset parsed by hand (no new crates): `#` comments, blank
 //! lines, `key = true|false` and `key = "string"`. Keys are `sounds`,
-//! `notifications` (both bool, default true) and `hotkey` (string, default
-//! `Ctrl+Shift+Space`). A missing file means defaults, never an error.
+//! `notifications`, `streaming` (bool, default true) and `hotkey` (string,
+//! default `Ctrl+Shift+Space`). A missing file means defaults, never an error.
 //!
-//! The environment still wins: `DICTATE_SOUNDS`, `DICTATE_NOTIFY` and
-//! `DICTATE_HOTKEY` override the file. The daemon resolves file + env once at
-//! startup into the effective switches below, which `cue` and `notify` read
-//! instead of touching the environment per call.
+//! The environment still wins: `DICTATE_SOUNDS`, `DICTATE_NOTIFY`,
+//! `DICTATE_STREAMING` and `DICTATE_HOTKEY` override the file. The daemon
+//! resolves file + env once at startup into the effective switches below,
+//! which `cue`, `notify` and the daemon read instead of touching the
+//! environment per call.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -20,6 +21,7 @@ use anyhow::Context;
 pub(crate) struct Settings {
     pub sounds: bool,
     pub notifications: bool,
+    pub streaming: bool,
     pub hotkey: String,
 }
 
@@ -28,6 +30,7 @@ impl Default for Settings {
         Self {
             sounds: true,
             notifications: true,
+            streaming: true,
             hotkey: crate::hotkey::DEFAULT_HOTKEY.to_string(),
         }
     }
@@ -37,6 +40,8 @@ impl Default for Settings {
 static SOUNDS_ON: AtomicBool = AtomicBool::new(true);
 /// Effective "show notifications" switch (file + env, resolved at startup).
 static NOTIFY_ON: AtomicBool = AtomicBool::new(true);
+/// Effective "type while speaking" switch (file + env, resolved at startup).
+static STREAMING_ON: AtomicBool = AtomicBool::new(true);
 
 /// Combine one bool setting with its env override: unset env keeps the file
 /// value, `"0"` turns it off, anything else turns it on.
@@ -52,10 +57,10 @@ pub(crate) fn apply_env(file_value: bool, env: Option<&str>) -> bool {
 /// environment. The daemon calls this once with the loaded file; short-lived
 /// processes call it with defaults so `DICTATE_*=0` still applies.
 pub(crate) fn init_effective(settings: &Settings) {
-    refresh_from(settings.sounds, settings.notifications);
+    refresh_from(settings.sounds, settings.notifications, settings.streaming);
 }
 
-fn refresh_from(sounds: bool, notifications: bool) {
+fn refresh_from(sounds: bool, notifications: bool, streaming: bool) {
     SOUNDS_ON.store(
         apply_env(sounds, std::env::var("DICTATE_SOUNDS").ok().as_deref()),
         Ordering::SeqCst,
@@ -64,6 +69,13 @@ fn refresh_from(sounds: bool, notifications: bool) {
         apply_env(
             notifications,
             std::env::var("DICTATE_NOTIFY").ok().as_deref(),
+        ),
+        Ordering::SeqCst,
+    );
+    STREAMING_ON.store(
+        apply_env(
+            streaming,
+            std::env::var("DICTATE_STREAMING").ok().as_deref(),
         ),
         Ordering::SeqCst,
     );
@@ -77,6 +89,11 @@ pub(crate) fn sounds_on() -> bool {
 /// Effective notification switch, read by `notify` on every event.
 pub(crate) fn notifications_on() -> bool {
     NOTIFY_ON.load(Ordering::SeqCst)
+}
+
+/// Effective streaming switch, read by the daemon on every start.
+pub(crate) fn streaming_on() -> bool {
+    STREAMING_ON.load(Ordering::SeqCst)
 }
 
 /// Update the effective sound switch after the tray changed the file value
@@ -93,6 +110,18 @@ pub(crate) fn refresh_sounds(file_value: bool) {
 pub(crate) fn refresh_notifications(file_value: bool) {
     NOTIFY_ON.store(
         apply_env(file_value, std::env::var("DICTATE_NOTIFY").ok().as_deref()),
+        Ordering::SeqCst,
+    );
+}
+
+/// Update the effective streaming switch after the tray changed the file
+/// value (env still wins).
+pub(crate) fn refresh_streaming(file_value: bool) {
+    STREAMING_ON.store(
+        apply_env(
+            file_value,
+            std::env::var("DICTATE_STREAMING").ok().as_deref(),
+        ),
         Ordering::SeqCst,
     );
 }
@@ -141,7 +170,7 @@ pub(crate) fn parse(text: &str) -> Result<Settings, String> {
         let key = key.trim();
         let value = value.trim();
         match key {
-            "sounds" | "notifications" => {
+            "sounds" | "notifications" | "streaming" => {
                 let parsed = match value {
                     "true" => true,
                     "false" => false,
@@ -153,8 +182,10 @@ pub(crate) fn parse(text: &str) -> Result<Settings, String> {
                 };
                 if key == "sounds" {
                     settings.sounds = parsed;
-                } else {
+                } else if key == "notifications" {
                     settings.notifications = parsed;
+                } else {
+                    settings.streaming = parsed;
                 }
             }
             "hotkey" => {
@@ -227,9 +258,10 @@ fn escape(value: &str) -> String {
 /// Render all keys, each with a one-line comment.
 fn render(settings: &Settings) -> String {
     format!(
-        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Global hotkey: tap to toggle, hold to talk.\nhotkey = \"{}\"\n",
+        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Type each pause segment while speaking (off: type once at stop).\nstreaming = {}\n# Global hotkey: tap to toggle, hold to talk.\nhotkey = \"{}\"\n",
         settings.sounds,
         settings.notifications,
+        settings.streaming,
         escape(&settings.hotkey)
     )
 }
@@ -292,9 +324,12 @@ mod tests {
 
     #[test]
     fn parses_all_keys() {
-        let settings = parse("sounds = false\nnotifications = false\nhotkey = \"F8\"\n").unwrap();
+        let settings =
+            parse("sounds = false\nnotifications = false\nstreaming = false\nhotkey = \"F8\"\n")
+                .unwrap();
         assert!(!settings.sounds);
         assert!(!settings.notifications);
+        assert!(!settings.streaming);
         assert_eq!(settings.hotkey, "F8");
     }
 
@@ -322,6 +357,7 @@ mod tests {
             Settings {
                 sounds: false,
                 notifications: false,
+                streaming: false,
                 hotkey: "say \"hi\" \\ now".to_string(),
             },
         ] {
@@ -387,6 +423,7 @@ mod tests {
         let settings = Settings {
             sounds: false,
             notifications: true,
+            streaming: false,
             hotkey: "F8".to_string(),
         };
         save_to(&path, &settings).unwrap();
