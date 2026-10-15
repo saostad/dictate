@@ -33,6 +33,9 @@ pub(crate) const WAYLAND_SHORTCUT_NOTE: &str =
 /// README section explaining the compositor keybinds.
 pub(crate) const README_USE_IT_URL: &str = "https://github.com/saostad/dictate#use-it";
 
+/// Stable tray identity (SNI id and title), so bars can pin the icon.
+pub(crate) const TRAY_ID: &str = "dictate";
+
 /// Pixels, width and height of the tray icon for `state`: a filled circle in
 /// the state color on a transparent background.
 pub(crate) fn icon_rgba(state: State) -> (Vec<u8>, u32, u32) {
@@ -193,6 +196,8 @@ pub(crate) fn build_tray(
     let icon = Icon::from_rgba(rgba, width, height)
         .map_err(|err| anyhow::anyhow!("Internal error: tray icon pixels rejected: {err}"))?;
     let icon = TrayIconBuilder::new()
+        .with_id(TRAY_ID)
+        .with_title(TRAY_ID)
         .with_menu(Box::new(menu))
         .with_tooltip("dictate")
         .with_icon(icon)
@@ -352,6 +357,11 @@ mod tests {
         assert_eq!(&rgba[0..4], &[0, 0, 0, 0]);
         let end = rgba.len();
         assert_eq!(&rgba[end - 4..end], &[0, 0, 0, 0]);
+    }
+
+    #[test]
+    fn tray_id_stays_stable() {
+        assert_eq!(TRAY_ID, "dictate");
     }
 
     #[test]
