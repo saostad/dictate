@@ -130,10 +130,10 @@ fn download_file_inner(url: &str, name: &str, part: &Path, dest: &Path) -> anyho
             }
         }
     }
-    if let Some(total) = total {
-        if downloaded != total {
-            anyhow::bail!("downloaded {downloaded} bytes but Content-Length was {total}");
-        }
+    if let Some(total) = total
+        && downloaded != total
+    {
+        anyhow::bail!("downloaded {downloaded} bytes but Content-Length was {total}");
     }
     drop(file);
     fs::rename(part, dest)

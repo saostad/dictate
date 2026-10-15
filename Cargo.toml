@@ -12,4 +12,7 @@ panic = "abort"
 [dependencies]
 anyhow = "1.0.104"
 directories = "6.0.0"
+hound = "3.5.1"
+parakeet-rs = "0.4.1"
+rubato = "5.0.1"
 ureq = "3.4.2"

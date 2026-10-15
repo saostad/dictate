@@ -1,4 +1,8 @@
+mod asr;
+mod audio;
 mod model;
+
+use std::path::Path;
 
 fn main() -> anyhow::Result<()> {
     if let Err(err) = run() {
@@ -16,7 +20,13 @@ fn run() -> anyhow::Result<()> {
     };
     match command.as_str() {
         "download" => model::download(),
-        "transcribe" => anyhow::bail!("the transcribe command is not implemented yet"),
+        "transcribe" => {
+            let Some(file) = args.next() else {
+                eprintln!("Usage: dictate transcribe <file.wav>");
+                std::process::exit(2);
+            };
+            transcribe(Path::new(&file))
+        }
         "help" | "--help" => {
             println!("{}", usage());
             Ok(())
@@ -26,6 +36,23 @@ fn run() -> anyhow::Result<()> {
             std::process::exit(2);
         }
     }
+}
+
+fn transcribe(path: &Path) -> anyhow::Result<()> {
+    let dir = model::model_dir_checked()?;
+    let samples = audio::load_wav_16k_mono(path)?;
+    let start = std::time::Instant::now();
+    let mut asr = asr::Asr::load(&dir)?;
+    eprintln!("model loaded in {} ms", start.elapsed().as_millis());
+    let seconds = samples.len() as f32 / 16_000.0;
+    let start = std::time::Instant::now();
+    let text = asr.transcribe(&samples)?;
+    eprintln!(
+        "transcribed {seconds:.1} s of audio in {} ms",
+        start.elapsed().as_millis()
+    );
+    println!("{text}");
+    Ok(())
 }
 
 fn usage() -> &'static str {
