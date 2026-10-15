@@ -52,7 +52,19 @@ pub(crate) fn socket_path() -> anyhow::Result<PathBuf> {
 }
 
 /// Run one client command: send it to the daemon and print the reply.
+/// Failures (except `status`) also pop a desktop notification, since keybind
+/// runs show no stderr; the error is still returned for the exit code.
 pub(crate) fn client_command(cmd: &str) -> anyhow::Result<()> {
+    if let Err(err) = client_command_inner(cmd) {
+        if cmd != "status" {
+            crate::notify::show(crate::notify::Kind::Error, "dictate", &format!("{err:#}"));
+        }
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn client_command_inner(cmd: &str) -> anyhow::Result<()> {
     let path = socket_path()?;
     let mut stream = UnixStream::connect(&path).map_err(|err| {
         anyhow::anyhow!(

@@ -188,6 +188,7 @@ struct DaemonApp {
     hotkey_id: Option<u32>,
     press_started: Option<Instant>,
     tap_armed: bool,
+    worker_gone_notified: bool,
     /// Held so the registration stays alive; dropping it would unregister.
     /// Never read, hence the underscore.
     _hotkey_manager: Option<GlobalHotKeyManager>,
@@ -203,6 +204,7 @@ impl DaemonApp {
             hotkey_id: None,
             press_started: None,
             tap_armed: false,
+            worker_gone_notified: false,
             _hotkey_manager: None,
         }
     }
@@ -212,6 +214,14 @@ impl DaemonApp {
     fn handle_command(&mut self, cmd: Command) -> String {
         if self.worker.is_finished() {
             eprintln!("error: The transcription worker thread ended unexpectedly");
+            if !self.worker_gone_notified {
+                self.worker_gone_notified = true;
+                crate::notify::show(
+                    crate::notify::Kind::Error,
+                    "dictate: transcription worker stopped",
+                    "Restart \"dictate daemon\".",
+                );
+            }
             return "err transcription worker stopped; restart \"dictate daemon\"".to_string();
         }
         let (new_state, action, ok_reply) = next(self.state, cmd);
@@ -333,6 +343,11 @@ fn run_action(
             }
             Err(err) => {
                 eprintln!("error: {err:#}");
+                crate::notify::show(
+                    crate::notify::Kind::Error,
+                    "dictate: recording failed",
+                    &format!("{err:#}"),
+                );
                 format!("err {err:#}")
             }
         },
@@ -348,18 +363,33 @@ fn run_action(
                         *state = State::Idle;
                         let message = format!("Could not queue audio for transcription: {err}");
                         eprintln!("error: {message}");
+                        crate::notify::show(
+                            crate::notify::Kind::Error,
+                            "dictate: recording failed",
+                            &message,
+                        );
                         format!("err {message}")
                     }
                 },
                 Err(err) => {
                     *state = State::Idle;
                     eprintln!("error: {err:#}");
+                    crate::notify::show(
+                        crate::notify::Kind::Error,
+                        "dictate: recording failed",
+                        &format!("{err:#}"),
+                    );
                     format!("err {err:#}")
                 }
             },
             None => {
                 *state = State::Idle;
                 eprintln!("error: the daemon was recording but its recorder is gone");
+                crate::notify::show(
+                    crate::notify::Kind::Error,
+                    "dictate: recording failed",
+                    "the daemon was recording but its recorder is gone",
+                );
                 "err not recording".to_string()
             }
         },
@@ -386,18 +416,29 @@ fn transcribe_worker(
         let seconds = samples.len() as f32 / 16_000.0;
         if crate::mic::recording_too_short(&samples) {
             let ms = samples.len() as u64 * 1000 / 16_000;
-            eprintln!("Recording too short ({ms} ms); nothing to transcribe.");
+            let message = format!("Recording too short ({ms} ms); nothing to transcribe.");
+            eprintln!("{message}");
+            crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
         } else {
             let start = Instant::now();
             match asr.transcribe(&samples) {
                 Ok(text) => {
                     if crate::asr::is_empty_transcript(&text) {
-                        eprintln!("{}", crate::asr::no_speech_message(seconds));
+                        let message = crate::asr::no_speech_message(seconds);
+                        eprintln!("{message}");
+                        crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
                     } else {
                         type_and_log(&text, seconds, start, typer.as_mut());
                     }
                 }
-                Err(err) => eprintln!("error: {err:#}"),
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    crate::notify::show(
+                        crate::notify::Kind::Error,
+                        "dictate: transcription failed",
+                        &format!("{err:#}"),
+                    );
+                }
             }
         }
         if proxy.send_event(UserEvent::WorkerDone).is_err() {
@@ -427,6 +468,11 @@ fn type_and_log(
         Err(err) => {
             eprintln!("error: {err:#}");
             eprintln!("Text that was not typed: {text}");
+            crate::notify::show(
+                crate::notify::Kind::Error,
+                "dictate: could not type the text",
+                &crate::notify::typing_failure_body(&format!("{err:#}"), text),
+            );
         }
     }
 }

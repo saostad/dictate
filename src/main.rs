@@ -15,6 +15,7 @@ mod daemon;
 mod hotkey;
 mod mic;
 mod model;
+mod notify;
 mod typer;
 
 use std::path::Path;
