@@ -1,3 +1,5 @@
+mod model;
+
 fn main() -> anyhow::Result<()> {
     if let Err(err) = run() {
         eprintln!("error: {err:#}");
@@ -13,7 +15,7 @@ fn run() -> anyhow::Result<()> {
         std::process::exit(2);
     };
     match command.as_str() {
-        "download" => anyhow::bail!("the download command is not implemented yet"),
+        "download" => model::download(),
         "transcribe" => anyhow::bail!("the transcribe command is not implemented yet"),
         "help" | "--help" => {
             println!("{}", usage());
