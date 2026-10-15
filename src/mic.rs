@@ -76,16 +76,39 @@ impl Recorder {
         })
     }
 
+    /// Device sample rate of this recording.
+    pub(crate) fn sample_rate(&self) -> u32 {
+        self.sample_rate
+    }
+
+    /// Shared capture buffer for the streaming feeder thread.
+    /// The `Recorder` (with its non-`Send` stream) stays on the event-loop
+    /// thread; only this `Arc` crosses threads.
+    pub(crate) fn buffer_handle(&self) -> Arc<Mutex<Vec<f32>>> {
+        self.samples.clone()
+    }
+
+    /// First stream error text, if any. Never panics on a poisoned mutex.
+    pub(crate) fn stream_error(&self) -> Option<String> {
+        stream_error_text(&self.stream_error)
+    }
+
+    /// Drain the mono device-rate samples captured since the last call.
+    /// Empties the buffer so streaming never grows memory. Never panics.
+    pub(crate) fn take_new(&self) -> Vec<f32> {
+        take_buffer(&self.samples)
+    }
+
     /// Stop recording and return the audio as 16 kHz mono samples.
     pub(crate) fn stop(self) -> anyhow::Result<Vec<f32>> {
+        // Drain most samples before stopping, then the trailing few after
+        // the stream is dropped, so no sample is lost.
+        let mut mono = self.take_new();
         drop(self.stream);
         if let Some(text) = stream_error_text(&self.stream_error) {
             anyhow::bail!("Microphone stream error: {text}");
         }
-        let mono = match self.samples.lock() {
-            Ok(buffer) => buffer.clone(),
-            Err(poisoned) => poisoned.into_inner().clone(),
-        };
+        mono.extend(take_buffer(&self.samples));
         if mono.is_empty() || self.sample_rate == crate::audio::TARGET_SAMPLE_RATE {
             return Ok(mono);
         }
@@ -158,6 +181,15 @@ fn stream_error_text(slot: &Mutex<Option<String>>) -> Option<String> {
     match slot.lock() {
         Ok(guard) => guard.clone(),
         Err(poisoned) => poisoned.into_inner().clone(),
+    }
+}
+
+/// Drain a shared capture buffer, leaving it empty. Never panics, even on a
+/// poisoned mutex.
+pub(crate) fn take_buffer(buffer: &Mutex<Vec<f32>>) -> Vec<f32> {
+    match buffer.lock() {
+        Ok(mut guard) => std::mem::take(&mut *guard),
+        Err(poisoned) => std::mem::take(&mut *poisoned.into_inner()),
     }
 }
 

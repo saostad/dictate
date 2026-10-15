@@ -81,7 +81,8 @@ impl Segmenter {
         if !self.pending.is_empty() {
             let need = self.frame_len - self.pending.len();
             let take = need.min(samples.len() - offset);
-            self.pending.extend_from_slice(&samples[offset..offset + take]);
+            self.pending
+                .extend_from_slice(&samples[offset..offset + take]);
             offset += take;
             if self.pending.len() == self.frame_len {
                 let frame = std::mem::take(&mut self.pending);
@@ -180,12 +181,7 @@ impl Segmenter {
         // The head holds the segment's speech by construction (the trailing
         // run is silence), so trimming always yields `Some`; fall back to the
         // untrimmed head rather than panic on the unreachable `None`.
-        let head = match trim_leading_by(
-            head,
-            first_speech,
-            self.frame_len,
-            self.preroll_frames,
-        ) {
+        let head = match trim_leading_by(head, first_speech, self.frame_len, self.preroll_frames) {
             Some(head) => head,
             None => self.samples[..cut].to_vec(),
         };
@@ -216,9 +212,7 @@ impl Segmenter {
         let cut = cut_frames * self.frame_len;
         let cut = cut.min(self.samples.len());
         let first_has_speech = self.speech[..cut_frames].iter().any(|&speech| speech);
-        let first_speech = self.speech[..cut_frames]
-            .iter()
-            .position(|&speech| speech);
+        let first_speech = self.speech[..cut_frames].iter().position(|&speech| speech);
         let head = self.samples[..cut].to_vec();
         let remainder = self.samples[cut..].to_vec();
         let remainder_rms = self.rms[cut_frames..].to_vec();
@@ -275,9 +269,7 @@ mod tests {
     fn tone(secs: f32) -> Vec<f32> {
         let len = (secs * RATE as f32) as usize;
         (0..len)
-            .map(|i| {
-                0.2 * (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / RATE as f32).sin()
-            })
+            .map(|i| 0.2 * (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / RATE as f32).sin())
             .collect()
     }
 
@@ -285,9 +277,7 @@ mod tests {
     fn silence(secs: f32) -> Vec<f32> {
         let len = (secs * RATE as f32) as usize;
         (0..len)
-            .map(|i| {
-                0.001 * (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / RATE as f32).sin()
-            })
+            .map(|i| 0.001 * (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / RATE as f32).sin())
             .collect()
     }
 
@@ -315,16 +305,12 @@ mod tests {
         audio.extend(tone(2.0));
         let mut segmenter = Segmenter::new(RATE);
         let mut segments = push_chunked(&mut segmenter, &audio);
-        let tail = segmenter.finish();
-        if tail.is_some() {
-            segments.push(tail.unwrap());
+        if let Some(tail) = segmenter.finish() {
+            segments.push(tail);
         }
         assert_eq!(segments.len(), 2, "a 600 ms pause must split");
         for (index, segment) in segments.iter().enumerate() {
-            assert!(
-                !segment.is_empty(),
-                "segment {index} must hold audio"
-            );
+            assert!(!segment.is_empty(), "segment {index} must hold audio");
         }
     }
 

@@ -92,6 +92,42 @@ pub(crate) fn next(state: State, cmd: Command) -> (State, Action, &'static str) 
     }
 }
 
+/// One unit of work for the transcription worker.
+#[derive(Debug)]
+pub(crate) enum Job {
+    /// Whole recording at 16 kHz (streaming off): today's exact path.
+    Full(Vec<f32>),
+    /// One pause segment at 16 kHz (streaming on).
+    Segment(Vec<f32>),
+    /// End of a streaming recording: whole-recording duration plus the moment
+    /// Stop was handled, so the worker can log latency after release.
+    End {
+        total_seconds: f32,
+        stop_time: Instant,
+    },
+    /// Discard a streaming recording; already-typed text stays.
+    Cancel,
+}
+
+/// Control message for the streaming feeder thread.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeederCmd {
+    Stop,
+    Cancel,
+}
+
+/// A running feeder thread (streaming on, while Recording only).
+struct FeederSession {
+    control_tx: mpsc::Sender<FeederCmd>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+/// True unless `DICTATE_STREAMING=0`. (Item 3 adds the config file key and the
+/// tray checkbox; the worker/feeder protocol here is unchanged.)
+fn streaming_enabled() -> bool {
+    std::env::var("DICTATE_STREAMING").as_deref() != Ok("0")
+}
+
 /// Events handled on the daemon's event-loop thread.
 #[derive(Debug)]
 pub(crate) enum UserEvent {
@@ -241,7 +277,7 @@ fn run_daemon_inner() -> anyhow::Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("Could not start the daemon event loop")?;
-    let (to_worker, worker_rx) = mpsc::channel::<Vec<f32>>();
+    let (to_worker, worker_rx) = mpsc::channel::<Job>();
     let worker_proxy = event_loop.create_proxy();
     let worker = std::thread::spawn(move || transcribe_worker(worker_rx, worker_proxy, asr));
     #[cfg(unix)]
@@ -306,7 +342,8 @@ fn setup_hotkey(
 struct DaemonApp {
     state: State,
     recorder: Option<crate::mic::Recorder>,
-    to_worker: mpsc::Sender<Vec<f32>>,
+    feeder: Option<FeederSession>,
+    to_worker: mpsc::Sender<Job>,
     worker: std::thread::JoinHandle<()>,
     hotkey: Option<HotKey>,
     hotkey_display: String,
@@ -324,7 +361,7 @@ struct DaemonApp {
 
 impl DaemonApp {
     fn new(
-        to_worker: mpsc::Sender<Vec<f32>>,
+        to_worker: mpsc::Sender<Job>,
         worker: std::thread::JoinHandle<()>,
         settings: crate::config::Settings,
         menu_proxy: EventLoopProxy<UserEvent>,
@@ -332,6 +369,7 @@ impl DaemonApp {
         Self {
             state: State::Idle,
             recorder: None,
+            feeder: None,
             to_worker,
             worker,
             hotkey: None,
@@ -363,14 +401,7 @@ impl DaemonApp {
             return "err transcription worker stopped; restart \"dictate daemon\"".to_string();
         }
         let (new_state, action, ok_reply) = next(self.state, cmd);
-        let reply = run_action(
-            action,
-            new_state,
-            ok_reply,
-            &mut self.state,
-            &mut self.recorder,
-            &self.to_worker,
-        );
+        let reply = self.run_action(action, new_state, ok_reply);
         if self.state != State::Recording {
             self.tap_armed = false;
         }
@@ -380,7 +411,7 @@ impl DaemonApp {
 
     /// Map a hotkey press/release to a command and run it. A hotkey has no
     /// requester, so the reply is dropped; genuine failures are already
-    /// logged by [`run_action`].
+    /// logged by [`DaemonApp::run_action`].
     fn handle_hotkey(&mut self, event: GlobalHotKeyEvent) {
         if self.hotkey.map(|hotkey| hotkey.id()) != Some(event.id) {
             return;
@@ -588,6 +619,155 @@ impl DaemonApp {
             crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
         }
     }
+
+    /// Run the state-machine action, updating `state`, and return the reply.
+    /// I/O failures are logged and turn the reply into `err ...`.
+    fn run_action(&mut self, action: Action, new_state: State, ok_reply: &str) -> String {
+        match action {
+            Action::None => {
+                self.state = new_state;
+                ok_reply.to_string()
+            }
+            Action::StartRecording => self.start_recording(new_state, ok_reply),
+            Action::StopRecording => self.stop_recording(new_state, ok_reply),
+            Action::CancelRecording => self.cancel_recording(new_state, ok_reply),
+        }
+    }
+
+    /// Start the mic, and the feeder thread when streaming is on.
+    fn start_recording(&mut self, new_state: State, ok_reply: &str) -> String {
+        match crate::mic::Recorder::start() {
+            Ok(started) => {
+                if streaming_enabled() {
+                    let buffer = started.buffer_handle();
+                    let sample_rate = started.sample_rate();
+                    let (control_tx, control_rx) = mpsc::channel::<FeederCmd>();
+                    let to_worker = self.to_worker.clone();
+                    let thread = std::thread::spawn(move || {
+                        feeder_loop(buffer, sample_rate, control_rx, to_worker);
+                    });
+                    self.feeder = Some(FeederSession {
+                        control_tx,
+                        thread: Some(thread),
+                    });
+                    self.recorder = Some(started);
+                } else {
+                    self.recorder = Some(started);
+                }
+                self.state = new_state;
+                crate::cue::play_start();
+                ok_reply.to_string()
+            }
+            Err(err) => {
+                dlog!("error: {err:#}");
+                crate::notify::show(
+                    crate::notify::Kind::Error,
+                    "dictate: recording failed",
+                    &format!("{err:#}"),
+                );
+                format!("err {err:#}")
+            }
+        }
+    }
+
+    /// Stop the mic. Streaming on: the feeder sends the tail plus `End` and
+    /// the state stays Transcribing until the worker is done. Streaming off:
+    /// today's exact path (one `Full` job at stop).
+    fn stop_recording(&mut self, new_state: State, ok_reply: &str) -> String {
+        if self.feeder.is_some() {
+            return self.stop_streaming(new_state, ok_reply);
+        }
+        match self.recorder.take() {
+            Some(started) => match started.stop() {
+                Ok(samples) => match self.to_worker.send(Job::Full(samples)) {
+                    Ok(()) => {
+                        self.state = new_state;
+                        crate::cue::play_stop();
+                        ok_reply.to_string()
+                    }
+                    Err(err) => {
+                        self.state = State::Idle;
+                        self.recording_failed(format!(
+                            "Could not queue audio for transcription: {err}"
+                        ))
+                    }
+                },
+                Err(err) => {
+                    self.state = State::Idle;
+                    self.recording_failed(format!("{err:#}"))
+                }
+            },
+            None => {
+                self.state = State::Idle;
+                self.recording_failed(
+                    "the daemon was recording but its recorder is gone".to_string(),
+                );
+                "err not recording".to_string()
+            }
+        }
+    }
+
+    /// Stop a streaming recording via the feeder thread.
+    fn stop_streaming(&mut self, new_state: State, ok_reply: &str) -> String {
+        // A mic failure discards the recording instead of finishing it.
+        if let Some(recorder) = &self.recorder
+            && let Some(text) = recorder.stream_error()
+        {
+            self.finish_feeder(FeederCmd::Cancel);
+            self.recorder = None;
+            self.state = State::Idle;
+            return self.recording_failed(format!("Microphone stream error: {text}"));
+        }
+        let Some(recorder) = self.recorder.take() else {
+            self.finish_feeder(FeederCmd::Cancel);
+            self.state = State::Idle;
+            self.recording_failed("the daemon was recording but its recorder is gone".to_string());
+            return "err not recording".to_string();
+        };
+        drop(recorder);
+        self.finish_feeder(FeederCmd::Stop);
+        self.state = new_state;
+        crate::cue::play_stop();
+        ok_reply.to_string()
+    }
+
+    /// Cancel the recording. Streaming on: the feeder sends `Cancel` and the
+    /// worker discards queued segments (already-typed text stays).
+    fn cancel_recording(&mut self, new_state: State, ok_reply: &str) -> String {
+        self.finish_feeder(FeederCmd::Cancel);
+        self.recorder = None;
+        self.state = new_state;
+        ok_reply.to_string()
+    }
+
+    /// Signal the feeder thread (`Stop`/`Cancel`) and wait for it to exit.
+    /// No feeder: no-op. A dead feeder unblocks the worker with `Cancel`.
+    fn finish_feeder(&mut self, cmd: FeederCmd) {
+        let Some(mut session) = self.feeder.take() else {
+            return;
+        };
+        let signalled = session.control_tx.send(cmd).is_ok();
+        if let Some(thread) = session.thread.take()
+            && thread.join().is_err()
+        {
+            dlog!("error: the streaming feeder thread panicked");
+        }
+        if !signalled && self.to_worker.send(Job::Cancel).is_err() {
+            // The worker is gone; `handle_command` reports that itself.
+        }
+    }
+
+    /// Log + notify a recording failure and build its `err` reply.
+    /// The caller sets the state; the message is returned for the reply.
+    fn recording_failed(&self, message: String) -> String {
+        dlog!("error: {message}");
+        crate::notify::show(
+            crate::notify::Kind::Error,
+            "dictate: recording failed",
+            &message,
+        );
+        format!("err {message}")
+    }
 }
 
 impl ApplicationHandler<UserEvent> for DaemonApp {
@@ -642,92 +822,131 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
     }
 }
 
-/// Run the state-machine action, updating `state`, and return the reply.
-/// I/O failures are logged and turn the reply into `err ...`.
-fn run_action(
-    action: Action,
-    new_state: State,
-    ok_reply: &str,
-    state: &mut State,
-    recorder: &mut Option<crate::mic::Recorder>,
-    to_worker: &mpsc::Sender<Vec<f32>>,
-) -> String {
-    match action {
-        Action::None => {
-            *state = new_state;
-            ok_reply.to_string()
-        }
-        Action::StartRecording => match crate::mic::Recorder::start() {
-            Ok(started) => {
-                *recorder = Some(started);
-                *state = new_state;
-                crate::cue::play_start();
-                ok_reply.to_string()
-            }
-            Err(err) => {
-                dlog!("error: {err:#}");
-                crate::notify::show(
-                    crate::notify::Kind::Error,
-                    "dictate: recording failed",
-                    &format!("{err:#}"),
-                );
-                format!("err {err:#}")
-            }
-        },
-        Action::StopRecording => match recorder.take() {
-            Some(started) => match started.stop() {
-                Ok(samples) => match to_worker.send(samples) {
-                    Ok(()) => {
-                        *state = new_state;
-                        crate::cue::play_stop();
-                        ok_reply.to_string()
-                    }
-                    Err(err) => {
-                        *state = State::Idle;
-                        let message = format!("Could not queue audio for transcription: {err}");
-                        dlog!("error: {message}");
-                        crate::notify::show(
-                            crate::notify::Kind::Error,
-                            "dictate: recording failed",
-                            &message,
-                        );
-                        format!("err {message}")
-                    }
-                },
-                Err(err) => {
-                    *state = State::Idle;
-                    dlog!("error: {err:#}");
-                    crate::notify::show(
-                        crate::notify::Kind::Error,
-                        "dictate: recording failed",
-                        &format!("{err:#}"),
-                    );
-                    format!("err {err:#}")
+/// Streaming feeder thread: while Recording, wake every 100 ms, drain new
+/// device-rate samples, split them into pause segments, resample each to
+/// 16 kHz and send it to the worker. On `Stop` the tail plus `End` go out;
+/// on `Cancel` a single `Cancel` goes out. Only the `Arc` buffer crosses
+/// threads; the `Recorder` stays on the event-loop thread.
+fn feeder_loop(
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+    sample_rate: u32,
+    control_rx: mpsc::Receiver<FeederCmd>,
+    to_worker: mpsc::Sender<Job>,
+) {
+    let mut segmenter = crate::segment::Segmenter::new(sample_rate);
+    let mut total_device_samples: u64 = 0;
+    loop {
+        match control_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(FeederCmd::Stop) => {
+                let new = crate::mic::take_buffer(&buffer);
+                total_device_samples += new.len() as u64;
+                for segment in segmenter.push(&new) {
+                    send_segment(&to_worker, &segment, sample_rate);
                 }
-            },
-            None => {
-                *state = State::Idle;
-                dlog!("error: the daemon was recording but its recorder is gone");
+                let total_seconds = total_device_samples as f32 / sample_rate.max(1) as f32;
+                // Recordings under 0.3 s keep today's too-short message: drop
+                // the tail so the worker sees only `End`.
+                let too_short = total_device_samples * 1000 < u64::from(sample_rate.max(1)) * 300;
+                if !too_short && let Some(tail) = segmenter.finish() {
+                    send_segment(&to_worker, &tail, sample_rate);
+                }
+                if to_worker
+                    .send(Job::End {
+                        total_seconds,
+                        stop_time: Instant::now(),
+                    })
+                    .is_err()
+                {
+                    // The worker is gone; the event loop reports that itself.
+                }
+                break;
+            }
+            Ok(FeederCmd::Cancel) => {
+                if to_worker.send(Job::Cancel).is_err() {
+                    // The worker is gone; the event loop reports that itself.
+                }
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let new = crate::mic::take_buffer(&buffer);
+                if new.is_empty() {
+                    continue;
+                }
+                total_device_samples += new.len() as u64;
+                for segment in segmenter.push(&new) {
+                    send_segment(&to_worker, &segment, sample_rate);
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The event loop went away without Stop/Cancel; unblock the
+                // worker rather than leave it Transcribing forever.
+                if to_worker.send(Job::Cancel).is_err() {
+                    // The worker is gone too.
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// Resample one device-rate segment to 16 kHz and queue it. Failures are
+/// logged + notified and the segment is skipped; dictation continues.
+fn send_segment(to_worker: &mpsc::Sender<Job>, segment: &[f32], sample_rate: u32) {
+    if segment.is_empty() {
+        return;
+    }
+    let samples_16k = if sample_rate == crate::audio::TARGET_SAMPLE_RATE {
+        segment.to_vec()
+    } else {
+        match crate::audio::resample(segment, sample_rate) {
+            Ok(samples) => samples,
+            Err(err) => {
+                let message = format!(
+                    "Could not resample microphone audio from {sample_rate} Hz to 16000 Hz: {err:#}"
+                );
+                dlog!("error: {message}");
                 crate::notify::show(
                     crate::notify::Kind::Error,
                     "dictate: recording failed",
-                    "the daemon was recording but its recorder is gone",
+                    &message,
                 );
-                "err not recording".to_string()
+                return;
             }
-        },
-        Action::CancelRecording => {
-            *recorder = None;
-            *state = new_state;
-            ok_reply.to_string()
         }
+    };
+    if to_worker.send(Job::Segment(samples_16k)).is_err() {
+        // The worker is gone; the event loop reports that itself.
+    }
+}
+
+/// Join one streaming segment onto already-typed text: prepend a space unless
+/// the new text starts with closing punctuation.
+fn join_segment_text(already_typed: bool, text: &str) -> String {
+    if !already_typed {
+        return text.to_string();
+    }
+    let starts_with_closing = text.chars().next().is_some_and(|first| {
+        matches!(
+            first,
+            '.' | ',' | '!' | '?' | ';' | ':' | ')' | ']' | '}' | '\'' | '…'
+        )
+    });
+    if starts_with_closing {
+        text.to_string()
+    } else {
+        format!(" {text}")
     }
 }
 
 /// Owns the `Asr`: transcribes queued recordings and signals completion.
 /// Never exits while the daemon runs; every failure is logged.
+///
+/// `Full` is the streaming-off path (today's exact behavior).
+/// `Segment`/`End`/`Cancel` are the streaming path: each segment is typed
+/// as it finishes, at `End` the latency line goes out, and `Cancel`
+/// discards queued segments without typing anything more.
 fn transcribe_worker(
-    rx: mpsc::Receiver<Vec<f32>>,
+    rx: mpsc::Receiver<Job>,
     proxy: EventLoopProxy<UserEvent>,
     mut asr: crate::asr::Asr,
 ) {
@@ -735,37 +954,173 @@ fn transcribe_worker(
     if let Err(err) = &typer {
         dlog!("error: {err:#}");
     }
-    for samples in rx {
-        let seconds = samples.len() as f32 / 16_000.0;
-        if crate::mic::recording_too_short(&samples) {
-            let ms = samples.len() as u64 * 1000 / 16_000;
-            let message = format!("Recording too short ({ms} ms); nothing to transcribe.");
-            dlog!("{message}");
-            crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
+    // Local queue: segments drained while a transcription was running wait
+    // here, in order, so a `Cancel` spotted mid-transcription can discard
+    // them before anything more is typed.
+    let mut queue: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
+    // Per-recording streaming state.
+    let mut typed_any = false;
+    let mut segments: usize = 0;
+    let mut failures: usize = 0;
+    let worker_done =
+        |proxy: &EventLoopProxy<UserEvent>| proxy.send_event(UserEvent::WorkerDone).is_err();
+    loop {
+        let job = if let Some(job) = queue.pop_front() {
+            job
         } else {
-            let start = Instant::now();
-            match asr.transcribe(&samples) {
-                Ok(text) => {
-                    if crate::asr::is_empty_transcript(&text) {
-                        let message = crate::asr::no_speech_message(seconds);
+            match rx.recv() {
+                Ok(job) => job,
+                Err(_) => break,
+            }
+        };
+        match job {
+            Job::Full(samples) => {
+                transcribe_full(&samples, &mut asr, typer.as_mut());
+                if worker_done(&proxy) {
+                    break;
+                }
+            }
+            Job::Segment(samples) => {
+                segments += 1;
+                let seq = segments;
+                let seconds = samples.len() as f32 / 16_000.0;
+                let start = Instant::now();
+                let text = match asr.transcribe(&samples) {
+                    Ok(text) => text,
+                    Err(err) => {
+                        dlog!("error: {err:#}");
+                        crate::notify::show(
+                            crate::notify::Kind::Error,
+                            "dictate: transcription failed",
+                            &format!("{err:#}"),
+                        );
+                        failures += 1;
+                        continue;
+                    }
+                };
+                let transcribe_ms = start.elapsed().as_millis();
+                if crate::asr::is_empty_transcript(&text) {
+                    continue;
+                }
+                // A `Cancel` that arrived mid-transcription discards this
+                // segment's text and every queued job up to it.
+                while let Ok(pending) = rx.try_recv() {
+                    queue.push_back(pending);
+                }
+                if let Some(position) = queue.iter().position(|job| matches!(job, Job::Cancel)) {
+                    for _ in 0..=position {
+                        queue.pop_front();
+                    }
+                    typed_any = false;
+                    segments = 0;
+                    failures = 0;
+                    if worker_done(&proxy) {
+                        break;
+                    }
+                    continue;
+                }
+                let to_type = join_segment_text(typed_any, &text);
+                let type_start = Instant::now();
+                let typed = match typer.as_mut() {
+                    Ok(typer) => typer.type_text(&to_type),
+                    Err(err) => Err(anyhow::anyhow!("{err:#}")),
+                };
+                let type_ms = type_start.elapsed().as_millis();
+                match typed {
+                    Ok(()) => {
+                        typed_any = true;
+                        dlog!(
+                            "segment {seq}: {seconds:.1} s audio, transcribed in {transcribe_ms} ms, typed {} chars in {type_ms} ms",
+                            to_type.chars().count()
+                        );
+                    }
+                    Err(err) => {
+                        failures += 1;
+                        dlog!("error: {err:#}");
+                        dlog!("Text that was not typed: {to_type}");
+                        crate::notify::show(
+                            crate::notify::Kind::Error,
+                            "dictate: could not type the text",
+                            &crate::notify::typing_failure_body(&format!("{err:#}"), &to_type),
+                        );
+                    }
+                }
+            }
+            Job::End {
+                total_seconds,
+                stop_time,
+            } => {
+                if typed_any {
+                    dlog!(
+                        "done {} ms after stop (total {total_seconds:.1} s audio, {segments} segments)",
+                        stop_time.elapsed().as_millis()
+                    );
+                } else if failures == 0 {
+                    if total_seconds * 1000.0
+                        < crate::mic::MIN_RECORDING_SAMPLES as f32 / 16_000.0 * 1000.0
+                    {
+                        let ms = (total_seconds * 1000.0) as u64;
+                        let message =
+                            format!("Recording too short ({ms} ms); nothing to transcribe.");
                         dlog!("{message}");
                         crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
                     } else {
-                        type_and_log(&text, seconds, start, typer.as_mut());
+                        let message = crate::asr::no_speech_message(total_seconds);
+                        dlog!("{message}");
+                        crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
                     }
                 }
-                Err(err) => {
-                    dlog!("error: {err:#}");
-                    crate::notify::show(
-                        crate::notify::Kind::Error,
-                        "dictate: transcription failed",
-                        &format!("{err:#}"),
-                    );
+                typed_any = false;
+                segments = 0;
+                failures = 0;
+                if worker_done(&proxy) {
+                    break;
+                }
+            }
+            Job::Cancel => {
+                typed_any = false;
+                segments = 0;
+                failures = 0;
+                if worker_done(&proxy) {
+                    break;
                 }
             }
         }
-        if proxy.send_event(UserEvent::WorkerDone).is_err() {
-            break;
+    }
+}
+
+/// Transcribe one whole recording (streaming off): today's exact behavior.
+fn transcribe_full(
+    samples: &[f32],
+    asr: &mut crate::asr::Asr,
+    typer: Result<&mut crate::typer::Typer, &mut anyhow::Error>,
+) {
+    let seconds = samples.len() as f32 / 16_000.0;
+    if crate::mic::recording_too_short(samples) {
+        let ms = samples.len() as u64 * 1000 / 16_000;
+        let message = format!("Recording too short ({ms} ms); nothing to transcribe.");
+        dlog!("{message}");
+        crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
+    } else {
+        let start = Instant::now();
+        match asr.transcribe(samples) {
+            Ok(text) => {
+                if crate::asr::is_empty_transcript(&text) {
+                    let message = crate::asr::no_speech_message(seconds);
+                    dlog!("{message}");
+                    crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
+                } else {
+                    type_and_log(&text, seconds, start, typer);
+                }
+            }
+            Err(err) => {
+                dlog!("error: {err:#}");
+                crate::notify::show(
+                    crate::notify::Kind::Error,
+                    "dictate: transcription failed",
+                    &format!("{err:#}"),
+                );
+            }
         }
     }
 }
@@ -866,5 +1221,14 @@ mod tests {
             daemon_log_path_for(Path::new("/data")),
             PathBuf::from("/data/daemon.log")
         );
+    }
+
+    #[test]
+    fn segment_joining_spaces_words_but_not_punctuation() {
+        assert_eq!(join_segment_text(false, "hello"), "hello");
+        assert_eq!(join_segment_text(true, "world"), " world");
+        assert_eq!(join_segment_text(true, ", world"), ", world");
+        assert_eq!(join_segment_text(true, ". Next"), ". Next");
+        assert_eq!(join_segment_text(true, "(aside)"), " (aside)");
     }
 }
