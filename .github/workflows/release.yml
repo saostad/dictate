@@ -1,0 +1,184 @@
+name: release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check tag matches Cargo.toml version
+        run: |
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION"
+            exit 1
+          fi
+
+  build:
+    needs: check-version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - asset: dictate-linux-x86_64
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            flags: ""
+          - asset: dictate-linux-x86_64-system-ort
+            os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            flags: --no-default-features --features system-ort
+          - asset: dictate-linux-aarch64
+            os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+            flags: ""
+          - asset: dictate-macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            flags: ""
+          - asset: dictate-windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            flags: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.asset }}
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.flags }}
+      - name: Smoke test (Unix)
+        if: runner.os != 'Windows'
+        run: ./target/${{ matrix.target }}/release/dictate help
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: .\target\${{ matrix.target }}\release\dictate.exe help
+      - name: Show linked libraries (Linux bundled builds)
+        if: runner.os == 'Linux' && !contains(matrix.asset, 'system-ort')
+        run: ldd target/${{ matrix.target }}/release/dictate
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -eu
+          ASSET="${{ matrix.asset }}"
+          TARGET="${{ matrix.target }}"
+          mkdir -p "$ASSET"
+          cp "target/$TARGET/release/dictate" "$ASSET/"
+          cp README.md LICENSE "$ASSET/"
+          echo "Bundled runtime libraries:"
+          found=0
+          for f in "target/$TARGET/release/"*.dll "target/$TARGET/release/"*.dylib "target/$TARGET/release/"*.so*; do
+            [ -e "$f" ] || continue
+            cp "$f" "$ASSET/"
+            echo "  $(basename "$f")"
+            found=1
+          done
+          if [ "$found" = 0 ]; then
+            echo "  (none)"
+          fi
+          tar -czf "$ASSET.tar.gz" "$ASSET"
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $asset = "${{ matrix.asset }}"
+          $target = "${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $asset | Out-Null
+          Copy-Item "target\$target\release\dictate.exe" "$asset\"
+          Copy-Item "README.md" "$asset\"
+          Copy-Item "LICENSE" "$asset\"
+          Write-Output "Bundled runtime libraries:"
+          $libs = Get-ChildItem "target\$target\release" -File | Where-Object { $_.Name -match '\.(dll|dylib|so(\..*)?)$' }
+          if ($libs) {
+            foreach ($lib in $libs) {
+              Copy-Item $lib.FullName "$asset\"
+              Write-Output ("  " + $lib.Name)
+            }
+          } else {
+            Write-Output "  (none)"
+          }
+          Compress-Archive -Path $asset -DestinationPath "$asset.zip"
+      - name: Write checksum (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          shasum -a 256 "${{ matrix.asset }}.tar.gz" > "${{ matrix.asset }}.tar.gz.sha256"
+          cat "${{ matrix.asset }}.tar.gz.sha256"
+      - name: Write checksum (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $archive = "${{ matrix.asset }}.zip"
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
+          Get-Content "$archive.sha256"
+      - uses: actions/upload-artifact@v4
+        if: runner.os != 'Windows'
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}.tar.gz
+            ${{ matrix.asset }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Windows'
+        with:
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}.zip
+            ${{ matrix.asset }}.zip.sha256
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+      - name: List artifacts
+        run: ls -la dist
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
+          generate_release_notes: true
+          body: |
+            ## Which file do I download?
+
+            | Your system | File |
+            |---|---|
+            | Linux, x86_64 (most PCs) | `dictate-linux-x86_64.tar.gz` |
+            | Linux, x86_64, CPU without AVX2 | `dictate-linux-x86_64-system-ort.tar.gz` (needs a system ONNX Runtime, see below) |
+            | Linux, aarch64 | `dictate-linux-aarch64.tar.gz` |
+            | macOS, Apple Silicon | `dictate-macos-aarch64.tar.gz` |
+            | Windows, x86_64 | `dictate-windows-x86_64.zip` |
+
+            There is no Intel macOS build (ONNX Runtime ships no prebuilt library for it).
+
+            **CPUs without AVX2:** if the regular Linux x86_64 binary exits with
+            "This CPU has no AVX2, but this build bundles an ONNX Runtime that needs AVX2",
+            use the `-system-ort` archive instead and install ONNX Runtime first
+            (`sudo pacman -S onnxruntime-cpu`, or download ONNX Runtime and set
+            `ORT_DYLIB_PATH` to the full path of the library file).
+
+            ## First run
+
+            1. Unpack the archive.
+            2. `dictate download` — downloads the speech model (~660 MB).
+            3. `dictate daemon` — keeps the model loaded; see the README for hotkeys and key binds.
+
+            Verify downloads with `shasum -a 256 -c <file>.sha256` (Linux/macOS).
