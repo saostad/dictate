@@ -215,6 +215,10 @@ cargo build --release --no-default-features --features system-ort
 If the library is not on the default search path, point at it with
 `ORT_DYLIB_PATH=/full/path/to/libonnxruntime.so`.
 
+## Troubleshooting
+
+Streaming diagnosis: set `DICTATE_DEBUG_SEGMENTS=<dir>` to save every emitted segment (`<recording>-<N>.wav` plus its `<recording>-<N>-ctx.wav` context prefix) and the whole recording (`<recording>-full.wav`) as 16 kHz WAVs.
+
 ## License
 
 Code: MIT (see LICENSE). Speech model: NVIDIA Parakeet TDT 0.6B v2,

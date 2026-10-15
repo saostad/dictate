@@ -853,11 +853,16 @@ fn feeder_loop(
         }
     };
     let mut total_device_samples: u64 = 0;
+    let mut dump = SegmentDump::new();
+    let mut full_device: Vec<f32> = Vec::new();
     loop {
         match control_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(FeederCmd::Stop) => {
                 let new = crate::mic::take_buffer(&buffer);
                 total_device_samples += new.len() as u64;
+                if dump.is_some() {
+                    full_device.extend_from_slice(&new);
+                }
                 let pushed = match feeder.push(&new) {
                     Ok(segments) => segments,
                     Err(err) => {
@@ -866,6 +871,9 @@ fn feeder_loop(
                     }
                 };
                 for segment in pushed {
+                    if let Some(dump) = dump.as_mut() {
+                        dump.dump_segment(&segment);
+                    }
                     send_segment(&to_worker, segment);
                 }
                 let total_seconds = total_device_samples as f32 / sample_rate.max(1) as f32;
@@ -876,6 +884,9 @@ fn feeder_loop(
                     match feeder.finish() {
                         Ok(segments) => {
                             for segment in segments {
+                                if let Some(dump) = dump.as_mut() {
+                                    dump.dump_segment(&segment);
+                                }
                                 send_segment(&to_worker, segment);
                             }
                         }
@@ -894,6 +905,9 @@ fn feeder_loop(
                 {
                     // The worker is gone; the event loop reports that itself.
                 }
+                if let Some(dump) = dump.as_mut() {
+                    dump.dump_full(&full_device, sample_rate);
+                }
                 break;
             }
             Ok(FeederCmd::Cancel) => {
@@ -908,6 +922,9 @@ fn feeder_loop(
                     continue;
                 }
                 total_device_samples += new.len() as u64;
+                if dump.is_some() {
+                    full_device.extend_from_slice(&new);
+                }
                 let pushed = match feeder.push(&new) {
                     Ok(segments) => segments,
                     Err(err) => {
@@ -916,6 +933,9 @@ fn feeder_loop(
                     }
                 };
                 for segment in pushed {
+                    if let Some(dump) = dump.as_mut() {
+                        dump.dump_segment(&segment);
+                    }
                     send_segment(&to_worker, segment);
                 }
             }
@@ -939,6 +959,134 @@ fn send_segment(to_worker: &mpsc::Sender<Job>, segment: crate::segment::Segment)
     if to_worker.send(Job::Segment(segment)).is_err() {
         // The worker is gone; the event loop reports that itself.
     }
+}
+
+/// Per-recording segment dump for streaming diagnosis. When
+/// `DICTATE_DEBUG_SEGMENTS` holds a non-empty directory, every emitted
+/// segment is written as `<id>-<N>.wav` (16 kHz mono f32, exactly the samples
+/// sent to the model) plus `<id>-<N>-ctx.wav` for its context prefix, and the
+/// whole recording as `<id>-full.wav`. A write failure is logged once and
+/// disables the rest of the recording; dictation itself never fails.
+struct SegmentDump {
+    dir: PathBuf,
+    recording_ms: u128,
+    next_n: usize,
+    failed: bool,
+}
+
+impl SegmentDump {
+    /// Enable dumping for one recording when the env var holds a non-empty
+    /// directory. Creates the directory; on failure logs once and stays off.
+    fn new() -> Option<Self> {
+        let dir = std::env::var_os("DICTATE_DEBUG_SEGMENTS")?;
+        if dir.is_empty() {
+            return None;
+        }
+        let dir = PathBuf::from(dir);
+        if let Err(err) = std::fs::create_dir_all(&dir) {
+            dlog!(
+                "warning: could not create segment dump dir {}: {err:#}",
+                dir.display()
+            );
+            return None;
+        }
+        let recording_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|elapsed| elapsed.as_millis())
+            .unwrap_or(0);
+        Some(Self {
+            dir,
+            recording_ms,
+            next_n: 1,
+            failed: false,
+        })
+    }
+
+    /// Dump one emitted segment (empty audio is skipped, like the send path,
+    /// so N matches the worker's per-segment log).
+    fn dump_segment(&mut self, segment: &crate::segment::Segment) {
+        if self.failed || segment.audio.is_empty() {
+            return;
+        }
+        let n = self.next_n;
+        self.next_n += 1;
+        let (path, ctx_path) = segment_dump_paths(&self.dir, self.recording_ms, n);
+        if let Err(err) = write_dump_wav(&path, &segment.audio) {
+            self.fail_once(err);
+            return;
+        }
+        if !segment.context.is_empty()
+            && let Err(err) = write_dump_wav(&ctx_path, &segment.context)
+        {
+            self.fail_once(err);
+        }
+    }
+
+    /// Dump the whole device-rate recording, resampled to 16 kHz.
+    fn dump_full(&mut self, device_samples: &[f32], sample_rate: u32) {
+        if self.failed {
+            return;
+        }
+        let samples_16k =
+            if device_samples.is_empty() || sample_rate == crate::audio::TARGET_SAMPLE_RATE {
+                device_samples.to_vec()
+            } else {
+                match crate::audio::resample(device_samples, sample_rate) {
+                    Ok(samples) => samples,
+                    Err(err) => {
+                        self.fail_once(err);
+                        return;
+                    }
+                }
+            };
+        let path = full_dump_path(&self.dir, self.recording_ms);
+        if let Err(err) = write_dump_wav(&path, &samples_16k) {
+            self.fail_once(err);
+        }
+    }
+
+    /// Log the first dump failure of this recording and skip the rest.
+    fn fail_once(&mut self, err: anyhow::Error) {
+        if !self.failed {
+            self.failed = true;
+            dlog!("warning: could not write segment dump: {err:#}");
+        }
+    }
+}
+
+/// Pure dump file names for segment N (1-based): the segment plus its
+/// context prefix.
+fn segment_dump_paths(dir: &Path, recording_ms: u128, n: usize) -> (PathBuf, PathBuf) {
+    (
+        dir.join(format!("{recording_ms}-{n}.wav")),
+        dir.join(format!("{recording_ms}-{n}-ctx.wav")),
+    )
+}
+
+/// Pure dump file name for the whole recording.
+fn full_dump_path(dir: &Path, recording_ms: u128) -> PathBuf {
+    dir.join(format!("{recording_ms}-full.wav"))
+}
+
+/// Write 16 kHz mono f32 samples as a WAV file.
+fn write_dump_wav(path: &Path, samples: &[f32]) -> anyhow::Result<()> {
+    let spec = hound::WavSpec {
+        channels: 1,
+        sample_rate: crate::audio::TARGET_SAMPLE_RATE,
+        bits_per_sample: 32,
+        sample_format: hound::SampleFormat::Float,
+    };
+    let mut writer = hound::WavWriter::create(path, spec)
+        .with_context(|| format!("Could not write {}", path.display()))?;
+    for sample in samples {
+        writer
+            .write_sample(*sample)
+            .with_context(|| format!("Could not write {}", path.display()))?;
+    }
+    writer
+        .finalize()
+        .with_context(|| format!("Could not write {}", path.display()))?;
+    Ok(())
 }
 
 /// Abort a streaming recording after a feeder failure: log + notify, and send
@@ -1274,6 +1422,18 @@ mod tests {
         assert_eq!(
             daemon_log_path_for(Path::new("/data")),
             PathBuf::from("/data/daemon.log")
+        );
+    }
+
+    #[test]
+    fn segment_dump_paths_name_segment_context_and_full() {
+        let dir = Path::new("/tmp/seg");
+        let (segment, ctx) = segment_dump_paths(dir, 123, 2);
+        assert_eq!(segment, PathBuf::from("/tmp/seg/123-2.wav"));
+        assert_eq!(ctx, PathBuf::from("/tmp/seg/123-2-ctx.wav"));
+        assert_eq!(
+            full_dump_path(dir, 123),
+            PathBuf::from("/tmp/seg/123-full.wav")
         );
     }
 }
