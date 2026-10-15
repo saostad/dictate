@@ -1,3 +1,13 @@
+#[cfg(all(feature = "bundled-ort", feature = "system-ort"))]
+compile_error!(
+    "features \"bundled-ort\" and \"system-ort\" cannot be enabled together; build with default features for the bundled ONNX Runtime, or with --no-default-features --features system-ort for the system ONNX Runtime"
+);
+
+#[cfg(not(any(feature = "bundled-ort", feature = "system-ort")))]
+compile_error!(
+    "one of the features \"bundled-ort\" or \"system-ort\" must be enabled; build with default features for the bundled ONNX Runtime, or with --no-default-features --features system-ort for the system ONNX Runtime"
+);
+
 mod asr;
 mod audio;
 mod model;
