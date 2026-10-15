@@ -61,6 +61,8 @@ pub(crate) fn show(kind: Kind, summary: &str, body: &str) {
 /// Show a desktop notification on the calling thread, unless disabled.
 /// For short-lived processes (the client commands) that would exit before a
 /// spawned thread delivers the message. Failures warn once per process.
+/// Unix-only: the only caller is the `#[cfg(unix)]` socket client.
+#[cfg(unix)]
 pub(crate) fn show_now(kind: Kind, summary: &str, body: &str) {
     if !enabled_now() {
         return;
