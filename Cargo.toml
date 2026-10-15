@@ -22,6 +22,7 @@ hound = "3.5.1"
 notify-rust = "4.18.2"
 parakeet-rs = { version = "0.4.1", default-features = false, features = ["cpu", "api-28"] }
 rubato = "5.0.1"
+tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
 ureq = "3.4.2"
 winit = "0.30.13"
 

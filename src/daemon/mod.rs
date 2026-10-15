@@ -16,10 +16,12 @@
 #[cfg(unix)]
 pub(crate) mod socket;
 
+use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::Instant;
 
 use anyhow::Context;
+use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use winit::application::ApplicationHandler;
 use winit::event::WindowEvent;
@@ -80,7 +82,7 @@ pub(crate) fn next(state: State, cmd: Command) -> (State, Action, &'static str) 
 
 /// Events handled on the daemon's event-loop thread.
 #[derive(Debug)]
-enum UserEvent {
+pub(crate) enum UserEvent {
     /// A command from a socket client; the reply goes back on the channel.
     #[cfg(unix)]
     Command(Command, mpsc::Sender<String>),
@@ -88,6 +90,8 @@ enum UserEvent {
     WorkerDone,
     /// A global hotkey press or release.
     HotKey(GlobalHotKeyEvent),
+    /// A tray menu click.
+    Menu(tray_icon::menu::MenuEvent),
 }
 
 /// Run `dictate daemon`: load the model, bind the socket (Unix), serve commands.
@@ -147,8 +151,8 @@ pub(crate) fn run_daemon() -> anyhow::Result<()> {
     eprintln!(
         "Socket commands (dictate toggle/start/stop) are not available on Windows yet; use the hotkey."
     );
-    let mut app = DaemonApp::new(to_worker, worker);
-    setup_hotkey(&event_loop, &hotkey, &mut app);
+    let mut app = DaemonApp::new(to_worker, worker, file_settings, event_loop.create_proxy());
+    setup_hotkey(&event_loop, hotkey, &mut app);
     event_loop
         .run_app(&mut app)
         .context("The daemon event loop failed")?;
@@ -161,9 +165,10 @@ pub(crate) fn run_daemon() -> anyhow::Result<()> {
 /// in the app. Never fatal: the socket commands always keep working.
 fn setup_hotkey(
     event_loop: &EventLoop<UserEvent>,
-    config: &crate::hotkey::HotkeyConfig,
+    config: crate::hotkey::HotkeyConfig,
     app: &mut DaemonApp,
 ) {
+    app.hotkey_display = config.display.clone();
     if crate::hotkey::wayland_session() {
         eprintln!(
             "Wayland session: global hotkeys are not available to apps. Bind \"dictate toggle\" (or start/stop) in your compositor; see README."
@@ -183,7 +188,7 @@ fn setup_hotkey(
             return;
         }
     };
-    app.hotkey_id = Some(config.hotkey.id());
+    app.hotkey = Some(config.hotkey);
     app._hotkey_manager = Some(manager);
     let proxy = event_loop.create_proxy();
     GlobalHotKeyEvent::set_event_handler(Some(move |event| {
@@ -195,32 +200,47 @@ fn setup_hotkey(
 }
 
 /// Daemon state, owned by the event-loop thread: the recording state, the
-/// `Recorder`, the hotkey manager and the tap-vs-hold tracking.
+/// `Recorder`, the hotkey manager, the tray icon and the tap-vs-hold tracking.
 struct DaemonApp {
     state: State,
     recorder: Option<crate::mic::Recorder>,
     to_worker: mpsc::Sender<Vec<f32>>,
     worker: std::thread::JoinHandle<()>,
-    hotkey_id: Option<u32>,
+    hotkey: Option<HotKey>,
+    hotkey_display: String,
     press_started: Option<Instant>,
     tap_armed: bool,
     worker_gone_notified: bool,
+    settings: crate::config::Settings,
+    tray: Option<crate::tray::Tray>,
+    tray_attempted: bool,
+    menu_proxy: EventLoopProxy<UserEvent>,
     /// Held so the registration stays alive; dropping it would unregister.
     /// Never read, hence the underscore.
     _hotkey_manager: Option<GlobalHotKeyManager>,
 }
 
 impl DaemonApp {
-    fn new(to_worker: mpsc::Sender<Vec<f32>>, worker: std::thread::JoinHandle<()>) -> Self {
+    fn new(
+        to_worker: mpsc::Sender<Vec<f32>>,
+        worker: std::thread::JoinHandle<()>,
+        settings: crate::config::Settings,
+        menu_proxy: EventLoopProxy<UserEvent>,
+    ) -> Self {
         Self {
             state: State::Idle,
             recorder: None,
             to_worker,
             worker,
-            hotkey_id: None,
+            hotkey: None,
+            hotkey_display: String::new(),
             press_started: None,
             tap_armed: false,
             worker_gone_notified: false,
+            settings,
+            tray: None,
+            tray_attempted: false,
+            menu_proxy,
             _hotkey_manager: None,
         }
     }
@@ -252,6 +272,7 @@ impl DaemonApp {
         if self.state != State::Recording {
             self.tap_armed = false;
         }
+        self.sync_tray();
         reply
     }
 
@@ -259,7 +280,7 @@ impl DaemonApp {
     /// requester, so the reply is dropped; genuine failures are already
     /// logged by [`run_action`].
     fn handle_hotkey(&mut self, event: GlobalHotKeyEvent) {
-        if Some(event.id) != self.hotkey_id {
+        if self.hotkey.map(|hotkey| hotkey.id()) != Some(event.id) {
             return;
         }
         match event.state {
@@ -299,13 +320,195 @@ impl DaemonApp {
             }
         }
     }
+
+    /// Refresh the tray icon and menu after a state change (no tray: no-op).
+    fn sync_tray(&self) {
+        if let Some(tray) = &self.tray
+            && let Err(err) = tray.sync_state(self.state)
+        {
+            eprintln!("error: {err:#}");
+        }
+    }
+
+    /// Run one tray menu click.
+    fn handle_menu(&mut self, event: tray_icon::menu::MenuEvent, event_loop: &ActiveEventLoop) {
+        let action = self
+            .tray
+            .as_ref()
+            .and_then(|tray| tray.match_event(event.id()));
+        match action {
+            None => {}
+            Some(crate::tray::TrayAction::Toggle) => {
+                drop(self.handle_command(Command::Toggle));
+            }
+            Some(crate::tray::TrayAction::Cancel) => {
+                drop(self.handle_command(Command::Cancel));
+            }
+            Some(crate::tray::TrayAction::Sounds) => self.flip_sounds(),
+            Some(crate::tray::TrayAction::Notifications) => self.flip_notifications(),
+            Some(crate::tray::TrayAction::Shortcut(display)) => self.switch_hotkey(&display),
+            Some(crate::tray::TrayAction::HowTo) => self.open_how_to(),
+            Some(crate::tray::TrayAction::OpenConfig) => self.open_settings_file(),
+            Some(crate::tray::TrayAction::Quit) => event_loop.exit(),
+        }
+    }
+
+    /// Flip the `Sound cues` check, update the effective switch, save.
+    fn flip_sounds(&mut self) {
+        let new = !self.settings.sounds;
+        self.settings.sounds = new;
+        crate::config::refresh_sounds(new);
+        if let Some(tray) = &self.tray {
+            tray.set_sounds_checked(new);
+        }
+        self.report_save_error(crate::config::save(&self.settings));
+    }
+
+    /// Flip the `Notifications` check, update the effective switch, save.
+    fn flip_notifications(&mut self) {
+        let new = !self.settings.notifications;
+        self.settings.notifications = new;
+        crate::config::refresh_notifications(new);
+        if let Some(tray) = &self.tray {
+            tray.set_notifications_checked(new);
+        }
+        self.report_save_error(crate::config::save(&self.settings));
+    }
+
+    /// Log and notify a settings-save failure (the in-memory value stays).
+    fn report_save_error(&self, result: anyhow::Result<()>) {
+        if let Err(err) = result {
+            eprintln!("error: {err:#}");
+            crate::notify::show(
+                crate::notify::Kind::Error,
+                "dictate: could not save settings",
+                &format!("{err:#}"),
+            );
+        }
+    }
+
+    /// Switch the global shortcut to `display`: register the new one first
+    /// (so a failure keeps the old one working), then unregister the old one
+    /// and save. Failures notify and keep the old shortcut checked.
+    fn switch_hotkey(&mut self, display: &str) {
+        if display == self.hotkey_display {
+            self.sync_shortcut_checks();
+            return;
+        }
+        let new_key = match HotKey::from_str(display) {
+            Ok(key) => key,
+            Err(err) => {
+                self.shortcut_failed(display, &format!("{err}"));
+                return;
+            }
+        };
+        if self._hotkey_manager.is_none() {
+            match GlobalHotKeyManager::new() {
+                Ok(manager) => self._hotkey_manager = Some(manager),
+                Err(err) => {
+                    self.shortcut_failed(display, &format!("{err}"));
+                    return;
+                }
+            }
+        }
+        let Some(manager) = &self._hotkey_manager else {
+            self.shortcut_failed(display, "the hotkey manager is gone");
+            return;
+        };
+        if let Err(err) = manager.register(new_key) {
+            self.shortcut_failed(display, &format!("{err}"));
+            return;
+        }
+        if let Some(old) = self.hotkey
+            && let Err(err) = manager.unregister(old)
+        {
+            eprintln!(
+                "error: Could not unregister shortcut {}: {err}",
+                self.hotkey_display
+            );
+        }
+        self.hotkey = Some(new_key);
+        self.hotkey_display = display.to_string();
+        self.press_started = None;
+        self.tap_armed = false;
+        self.settings.hotkey = display.to_string();
+        self.report_save_error(crate::config::save(&self.settings));
+        self.sync_shortcut_checks();
+        eprintln!("Hotkey: {display} (tap to toggle, hold to talk)");
+    }
+
+    /// Notify a failed shortcut switch and re-check the current shortcut.
+    fn shortcut_failed(&self, display: &str, err: &str) {
+        crate::notify::show(
+            crate::notify::Kind::Error,
+            &format!("dictate: could not use shortcut {display}"),
+            err,
+        );
+        self.sync_shortcut_checks();
+    }
+
+    /// Check exactly the current shortcut in the tray menu.
+    fn sync_shortcut_checks(&self) {
+        if let Some(tray) = &self.tray {
+            tray.sync_shortcut_checks(&self.hotkey_display);
+        }
+    }
+
+    /// Open the README keybind section in the default browser.
+    fn open_how_to(&self) {
+        if let Err(err) = crate::tray::open_target(crate::tray::README_USE_IT_URL) {
+            let message = format!("{err:#}");
+            eprintln!("error: {message}");
+            crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
+        }
+    }
+
+    /// Create the settings file (with the current settings, which are the
+    /// defaults when the file is missing) and open it in the default app.
+    fn open_settings_file(&self) {
+        let Some(path) = crate::config::config_path() else {
+            let message = "Could not find a home directory for this user";
+            eprintln!("error: {message}");
+            crate::notify::show(crate::notify::Kind::Error, "dictate", message);
+            return;
+        };
+        if !path.is_file()
+            && let Err(err) = crate::config::save(&self.settings)
+        {
+            let message = format!("Could not create {}: {err:#}", path.display());
+            eprintln!("error: {message}");
+            crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
+            return;
+        }
+        if let Err(err) = crate::tray::open_target(&path.to_string_lossy()) {
+            let message = format!("{err:#}");
+            eprintln!("error: {message}");
+            crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
+        }
+    }
 }
 
 impl ApplicationHandler<UserEvent> for DaemonApp {
     fn resumed(&mut self, event_loop: &ActiveEventLoop) {
-        // No windows, no polling: sleep until a socket, worker or hotkey
-        // event arrives.
+        // No windows, no polling: sleep until a socket, worker, hotkey or
+        // menu event arrives.
         event_loop.set_control_flow(ControlFlow::Wait);
+        // The tray must be created on the main thread after the loop
+        // started; without a tray host the daemon keeps running headless.
+        if !self.tray_attempted {
+            self.tray_attempted = true;
+            match crate::tray::build_tray(&self.settings, self.state, self.menu_proxy.clone()) {
+                Ok(tray) => self.tray = Some(tray),
+                Err(err) => {
+                    eprintln!("error: {err:#}");
+                    crate::notify::show(
+                        crate::notify::Kind::Error,
+                        "dictate: no tray icon",
+                        &format!("{err:#}"),
+                    );
+                }
+            }
+        }
     }
 
     fn window_event(
@@ -317,7 +520,7 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
         // The daemon never creates a window.
     }
 
-    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
         match event {
             #[cfg(unix)]
             UserEvent::Command(cmd, reply_tx) => {
@@ -329,8 +532,10 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
             UserEvent::WorkerDone => {
                 self.state = State::Idle;
                 self.tap_armed = false;
+                self.sync_tray();
             }
             UserEvent::HotKey(event) => self.handle_hotkey(event),
+            UserEvent::Menu(event) => self.handle_menu(event, event_loop),
         }
     }
 }

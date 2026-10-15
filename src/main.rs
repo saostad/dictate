@@ -17,6 +17,7 @@ mod hotkey;
 mod mic;
 mod model;
 mod notify;
+mod tray;
 mod typer;
 
 use std::path::Path;

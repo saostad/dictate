@@ -79,6 +79,24 @@ pub(crate) fn notifications_on() -> bool {
     NOTIFY_ON.load(Ordering::SeqCst)
 }
 
+/// Update the effective sound switch after the tray changed the file value
+/// (env still wins).
+pub(crate) fn refresh_sounds(file_value: bool) {
+    SOUNDS_ON.store(
+        apply_env(file_value, std::env::var("DICTATE_SOUNDS").ok().as_deref()),
+        Ordering::SeqCst,
+    );
+}
+
+/// Update the effective notification switch after the tray changed the file
+/// value (env still wins).
+pub(crate) fn refresh_notifications(file_value: bool) {
+    NOTIFY_ON.store(
+        apply_env(file_value, std::env::var("DICTATE_NOTIFY").ok().as_deref()),
+        Ordering::SeqCst,
+    );
+}
+
 /// Path of the settings file, if a home directory exists.
 pub(crate) fn config_path() -> Option<PathBuf> {
     directories::ProjectDirs::from("", "", "dictate")
