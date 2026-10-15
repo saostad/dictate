@@ -121,9 +121,9 @@ pub(crate) fn run_daemon() -> anyhow::Result<()> {
     let (to_worker, worker_rx) = mpsc::channel::<Vec<f32>>();
     let (done_tx, from_worker) = mpsc::channel::<()>();
     std::thread::spawn(move || transcribe_worker(worker_rx, done_tx, asr));
-    let result = serve(listener, to_worker, from_worker);
+    serve(listener, to_worker, from_worker);
     remove_socket_file(&path);
-    result
+    Ok(())
 }
 
 /// Run one client command: send it to the daemon and print the reply.
@@ -212,32 +212,22 @@ fn remove_socket_file(path: &Path) {
 }
 
 /// Accept loop: owns the `Recorder`, forwards stopped audio to the worker and
-/// returns the state to Idle on completion. Only returns when the worker is
-/// gone; every per-request failure is logged and the loop continues.
+/// returns the state to Idle on completion. Blocking accept, so an idle daemon
+/// sleeps; every per-request failure is logged and the loop continues.
 fn serve(
     listener: UnixListener,
     to_worker: mpsc::Sender<Vec<f32>>,
     from_worker: mpsc::Receiver<()>,
-) -> anyhow::Result<()> {
-    listener
-        .set_nonblocking(true)
-        .context("Could not listen on the daemon socket")?;
+) {
     let mut state = State::Idle;
     let mut recorder: Option<crate::mic::Recorder> = None;
-    loop {
-        match from_worker.try_recv() {
-            Ok(()) => state = State::Idle,
-            Err(mpsc::TryRecvError::Empty) => {}
-            Err(mpsc::TryRecvError::Disconnected) => {
-                anyhow::bail!("The transcription worker thread ended unexpectedly");
+    for stream in listener.incoming() {
+        match stream {
+            Ok(stream) => {
+                handle_connection(stream, &mut state, &mut recorder, &to_worker, &from_worker);
             }
-        }
-        match listener.accept() {
-            Ok((stream, _)) => handle_connection(stream, &mut state, &mut recorder, &to_worker),
-            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {}
             Err(err) => eprintln!("error: Could not accept a daemon connection: {err:#}"),
         }
-        std::thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -247,8 +237,9 @@ fn handle_connection(
     state: &mut State,
     recorder: &mut Option<crate::mic::Recorder>,
     to_worker: &mpsc::Sender<Vec<f32>>,
+    from_worker: &mpsc::Receiver<()>,
 ) {
-    if let Err(err) = handle_connection_inner(stream, state, recorder, to_worker) {
+    if let Err(err) = handle_connection_inner(stream, state, recorder, to_worker, from_worker) {
         eprintln!("error: {err:#}");
     }
 }
@@ -258,14 +249,38 @@ fn handle_connection_inner(
     state: &mut State,
     recorder: &mut Option<crate::mic::Recorder>,
     to_worker: &mpsc::Sender<Vec<f32>>,
+    from_worker: &mpsc::Receiver<()>,
 ) -> anyhow::Result<()> {
+    // `accept()` inherits O_NONBLOCK from the listener on macOS/BSD, which
+    // would make `read_line` fail with WouldBlock; force blocking mode. The
+    // read timeout keeps a client that sends nothing from blocking us forever.
+    stream
+        .set_nonblocking(false)
+        .context("Could not use blocking mode on a daemon client connection")?;
+    stream
+        .set_read_timeout(Some(Duration::from_secs(2)))
+        .context("Could not set a read timeout on a daemon client connection")?;
     let reader = stream
         .try_clone()
         .context("Could not read from a daemon client connection")?;
     let mut line = String::new();
-    BufReader::new(reader)
+    let bytes = BufReader::new(reader)
         .read_line(&mut line)
         .context("Could not read from a daemon client connection")?;
+    if bytes == 0 {
+        // EOF with zero bytes: an already-running probe from a second
+        // `dictate daemon`. Close it with no reply and no log.
+        return Ok(());
+    }
+    if poll_worker_done(from_worker, state) {
+        let mut stream = stream;
+        writeln!(
+            stream,
+            "err transcription worker stopped; restart \"dictate daemon\""
+        )
+        .context("Could not reply to a daemon client")?;
+        return Ok(());
+    }
     let reply = match parse_command(&line) {
         None => {
             let text = line.trim();
@@ -279,6 +294,21 @@ fn handle_connection_inner(
     let mut stream = stream;
     writeln!(stream, "{reply}").context("Could not reply to a daemon client")?;
     Ok(())
+}
+
+/// Drain queued worker completions into `state`. Returns true when the
+/// worker thread is gone (logged here; the caller replies `err`).
+fn poll_worker_done(from_worker: &mpsc::Receiver<()>, state: &mut State) -> bool {
+    loop {
+        match from_worker.try_recv() {
+            Ok(()) => *state = State::Idle,
+            Err(mpsc::TryRecvError::Empty) => return false,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                eprintln!("error: The transcription worker thread ended unexpectedly");
+                return true;
+            }
+        }
+    }
 }
 
 /// Run the state-machine action, updating `state`, and return the reply.
