@@ -1,9 +1,10 @@
 //! Settings file: `config.toml` in the platform config directory.
 //!
 //! A tiny TOML subset parsed by hand (no new crates): `#` comments, blank
-//! lines, `key = true|false` and `key = "string"`. Keys are `sounds`,
-//! `notifications`, `streaming` (bool, default true) and `hotkey` (string,
-//! default `Ctrl+Shift+Space`). A missing file means defaults, never an error.
+//! lines, `key = true|false` and `key = "string"`. Keys are `sounds` and
+//! `notifications` (bool, default true), `streaming` (bool, default false)
+//! and `hotkey` (string, default `Ctrl+Shift+Space`). A missing file means
+//! defaults, never an error.
 //!
 //! The environment still wins: `DICTATE_SOUNDS`, `DICTATE_NOTIFY`,
 //! `DICTATE_STREAMING` and `DICTATE_HOTKEY` override the file. The daemon
@@ -30,7 +31,7 @@ impl Default for Settings {
         Self {
             sounds: true,
             notifications: true,
-            streaming: true,
+            streaming: false,
             hotkey: crate::hotkey::DEFAULT_HOTKEY.to_string(),
         }
     }
@@ -41,7 +42,7 @@ static SOUNDS_ON: AtomicBool = AtomicBool::new(true);
 /// Effective "show notifications" switch (file + env, resolved at startup).
 static NOTIFY_ON: AtomicBool = AtomicBool::new(true);
 /// Effective "type while speaking" switch (file + env, resolved at startup).
-static STREAMING_ON: AtomicBool = AtomicBool::new(true);
+static STREAMING_ON: AtomicBool = AtomicBool::new(false);
 
 /// Combine one bool setting with its env override: unset env keeps the file
 /// value, `"0"` turns it off, anything else turns it on.
@@ -320,16 +321,17 @@ mod tests {
             parse("# only a comment\n\n  \n").unwrap(),
             Settings::default()
         );
+        assert!(!Settings::default().streaming);
     }
 
     #[test]
     fn parses_all_keys() {
         let settings =
-            parse("sounds = false\nnotifications = false\nstreaming = false\nhotkey = \"F8\"\n")
+            parse("sounds = false\nnotifications = false\nstreaming = true\nhotkey = \"F8\"\n")
                 .unwrap();
         assert!(!settings.sounds);
         assert!(!settings.notifications);
-        assert!(!settings.streaming);
+        assert!(settings.streaming);
         assert_eq!(settings.hotkey, "F8");
     }
 
@@ -357,7 +359,7 @@ mod tests {
             Settings {
                 sounds: false,
                 notifications: false,
-                streaming: false,
+                streaming: true,
                 hotkey: "say \"hi\" \\ now".to_string(),
             },
         ] {
