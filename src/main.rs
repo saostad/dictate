@@ -45,11 +45,19 @@ fn run() -> anyhow::Result<()> {
         "daemon" => run_daemon(),
         "toggle" | "start" | "stop" | "cancel" | "status" => run_client(&command),
         "transcribe" => {
-            let Some(file) = args.next() else {
+            let Some(first) = args.next() else {
                 eprintln!("Usage: dictate transcribe <file.wav>");
                 std::process::exit(2);
             };
-            transcribe(Path::new(&file))
+            if first == "--segmented" {
+                let Some(file) = args.next() else {
+                    eprintln!("Usage: dictate transcribe [--segmented] <file.wav>");
+                    std::process::exit(2);
+                };
+                transcribe_segmented(Path::new(&file))
+            } else {
+                transcribe(Path::new(&first))
+            }
         }
         "help" | "--help" => {
             println!("{}", usage());
@@ -80,6 +88,69 @@ fn transcribe(path: &Path) -> anyhow::Result<()> {
         return Ok(());
     }
     println!("{text}");
+    Ok(())
+}
+
+/// Test hook: transcribe a file through the same feeder path the streaming
+/// daemon uses (100 ms pushes at the file's rate, per-segment transcribe,
+/// same join rule). Prints the joined text to stdout and per-segment timings
+/// to stderr.
+fn transcribe_segmented(path: &Path) -> anyhow::Result<()> {
+    let dir = model::model_dir_checked()?;
+    let (mono, rate) = audio::load_wav_mono(path)?;
+    let start = std::time::Instant::now();
+    let mut asr = asr::Asr::load(&dir)?;
+    eprintln!("model loaded in {} ms", start.elapsed().as_millis());
+    let mut feeder = segment::Feeder::new(rate)?;
+    let mut run = SegmentRun::default();
+    let chunk = (rate as usize / 10).max(1);
+    for piece in mono.chunks(chunk) {
+        let segments = feeder.push(piece)?;
+        transcribe_segments(&mut asr, &segments, &mut run)?;
+    }
+    let segments = feeder.finish()?;
+    transcribe_segments(&mut asr, &segments, &mut run)?;
+    if !run.has_text {
+        let seconds = mono.len() as f32 / rate.max(1) as f32;
+        eprintln!("{}", asr::no_speech_message(seconds));
+        return Ok(());
+    }
+    println!("{}", run.joined);
+    Ok(())
+}
+
+/// Joined-text state for one `--segmented` run.
+#[derive(Default)]
+struct SegmentRun {
+    seq: usize,
+    joined: String,
+    has_text: bool,
+}
+
+/// Transcribe feeder segments like the daemon worker: skip empties silently,
+/// join with the same rule, log per-segment timings to stderr.
+fn transcribe_segments(
+    asr: &mut asr::Asr,
+    segments: &[Vec<f32>],
+    run: &mut SegmentRun,
+) -> anyhow::Result<()> {
+    for segment in segments {
+        run.seq += 1;
+        let seconds = segment.len() as f32 / 16_000.0;
+        let start = std::time::Instant::now();
+        let text = asr.transcribe(segment)?;
+        let ms = start.elapsed().as_millis();
+        if asr::is_empty_transcript(&text) {
+            continue;
+        }
+        eprintln!(
+            "segment {}: {seconds:.1} s audio, transcribed in {ms} ms",
+            run.seq
+        );
+        run.joined
+            .push_str(&daemon::join_segment_text(run.has_text, &text));
+        run.has_text = true;
+    }
     Ok(())
 }
 

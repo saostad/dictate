@@ -834,9 +834,10 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
 }
 
 /// Streaming feeder thread: while Recording, wake every 100 ms, drain new
-/// device-rate samples, split them into pause segments, resample each to
-/// 16 kHz and send it to the worker. On `Stop` the tail plus `End` go out;
-/// on `Cancel` a single `Cancel` goes out. Only the `Arc` buffer crosses
+/// device-rate samples and push them through the shared [`Feeder`](crate::segment::Feeder)
+/// (continuous resample to 16 kHz, then pause segmentation), sending each
+/// finished segment to the worker. On `Stop` the tail plus `End` go out; on
+/// `Cancel` a single `Cancel` goes out. Only the `Arc` buffer crosses
 /// threads; the `Recorder` stays on the event-loop thread.
 fn feeder_loop(
     buffer: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
@@ -844,22 +845,45 @@ fn feeder_loop(
     control_rx: mpsc::Receiver<FeederCmd>,
     to_worker: mpsc::Sender<Job>,
 ) {
-    let mut segmenter = crate::segment::Segmenter::new(sample_rate);
+    let mut feeder = match crate::segment::Feeder::new(sample_rate) {
+        Ok(feeder) => feeder,
+        Err(err) => {
+            feeder_failed(&to_worker, err);
+            return;
+        }
+    };
     let mut total_device_samples: u64 = 0;
     loop {
         match control_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(FeederCmd::Stop) => {
                 let new = crate::mic::take_buffer(&buffer);
                 total_device_samples += new.len() as u64;
-                for segment in segmenter.push(&new) {
-                    send_segment(&to_worker, &segment, sample_rate);
+                let pushed = match feeder.push(&new) {
+                    Ok(segments) => segments,
+                    Err(err) => {
+                        feeder_failed(&to_worker, err);
+                        break;
+                    }
+                };
+                for segment in pushed {
+                    send_segment(&to_worker, segment);
                 }
                 let total_seconds = total_device_samples as f32 / sample_rate.max(1) as f32;
                 // Recordings under 0.3 s keep today's too-short message: drop
                 // the tail so the worker sees only `End`.
                 let too_short = total_device_samples * 1000 < u64::from(sample_rate.max(1)) * 300;
-                if !too_short && let Some(tail) = segmenter.finish() {
-                    send_segment(&to_worker, &tail, sample_rate);
+                if !too_short {
+                    match feeder.finish() {
+                        Ok(segments) => {
+                            for segment in segments {
+                                send_segment(&to_worker, segment);
+                            }
+                        }
+                        Err(err) => {
+                            feeder_failed(&to_worker, err);
+                            break;
+                        }
+                    }
                 }
                 if to_worker
                     .send(Job::End {
@@ -884,8 +908,15 @@ fn feeder_loop(
                     continue;
                 }
                 total_device_samples += new.len() as u64;
-                for segment in segmenter.push(&new) {
-                    send_segment(&to_worker, &segment, sample_rate);
+                let pushed = match feeder.push(&new) {
+                    Ok(segments) => segments,
+                    Err(err) => {
+                        feeder_failed(&to_worker, err);
+                        break;
+                    }
+                };
+                for segment in pushed {
+                    send_segment(&to_worker, segment);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -900,39 +931,36 @@ fn feeder_loop(
     }
 }
 
-/// Resample one device-rate segment to 16 kHz and queue it. Failures are
-/// logged + notified and the segment is skipped; dictation continues.
-fn send_segment(to_worker: &mpsc::Sender<Job>, segment: &[f32], sample_rate: u32) {
+/// Queue one 16 kHz segment for transcription.
+fn send_segment(to_worker: &mpsc::Sender<Job>, segment: Vec<f32>) {
     if segment.is_empty() {
         return;
     }
-    let samples_16k = if sample_rate == crate::audio::TARGET_SAMPLE_RATE {
-        segment.to_vec()
-    } else {
-        match crate::audio::resample(segment, sample_rate) {
-            Ok(samples) => samples,
-            Err(err) => {
-                let message = format!(
-                    "Could not resample microphone audio from {sample_rate} Hz to 16000 Hz: {err:#}"
-                );
-                dlog!("error: {message}");
-                crate::notify::show(
-                    crate::notify::Kind::Error,
-                    "dictate: recording failed",
-                    &message,
-                );
-                return;
-            }
-        }
-    };
-    if to_worker.send(Job::Segment(samples_16k)).is_err() {
+    if to_worker.send(Job::Segment(segment)).is_err() {
+        // The worker is gone; the event loop reports that itself.
+    }
+}
+
+/// Abort a streaming recording after a feeder failure: log + notify, and send
+/// `Cancel` so the worker discards queued segments and returns to Idle
+/// (already-typed text stays).
+fn feeder_failed(to_worker: &mpsc::Sender<Job>, err: anyhow::Error) {
+    let message = format!("{err:#}");
+    dlog!("error: {message}");
+    crate::notify::show(
+        crate::notify::Kind::Error,
+        "dictate: recording failed",
+        &message,
+    );
+    if to_worker.send(Job::Cancel).is_err() {
         // The worker is gone; the event loop reports that itself.
     }
 }
 
 /// Join one streaming segment onto already-typed text: prepend a space unless
-/// the new text starts with closing punctuation.
-fn join_segment_text(already_typed: bool, text: &str) -> String {
+/// the new text starts with closing punctuation. Shared with `transcribe
+/// --segmented`, which replays the feeder path on a file.
+pub(crate) fn join_segment_text(already_typed: bool, text: &str) -> String {
     if !already_typed {
         return text.to_string();
     }

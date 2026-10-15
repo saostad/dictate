@@ -1,11 +1,15 @@
 //! Pause-based audio segmenter for type-while-speaking.
 //!
-//! Splits device-rate mono audio at natural pauses so the daemon can
-//! transcribe and type each piece while the user keeps talking. Energy VAD on
-//! 30 ms frames (RMS) with an adaptive threshold; cuts at ≥ 450 ms of silence
-//! after speech (segment ≥ 1.2 s) in the middle of the silence, force-cuts at
-//! 8 s at the quietest frame in the last 2 s, drops pure-silence segments, and
-//! keeps 150 ms of pre-roll before the first speech frame.
+//! Splits mono audio at natural pauses so the daemon can transcribe and type
+//! each piece while the user keeps talking. Energy VAD on 30 ms frames (RMS)
+//! with an adaptive threshold; cuts at ≥ 450 ms of silence after speech
+//! (segment ≥ 1.2 s) in the middle of the silence, force-cuts at 8 s at the
+//! quietest frame in the last 2 s, drops pure-silence segments, and keeps
+//! 300 ms of pre-roll before the first speech frame.
+//!
+//! `Feeder` is the shared streaming path (daemon + `transcribe --segmented`):
+//! it resamples the continuous stream to 16 kHz once (stateful, so there are
+//! no per-segment resample edges) and drives a `Segmenter` at 16 kHz.
 
 /// Length of one VAD frame.
 const FRAME_MS: u32 = 30;
@@ -16,18 +20,76 @@ const MIN_SEGMENT_MS: u32 = 1200;
 /// Segment length that triggers a force-cut.
 const MAX_SEGMENT_MS: u32 = 8000;
 /// Pre-roll kept before the first speech frame.
-const PREROLL_MS: u32 = 150;
+const PREROLL_MS: u32 = 300;
 /// Search window for the force-cut point.
 const FORCE_SEARCH_MS: u32 = 2000;
 /// Floor of the adaptive speech threshold.
 const MIN_THRESHOLD: f32 = 0.008;
 /// Speech threshold is this multiple of the noise floor.
 const THRESHOLD_RATIO: f32 = 3.0;
-/// Starting noise floor (frame RMS).
-const INITIAL_NOISE_FLOOR: f32 = 0.01;
+/// Starting noise floor (frame RMS). Low on purpose: a high start reads soft
+/// word onsets as silence and the leading trim then eats them.
+const INITIAL_NOISE_FLOOR: f32 = 0.002;
+/// Downward adaptation toward new lows (fast: the threshold must reach a
+/// quiet room before the first word ends).
+const NOISE_FLOOR_DOWN: f32 = 0.25;
+/// Upward drift on silence only (slow: speech must not raise the floor).
+const NOISE_FLOOR_UP: f32 = 0.002;
 
-/// Splits mono audio at pauses. All audio is at the device rate; the caller
-/// resamples finished segments to 16 kHz.
+/// Streaming feeder path shared by the daemon and `transcribe --segmented`:
+/// resamples the continuous device-rate stream to 16 kHz once (stateful) and
+/// segments at 16 kHz, so live segmentation equals file segmentation.
+pub(crate) struct Feeder {
+    resampler: Option<crate::audio::StreamResampler>,
+    segmenter: Segmenter,
+}
+
+impl Feeder {
+    /// New feeder for `device_rate` Hz mono input; segments come out at 16 kHz.
+    pub(crate) fn new(device_rate: u32) -> anyhow::Result<Self> {
+        if device_rate == 0 {
+            anyhow::bail!("Invalid sample rate 0 Hz");
+        }
+        let resampler = if device_rate == crate::audio::TARGET_SAMPLE_RATE {
+            None
+        } else {
+            Some(crate::audio::StreamResampler::new(device_rate)?)
+        };
+        Ok(Self {
+            resampler,
+            segmenter: Segmenter::new(crate::audio::TARGET_SAMPLE_RATE),
+        })
+    }
+
+    /// Push device-rate samples; returns finished 16 kHz segments.
+    pub(crate) fn push(&mut self, samples: &[f32]) -> anyhow::Result<Vec<Vec<f32>>> {
+        match &mut self.resampler {
+            Some(resampler) => {
+                let mono16 = resampler.push(samples)?;
+                Ok(self.segmenter.push(&mono16))
+            }
+            None => Ok(self.segmenter.push(samples)),
+        }
+    }
+
+    /// Finish the recording: returns finished segments, including the tail
+    /// when it holds speech. (The flushed tail audio can still complete a
+    /// segment, which is why this returns a list and not just the tail.)
+    pub(crate) fn finish(&mut self) -> anyhow::Result<Vec<Vec<f32>>> {
+        let tail16 = match &mut self.resampler {
+            Some(resampler) => resampler.finish()?,
+            None => Vec::new(),
+        };
+        let mut segments = self.segmenter.push(&tail16);
+        if let Some(tail) = self.segmenter.finish() {
+            segments.push(tail);
+        }
+        Ok(segments)
+    }
+}
+
+/// Splits mono audio at pauses. Usually driven through [`Feeder`] (16 kHz);
+/// direct use takes audio at any sample rate.
 pub(crate) struct Segmenter {
     frame_len: usize,
     noise_floor: f32,
@@ -129,9 +191,9 @@ impl Segmenter {
         // Slow-moving minimum: quick down toward new lows, slow drift up
         // on silence only (speech must not raise the floor).
         if value < self.noise_floor {
-            self.noise_floor += (value - self.noise_floor) * 0.05;
+            self.noise_floor += (value - self.noise_floor) * NOISE_FLOOR_DOWN;
         } else if !is_speech {
-            self.noise_floor += (value - self.noise_floor) * 0.002;
+            self.noise_floor += (value - self.noise_floor) * NOISE_FLOOR_UP;
         }
         self.noise_floor = self.noise_floor.clamp(1e-4, 0.5);
         self.samples.extend_from_slice(frame);
@@ -267,17 +329,33 @@ mod tests {
 
     /// Sine burst (speech-like) at 440 Hz, amplitude 0.2.
     fn tone(secs: f32) -> Vec<f32> {
-        let len = (secs * RATE as f32) as usize;
+        tone_at(RATE, 0.2, secs)
+    }
+
+    /// Soft sine burst at 440 Hz, amplitude 0.02 (RMS ~0.014): below the old
+    /// initial threshold (0.03) but above the new one (0.008).
+    fn soft_tone(secs: f32) -> Vec<f32> {
+        tone_at(RATE, 0.02, secs)
+    }
+
+    fn tone_at(rate: u32, amplitude: f32, secs: f32) -> Vec<f32> {
+        let len = (secs * rate as f32) as usize;
         (0..len)
-            .map(|i| 0.2 * (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / RATE as f32).sin())
+            .map(|i| {
+                amplitude * (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / rate as f32).sin()
+            })
             .collect()
     }
 
     /// Near-silence: faint 440 Hz at amplitude 0.001 (RMS ~0.0007).
     fn silence(secs: f32) -> Vec<f32> {
-        let len = (secs * RATE as f32) as usize;
+        silence_at(RATE, secs)
+    }
+
+    fn silence_at(rate: u32, secs: f32) -> Vec<f32> {
+        let len = (secs * rate as f32) as usize;
         (0..len)
-            .map(|i| 0.001 * (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / RATE as f32).sin())
+            .map(|i| 0.001 * (i as f32 * 440.0 * 2.0 * std::f32::consts::PI / rate as f32).sin())
             .collect()
     }
 
@@ -385,20 +463,148 @@ mod tests {
         let segments = push_chunked(&mut segmenter, &audio);
         assert!(segments.is_empty(), "no pause, so no mid-stream cut");
         let tail = segmenter.finish().expect("speech tail");
-        // Leading silence kept: 150 ms ± one frame.
+        // Leading silence kept: 300 ms ± one frame (hardcoded to pin the
+        // constant, not PREROLL_MS itself).
         let frame = RATE as usize * FRAME_MS as usize / 1000;
-        let preroll = RATE as usize * PREROLL_MS as usize / 1000;
+        let preroll = RATE as usize * 300 / 1000;
         let leading = tail
             .iter()
             .take_while(|sample| sample.abs() <= 0.05)
             .count();
         assert!(
             leading <= preroll + frame,
-            "leading silence is {leading} samples, over 150 ms + one frame"
+            "leading silence is {leading} samples, over 300 ms + one frame"
         );
         assert!(
             leading >= preroll.saturating_sub(frame),
-            "pre-roll keeps about 150 ms, got {leading} samples"
+            "pre-roll keeps about 300 ms, got {leading} samples"
         );
+    }
+
+    /// Regression test for lost word onsets (round 19): a soft start (RMS
+    /// ~0.014) read as silence by the old initial threshold (0.03) was
+    /// eaten by the leading trim. It must survive now. The soft speech
+    /// starts after 0.2 s, before the old floor could adapt down.
+    #[test]
+    fn soft_onset_at_recording_start_is_kept() {
+        let mut audio = silence(0.2);
+        audio.extend(soft_tone(2.0));
+        let mut segmenter = Segmenter::new(RATE);
+        let segments = push_chunked(&mut segmenter, &audio);
+        assert!(segments.is_empty(), "no pause, so no mid-stream cut");
+        let tail = segmenter.finish().expect("the soft tone is speech");
+        let input_soft = audio.iter().filter(|sample| sample.abs() > 0.005).count();
+        let output_soft = tail.iter().filter(|sample| sample.abs() > 0.005).count();
+        assert!(input_soft > 0, "the fixture must contain soft speech");
+        assert_eq!(
+            output_soft, input_soft,
+            "every soft onset sample must survive the trim"
+        );
+    }
+
+    /// Segment-2 onsets: a soft ramp after a pause must survive the cut and
+    /// the next segment's leading trim. The ramp (RMS ~0.003) sits below both
+    /// thresholds, so this pins the 300 ms pre-roll: the old 150 ms window
+    /// kept only part of it.
+    #[test]
+    fn soft_ramp_after_pause_is_kept() {
+        let ramp = tone_at(RATE, 0.004, 0.25);
+        let mut audio = tone(2.0);
+        audio.extend(silence(0.6));
+        audio.extend(ramp.clone());
+        audio.extend(tone(2.0));
+        let mut segmenter = Segmenter::new(RATE);
+        let segments = push_chunked(&mut segmenter, &audio);
+        assert_eq!(segments.len(), 1, "the pause must cut once");
+        let tail = segmenter.finish().expect("second segment");
+        // Everything before the loud tone: carried silence plus the ramp.
+        let loud_at = tail
+            .iter()
+            .position(|sample| sample.abs() > 0.05)
+            .expect("loud tone in the tail");
+        // Band that holds the ramp (0.004) but neither the silence (0.001)
+        // nor the loud tone's first rise samples (0, 0.034, ...).
+        let in_ramp_band = |sample: f32| sample.abs() > 0.0015 && sample.abs() < 0.006;
+        let input_ramp = ramp.iter().filter(|sample| in_ramp_band(**sample)).count();
+        let output_ramp = tail[..loud_at]
+            .iter()
+            .filter(|sample| in_ramp_band(**sample))
+            .count();
+        assert!(input_ramp > 0, "the ramp fixture must contain band samples");
+        assert_eq!(
+            output_ramp, input_ramp,
+            "every soft ramp sample after the pause must survive"
+        );
+    }
+
+    #[test]
+    fn pause_cut_keeps_silence_on_both_sides() {
+        let mut audio = tone(2.0);
+        audio.extend(silence(0.6));
+        audio.extend(tone(2.0));
+        let mut segmenter = Segmenter::new(RATE);
+        let segments = push_chunked(&mut segmenter, &audio);
+        assert_eq!(segments.len(), 1, "the pause must cut once");
+        let tail = segmenter.finish().expect("second segment");
+        // ≥ 200 ms of silence on each side of the cut.
+        let want = RATE as usize / 5;
+        let trailing = segments[0]
+            .iter()
+            .rev()
+            .take_while(|sample| sample.abs() <= 0.05)
+            .count();
+        assert!(
+            trailing >= want,
+            "segment 1 must end with ≥200 ms of silence, got {trailing} samples"
+        );
+        let leading = tail
+            .iter()
+            .take_while(|sample| sample.abs() <= 0.05)
+            .count();
+        assert!(
+            leading >= want,
+            "segment 2 must start with ≥200 ms of silence, got {leading} samples"
+        );
+    }
+
+    #[test]
+    fn feeder_segments_device_rate_audio_at_16k() {
+        let mut audio = tone_at(48_000, 0.2, 2.0);
+        audio.extend(silence_at(48_000, 0.6));
+        audio.extend(tone_at(48_000, 0.2, 2.0));
+        let mut feeder = Feeder::new(48_000).unwrap();
+        let mut segments = Vec::new();
+        for piece in audio.chunks(4800) {
+            segments.extend(feeder.push(piece).unwrap());
+        }
+        segments.extend(feeder.finish().unwrap());
+        assert_eq!(segments.len(), 2, "the pause must cut once");
+        let pieces = segments;
+        // 16 kHz output: ~4.6 s total (input starts with tone, so no trim).
+        let total: usize = pieces.iter().map(Vec::len).sum();
+        let expected = 16_000.0 * 4.6;
+        assert!(
+            (total as f32 - expected).abs() / expected < 0.02,
+            "unexpected total length: {total}"
+        );
+        // Speech survives the resample + split (a third of the samples now).
+        let input_speech = audio.iter().filter(|sample| sample.abs() > 0.05).count();
+        let output_speech: usize = pieces
+            .iter()
+            .map(|piece| piece.iter().filter(|sample| sample.abs() > 0.05).count())
+            .sum();
+        let expected_speech = input_speech as f32 / 3.0;
+        assert!(
+            (output_speech as f32 - expected_speech).abs() / expected_speech < 0.05,
+            "speech lost: {output_speech} vs {expected_speech:.0} expected"
+        );
+    }
+
+    #[test]
+    fn feeder_rejects_rate_zero() {
+        let Err(err) = Feeder::new(0) else {
+            panic!("sample rate 0 must fail");
+        };
+        assert!(format!("{err:#}").contains('0'), "unexpected: {err:#}");
     }
 }
