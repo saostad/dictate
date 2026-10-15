@@ -68,7 +68,9 @@ fn play_cue(freq_hz: f32) {
         if let Err(err) = play_blocking(freq_hz)
             && !WARNED.swap(true, Ordering::SeqCst)
         {
-            eprintln!("warning: could not play sound cue: {err:#}");
+            let message = format!("warning: could not play sound cue: {err:#}");
+            eprintln!("{message}");
+            crate::daemon::mirror_to_log(&message);
         }
     });
 }

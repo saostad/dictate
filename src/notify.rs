@@ -35,7 +35,9 @@ fn enabled_now() -> bool {
 /// Warn about a notification failure, at most once per process.
 fn warn_once(err: &anyhow::Error) {
     if !WARNED.swap(true, Ordering::SeqCst) {
-        eprintln!("warning: could not show desktop notification: {err:#}");
+        let message = format!("warning: could not show desktop notification: {err:#}");
+        eprintln!("{message}");
+        crate::daemon::mirror_to_log(&message);
     }
 }
 

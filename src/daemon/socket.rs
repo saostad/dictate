@@ -6,6 +6,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
 use std::time::Duration;
@@ -68,12 +69,24 @@ pub(crate) fn client_command(cmd: &str) -> anyhow::Result<()> {
 
 fn client_command_inner(cmd: &str) -> anyhow::Result<()> {
     let path = socket_path()?;
-    let mut stream = UnixStream::connect(&path).map_err(|err| {
-        anyhow::anyhow!(
-            "Could not reach the dictate daemon at {}: {err}. Start it with \"dictate daemon\".",
-            path.display()
-        )
-    })?;
+    let mut stream = match UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        Err(err)
+            if cmd != "status"
+                && matches!(
+                    err.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+                ) =>
+        {
+            autostart_and_connect(&path)?
+        }
+        Err(err) => {
+            return Err(anyhow::anyhow!(
+                "Could not reach the dictate daemon at {}: {err}. Start it with \"dictate daemon\".",
+                path.display()
+            ));
+        }
+    };
     writeln!(stream, "{cmd}").with_context(|| {
         format!(
             "Could not send {cmd} to the dictate daemon at {}",
@@ -115,6 +128,57 @@ fn client_command_inner(cmd: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Start the daemon on demand and connect to it: spawn `dictate daemon`
+/// detached with its output appended to the daemon log, notify, then poll
+/// the socket every 200 ms for up to 30 s.
+fn autostart_and_connect(path: &Path) -> anyhow::Result<UnixStream> {
+    let log_path = super::daemon_log_path()?;
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("Could not create daemon log directory {}", parent.display())
+        })?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("Could not open daemon log {}", log_path.display()))?;
+    let out = log
+        .try_clone()
+        .with_context(|| format!("Could not open daemon log {}", log_path.display()))?;
+    let exe =
+        std::env::current_exe().context("Could not find the dictate binary to start the daemon")?;
+    std::process::Command::new(exe)
+        .arg("daemon")
+        .stdin(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(log)
+        .env("DICTATE_STDERR_IS_LOG", "1")
+        .process_group(0)
+        .spawn()
+        .context("Could not start the dictate daemon")?;
+    crate::notify::show_now(
+        crate::notify::Kind::Info,
+        "dictate",
+        "Starting dictate (loading the speech model)…",
+    );
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        match UnixStream::connect(path) {
+            Ok(stream) => return Ok(stream),
+            Err(_) => {
+                if std::time::Instant::now() >= deadline {
+                    anyhow::bail!(
+                        "The dictate daemon did not start within 30 s. See its log: {}",
+                        log_path.display()
+                    );
+                }
+                std::thread::sleep(std::time::Duration::from_millis(200));
+            }
+        }
+    }
+}
+
 /// Bind the daemon socket, handling the already-running and stale cases.
 pub(crate) fn bind_listener(path: &Path) -> anyhow::Result<UnixListener> {
     match UnixListener::bind(path) {
@@ -128,7 +192,7 @@ pub(crate) fn bind_listener(path: &Path) -> anyhow::Result<UnixListener> {
             }
             std::fs::remove_file(path)
                 .with_context(|| format!("Could not remove stale socket {}", path.display()))?;
-            eprintln!("Removed stale socket {}", path.display());
+            dlog!("Removed stale socket {}", path.display());
             UnixListener::bind(path)
                 .with_context(|| format!("Could not bind the daemon socket {}", path.display()))
         }
@@ -143,7 +207,7 @@ pub(crate) fn remove_socket_file(path: &Path) {
     match std::fs::remove_file(path) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => eprintln!(
+        Err(err) => dlog!(
             "warning: could not delete daemon socket {}: {err}",
             path.display()
         ),
@@ -156,7 +220,7 @@ pub(super) fn serve_socket(listener: UnixListener, proxy: EventLoopProxy<UserEve
     for stream in listener.incoming() {
         match stream {
             Ok(stream) => handle_connection(stream, &proxy),
-            Err(err) => eprintln!("error: Could not accept a daemon connection: {err:#}"),
+            Err(err) => dlog!("error: Could not accept a daemon connection: {err:#}"),
         }
     }
 }
@@ -165,7 +229,7 @@ pub(super) fn serve_socket(listener: UnixListener, proxy: EventLoopProxy<UserEve
 /// event loop, write back the reply. Failures are logged, never fatal.
 fn handle_connection(stream: UnixStream, proxy: &EventLoopProxy<UserEvent>) {
     if let Err(err) = handle_connection_inner(stream, proxy) {
-        eprintln!("error: {err:#}");
+        dlog!("error: {err:#}");
     }
 }
 

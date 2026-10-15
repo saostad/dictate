@@ -1,6 +1,6 @@
 [package]
 name = "dictate"
-version = "0.1.2"
+version = "0.2.0"
 description = "Superwhisper-like voice typing in pure Rust"
 edition = "2024"
 license = "MIT"

@@ -98,9 +98,18 @@ dictate toggle   # start/stop recording
 dictate status   # idle, recording or transcribing
 ```
 
+If the daemon isn't running, `toggle`/`start`/`stop`/`cancel` start it
+automatically (its output goes to the log below) and wait up to 30 s for it.
+
 The daemon plays a short tone when recording starts and stops; set `DICTATE_SOUNDS=0` to silence it.
 
 Failures (and empty recordings) also pop a desktop notification; set `DICTATE_NOTIFY=0` to disable them.
+
+When the daemon's stderr is not a terminal (autostart), it also writes every
+line to `daemon.log` in the platform data directory:
+`~/.local/share/dictate/daemon.log` on Linux,
+`~/Library/Application Support/dictate/daemon.log` on macOS,
+`%APPDATA%\dictate\data\daemon.log` on Windows.
 
 Bind keys to the control commands in your compositor or desktop. Hyprland
 (`~/.config/hypr/hyprland.conf`):
@@ -118,6 +127,37 @@ bindr = SUPER, D, exec, dictate stop
 
 On GNOME or KDE, bind the same commands in Settings → Keyboard → Custom
 Shortcuts.
+
+## Tray menu
+
+`dictate daemon` shows a tray icon: grey when idle, red while recording,
+amber while transcribing. Its menu shows the live state, starts/stops/cancels
+dictation, toggles sound cues and notifications (saved to the settings file),
+switches the global shortcut (on Wayland it explains the compositor keybinds
+instead), opens the settings file, and quits the daemon. Without a tray host
+the daemon logs `dictate: no tray icon` once and keeps running headless.
+
+## Settings file
+
+Settings live in `config.toml` in the platform config directory:
+
+| OS | Path |
+|---|---|
+| Linux | `~/.config/dictate/config.toml` |
+| macOS | `~/Library/Application Support/dictate/config.toml` |
+| Windows | `%APPDATA%\dictate\config\config.toml` |
+
+All keys are optional; a missing file means defaults:
+
+```toml
+sounds = true                 # short tone when recording starts/stops
+notifications = true          # desktop notifications for errors
+hotkey = "Ctrl+Shift+Space"   # global shortcut: tap to toggle, hold to talk
+```
+
+The environment wins: `DICTATE_SOUNDS=0`, `DICTATE_NOTIFY=0` and
+`DICTATE_HOTKEY=...` override the file. The tray menu edits the file for you;
+`Open settings file` creates it with defaults when missing.
 
 ## Global hotkey
 

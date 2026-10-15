@@ -12,10 +12,22 @@
 //! The socket accept loop runs on a thread and forwards commands as user
 //! events; one worker thread owns the [`Asr`](crate::asr::Asr) and transcribes
 //! audio sent over an mpsc channel.
+//!
+//! Every daemon line goes through [`dlog!`]: stderr, plus `<data_dir>/daemon.log`
+//! when stderr is not a terminal (compositor or on-demand autostart).
+
+/// Print one daemon line: stderr, and the log file when active (see
+/// [`init_file_log`]). Same syntax as `eprintln!`.
+macro_rules! dlog {
+    ($($arg:tt)*) => {
+        $crate::daemon::log_line(format_args!($($arg)*))
+    };
+}
 
 #[cfg(unix)]
 pub(crate) mod socket;
 
+use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::mpsc;
 use std::time::Instant;
@@ -94,13 +106,103 @@ pub(crate) enum UserEvent {
     Menu(tray_icon::menu::MenuEvent),
 }
 
-/// Run `dictate daemon`: load the model, bind the socket (Unix), serve commands.
+/// Daemon log file, opened when stderr is not a terminal.
+static LOG_FILE: std::sync::Mutex<Option<std::fs::File>> = std::sync::Mutex::new(None);
+
+/// Pure daemon-log path: `<data_dir>/daemon.log`.
+pub(crate) fn daemon_log_path_for(data_dir: &Path) -> PathBuf {
+    data_dir.join("daemon.log")
+}
+
+/// Path of the daemon log file.
+pub(crate) fn daemon_log_path() -> anyhow::Result<PathBuf> {
+    let dirs = directories::ProjectDirs::from("", "", "dictate")
+        .ok_or_else(|| anyhow::anyhow!("Could not find a home/data directory for this user"))?;
+    Ok(daemon_log_path_for(dirs.data_dir()))
+}
+
+/// Start mirroring daemon lines to the log file when stderr is not a
+/// terminal (autostarted daemons). Failures warn on stderr and keep
+/// stderr-only logging. Skipped when the on-demand client already redirects
+/// stderr to the log file (then every line, including panics, is logged via
+/// the file descriptor and mirroring would duplicate it).
+pub(crate) fn init_file_log() {
+    use std::io::IsTerminal;
+    if std::io::stderr().is_terminal()
+        || std::env::var("DICTATE_STDERR_IS_LOG").as_deref() == Ok("1")
+    {
+        return;
+    }
+    let path = match daemon_log_path() {
+        Ok(path) => path,
+        Err(err) => {
+            eprintln!("warning: could not open the daemon log: {err:#}");
+            return;
+        }
+    };
+    if let Some(parent) = path.parent()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        eprintln!(
+            "warning: could not open daemon log {}: {err:#}",
+            path.display()
+        );
+        return;
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)
+    {
+        Ok(file) => {
+            if let Ok(mut slot) = LOG_FILE.lock() {
+                *slot = Some(file);
+            }
+        }
+        Err(err) => eprintln!(
+            "warning: could not open daemon log {}: {err:#}",
+            path.display()
+        ),
+    }
+}
+
+/// Print one daemon line to stderr, and to the log file when active.
+pub(crate) fn log_line(args: std::fmt::Arguments<'_>) {
+    eprintln!("{args}");
+    mirror_to_log(&args.to_string());
+}
+
+/// Append one already-printed line to the log file, when active. A failed
+/// lock or write is skipped: stderr already shows the line.
+pub(crate) fn mirror_to_log(line: &str) {
+    use std::io::Write;
+    let Ok(mut slot) = LOG_FILE.lock() else {
+        return;
+    };
+    if let Some(file) = slot.as_mut()
+        && writeln!(file, "{line}").is_err()
+    {
+        // The line is already on stderr; nothing more can be done.
+    }
+}
+
+/// Run `dictate daemon`. A fatal startup failure is mirrored to the log
+/// file too (its stderr twin is printed by `main`).
 pub(crate) fn run_daemon() -> anyhow::Result<()> {
+    init_file_log();
+    run_daemon_inner().map_err(|err| {
+        mirror_to_log(&format!("error: {err:#}"));
+        err
+    })
+}
+
+/// Load the model, bind the socket (Unix), serve commands.
+fn run_daemon_inner() -> anyhow::Result<()> {
     let (file_settings, settings_problem) = crate::config::load();
     crate::config::init_effective(&file_settings);
     if let Some(problem) = settings_problem {
         let message = format!("{problem} Using defaults.");
-        eprintln!("error: {message}");
+        dlog!("error: {message}");
         crate::notify::show(
             crate::notify::Kind::Error,
             "dictate: settings file has an error",
@@ -117,7 +219,7 @@ pub(crate) fn run_daemon() -> anyhow::Result<()> {
     };
     let start = Instant::now();
     let asr = crate::asr::Asr::load(&dir)?;
-    eprintln!(
+    dlog!(
         "model loaded in {} ms. Ready: run \"dictate toggle\" to start/stop recording.",
         start.elapsed().as_millis()
     );
@@ -148,7 +250,7 @@ pub(crate) fn run_daemon() -> anyhow::Result<()> {
         std::thread::spawn(move || socket::serve_socket(listener, socket_proxy));
     }
     #[cfg(not(unix))]
-    eprintln!(
+    dlog!(
         "Socket commands (dictate toggle/start/stop) are not available on Windows yet; use the hotkey."
     );
     let mut app = DaemonApp::new(to_worker, worker, file_settings, event_loop.create_proxy());
@@ -170,7 +272,7 @@ fn setup_hotkey(
 ) {
     app.hotkey_display = config.display.clone();
     if crate::hotkey::wayland_session() {
-        eprintln!(
+        dlog!(
             "Wayland session: global hotkeys are not available to apps. Bind \"dictate toggle\" (or start/stop) in your compositor; see README."
         );
         return;
@@ -181,7 +283,7 @@ fn setup_hotkey(
     }) {
         Ok(manager) => manager,
         Err(err) => {
-            eprintln!(
+            dlog!(
                 "Could not register hotkey {}: {err}. Socket commands still work.",
                 config.display
             );
@@ -196,7 +298,7 @@ fn setup_hotkey(
             // The event loop is closed; the daemon is shutting down.
         }
     }));
-    eprintln!("Hotkey: {} (tap to toggle, hold to talk)", config.display);
+    dlog!("Hotkey: {} (tap to toggle, hold to talk)", config.display);
 }
 
 /// Daemon state, owned by the event-loop thread: the recording state, the
@@ -249,7 +351,7 @@ impl DaemonApp {
     /// reply. A dead worker is logged here and turns every reply into `err`.
     fn handle_command(&mut self, cmd: Command) -> String {
         if self.worker.is_finished() {
-            eprintln!("error: The transcription worker thread ended unexpectedly");
+            dlog!("error: The transcription worker thread ended unexpectedly");
             if !self.worker_gone_notified {
                 self.worker_gone_notified = true;
                 crate::notify::show(
@@ -326,7 +428,7 @@ impl DaemonApp {
         if let Some(tray) = &self.tray
             && let Err(err) = tray.sync_state(self.state)
         {
-            eprintln!("error: {err:#}");
+            dlog!("error: {err:#}");
         }
     }
 
@@ -378,7 +480,7 @@ impl DaemonApp {
     /// Log and notify a settings-save failure (the in-memory value stays).
     fn report_save_error(&self, result: anyhow::Result<()>) {
         if let Err(err) = result {
-            eprintln!("error: {err:#}");
+            dlog!("error: {err:#}");
             crate::notify::show(
                 crate::notify::Kind::Error,
                 "dictate: could not save settings",
@@ -422,7 +524,7 @@ impl DaemonApp {
         if let Some(old) = self.hotkey
             && let Err(err) = manager.unregister(old)
         {
-            eprintln!(
+            dlog!(
                 "error: Could not unregister shortcut {}: {err}",
                 self.hotkey_display
             );
@@ -434,7 +536,7 @@ impl DaemonApp {
         self.settings.hotkey = display.to_string();
         self.report_save_error(crate::config::save(&self.settings));
         self.sync_shortcut_checks();
-        eprintln!("Hotkey: {display} (tap to toggle, hold to talk)");
+        dlog!("Hotkey: {display} (tap to toggle, hold to talk)");
     }
 
     /// Notify a failed shortcut switch and re-check the current shortcut.
@@ -458,7 +560,7 @@ impl DaemonApp {
     fn open_how_to(&self) {
         if let Err(err) = crate::tray::open_target(crate::tray::README_USE_IT_URL) {
             let message = format!("{err:#}");
-            eprintln!("error: {message}");
+            dlog!("error: {message}");
             crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
         }
     }
@@ -468,7 +570,7 @@ impl DaemonApp {
     fn open_settings_file(&self) {
         let Some(path) = crate::config::config_path() else {
             let message = "Could not find a home directory for this user";
-            eprintln!("error: {message}");
+            dlog!("error: {message}");
             crate::notify::show(crate::notify::Kind::Error, "dictate", message);
             return;
         };
@@ -476,13 +578,13 @@ impl DaemonApp {
             && let Err(err) = crate::config::save(&self.settings)
         {
             let message = format!("Could not create {}: {err:#}", path.display());
-            eprintln!("error: {message}");
+            dlog!("error: {message}");
             crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
             return;
         }
         if let Err(err) = crate::tray::open_target(&path.to_string_lossy()) {
             let message = format!("{err:#}");
-            eprintln!("error: {message}");
+            dlog!("error: {message}");
             crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
         }
     }
@@ -500,7 +602,7 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
             match crate::tray::build_tray(&self.settings, self.state, self.menu_proxy.clone()) {
                 Ok(tray) => self.tray = Some(tray),
                 Err(err) => {
-                    eprintln!("error: {err:#}");
+                    dlog!("error: {err:#}");
                     crate::notify::show(
                         crate::notify::Kind::Error,
                         "dictate: no tray icon",
@@ -526,7 +628,7 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
             UserEvent::Command(cmd, reply_tx) => {
                 let reply = self.handle_command(cmd);
                 if reply_tx.send(reply).is_err() {
-                    eprintln!("error: Could not reply to a daemon client: the connection closed");
+                    dlog!("error: Could not reply to a daemon client: the connection closed");
                 }
             }
             UserEvent::WorkerDone => {
@@ -563,7 +665,7 @@ fn run_action(
                 ok_reply.to_string()
             }
             Err(err) => {
-                eprintln!("error: {err:#}");
+                dlog!("error: {err:#}");
                 crate::notify::show(
                     crate::notify::Kind::Error,
                     "dictate: recording failed",
@@ -583,7 +685,7 @@ fn run_action(
                     Err(err) => {
                         *state = State::Idle;
                         let message = format!("Could not queue audio for transcription: {err}");
-                        eprintln!("error: {message}");
+                        dlog!("error: {message}");
                         crate::notify::show(
                             crate::notify::Kind::Error,
                             "dictate: recording failed",
@@ -594,7 +696,7 @@ fn run_action(
                 },
                 Err(err) => {
                     *state = State::Idle;
-                    eprintln!("error: {err:#}");
+                    dlog!("error: {err:#}");
                     crate::notify::show(
                         crate::notify::Kind::Error,
                         "dictate: recording failed",
@@ -605,7 +707,7 @@ fn run_action(
             },
             None => {
                 *state = State::Idle;
-                eprintln!("error: the daemon was recording but its recorder is gone");
+                dlog!("error: the daemon was recording but its recorder is gone");
                 crate::notify::show(
                     crate::notify::Kind::Error,
                     "dictate: recording failed",
@@ -631,14 +733,14 @@ fn transcribe_worker(
 ) {
     let mut typer = crate::typer::Typer::new();
     if let Err(err) = &typer {
-        eprintln!("error: {err:#}");
+        dlog!("error: {err:#}");
     }
     for samples in rx {
         let seconds = samples.len() as f32 / 16_000.0;
         if crate::mic::recording_too_short(&samples) {
             let ms = samples.len() as u64 * 1000 / 16_000;
             let message = format!("Recording too short ({ms} ms); nothing to transcribe.");
-            eprintln!("{message}");
+            dlog!("{message}");
             crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
         } else {
             let start = Instant::now();
@@ -646,14 +748,14 @@ fn transcribe_worker(
                 Ok(text) => {
                     if crate::asr::is_empty_transcript(&text) {
                         let message = crate::asr::no_speech_message(seconds);
-                        eprintln!("{message}");
+                        dlog!("{message}");
                         crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
                     } else {
                         type_and_log(&text, seconds, start, typer.as_mut());
                     }
                 }
                 Err(err) => {
-                    eprintln!("error: {err:#}");
+                    dlog!("error: {err:#}");
                     crate::notify::show(
                         crate::notify::Kind::Error,
                         "dictate: transcription failed",
@@ -681,14 +783,14 @@ fn type_and_log(
         Err(err) => Err(anyhow::anyhow!("{err:#}")),
     };
     match typed {
-        Ok(()) => eprintln!(
+        Ok(()) => dlog!(
             "recorded {seconds:.1} s, transcribed in {} ms, typed {} chars",
             start.elapsed().as_millis(),
             text.chars().count()
         ),
         Err(err) => {
-            eprintln!("error: {err:#}");
-            eprintln!("Text that was not typed: {text}");
+            dlog!("error: {err:#}");
+            dlog!("Text that was not typed: {text}");
             crate::notify::show(
                 crate::notify::Kind::Error,
                 "dictate: could not type the text",
@@ -756,5 +858,13 @@ mod tests {
         for (state, cmd, expected) in cases {
             assert_eq!(next(state, cmd), expected, "next({state:?}, {cmd:?})");
         }
+    }
+
+    #[test]
+    fn daemon_log_path_appends_file_name() {
+        assert_eq!(
+            daemon_log_path_for(Path::new("/data")),
+            PathBuf::from("/data/daemon.log")
+        );
     }
 }
