@@ -17,6 +17,7 @@ mod hotkey;
 mod mic;
 mod model;
 mod notify;
+mod segment;
 mod tray;
 mod typer;
 
