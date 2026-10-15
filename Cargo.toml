@@ -11,6 +11,7 @@ panic = "abort"
 
 [dependencies]
 anyhow = "1.0.104"
+cpal = "0.18.2"
 directories = "6.0.0"
 hound = "3.5.1"
 parakeet-rs = { version = "0.4.1", default-features = false, features = ["cpu", "api-28"] }

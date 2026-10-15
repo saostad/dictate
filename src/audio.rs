@@ -6,7 +6,7 @@ use rubato::audioadapter::Adapter;
 use rubato::audioadapter_buffers::direct::SequentialSliceOfVecs;
 use rubato::{Fft, FixedSync, Resampler};
 
-const TARGET_SAMPLE_RATE: u32 = 16_000;
+pub(crate) const TARGET_SAMPLE_RATE: u32 = 16_000;
 
 /// Load a WAV file as mono 16 kHz f32 samples in [-1, 1].
 pub fn load_wav_16k_mono(path: &Path) -> anyhow::Result<Vec<f32>> {
@@ -33,10 +33,7 @@ fn load_inner(path: &Path) -> anyhow::Result<Vec<f32>> {
         }
     };
     let channels = usize::from(spec.channels);
-    let mono: Vec<f32> = samples
-        .chunks(channels)
-        .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
-        .collect();
+    let mono = crate::mic::downmix(&samples, channels);
     if spec.sample_rate == TARGET_SAMPLE_RATE || mono.is_empty() {
         return Ok(mono);
     }
@@ -48,7 +45,7 @@ fn load_inner(path: &Path) -> anyhow::Result<Vec<f32>> {
     })
 }
 
-fn resample(mono: &[f32], sample_rate: u32) -> anyhow::Result<Vec<f32>> {
+pub(crate) fn resample(mono: &[f32], sample_rate: u32) -> anyhow::Result<Vec<f32>> {
     let mut resampler = Fft::<f32>::new(
         sample_rate as usize,
         TARGET_SAMPLE_RATE as usize,

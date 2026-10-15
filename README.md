@@ -17,6 +17,7 @@ cargo build --release
 ```sh
 dictate download
 dictate transcribe x.wav
+dictate listen
 ```
 
 ## Model

@@ -10,9 +10,12 @@ compile_error!(
 
 mod asr;
 mod audio;
+mod mic;
 mod model;
 
 use std::path::Path;
+
+use anyhow::Context;
 
 fn main() -> anyhow::Result<()> {
     if let Err(err) = run() {
@@ -30,6 +33,7 @@ fn run() -> anyhow::Result<()> {
     };
     match command.as_str() {
         "download" => model::download(),
+        "listen" => listen(),
         "transcribe" => {
             let Some(file) = args.next() else {
                 eprintln!("Usage: dictate transcribe <file.wav>");
@@ -65,6 +69,36 @@ fn transcribe(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn listen() -> anyhow::Result<()> {
+    let dir = model::model_dir_checked()?;
+    let recorder = mic::Recorder::start()?;
+    let loader = std::thread::spawn(move || asr::Asr::load(&dir));
+    eprintln!("Recording... press Enter to stop.");
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("Could not read from stdin")?;
+    let samples = recorder.stop()?;
+    if mic::recording_too_short(&samples) {
+        let ms = samples.len() as u64 * 1000 / 16_000;
+        anyhow::bail!("Recording too short ({ms} ms); nothing to transcribe.");
+    }
+    let mut asr = match loader.join() {
+        Ok(Ok(asr)) => asr,
+        Ok(Err(err)) => return Err(err),
+        Err(_) => anyhow::bail!("Model loading thread panicked"),
+    };
+    let seconds = samples.len() as f32 / 16_000.0;
+    let start = std::time::Instant::now();
+    let text = asr.transcribe(&samples)?;
+    eprintln!(
+        "recorded {seconds:.1} s, transcribed in {} ms",
+        start.elapsed().as_millis()
+    );
+    println!("{text}");
+    Ok(())
+}
+
 fn usage() -> &'static str {
-    "Usage: dictate <command> [args]\n\nCommands:\n  download               Download the speech model (about 660 MB)\n  transcribe <file.wav>  Transcribe a WAV file and print the text\n  help                   Show this help"
+    "Usage: dictate <command> [args]\n\nCommands:\n  download               Download the speech model (about 660 MB)\n  transcribe <file.wav>  Transcribe a WAV file and print the text\n  listen                 Record from the microphone and print the text\n  help                   Show this help"
 }
