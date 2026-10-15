@@ -28,3 +28,26 @@ jobs:
       - name: Lint and test with system ONNX Runtime (Ubuntu only)
         if: runner.os == 'Linux'
         run: cargo clippy --all-targets --no-default-features --features system-ort -- -D warnings && cargo test --no-default-features --features system-ort
+
+  e2e:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    env:
+      DICTATE_MODEL_DIR: ${{ github.workspace }}/.model
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Linux dependencies
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
+        with:
+          path: .model
+          key: parakeet-tdt-0.6b-v2-int8-0bbb45a
+      - name: Download model
+        run: cargo run --release -- download
+      - name: Transcribe real clip
+        run: cargo test --release -- --ignored

@@ -1,12 +1,13 @@
-//! Transcribes a real WAV with the downloaded model. Ignored by default so CI
-//! never downloads the 660 MB model; run with:
-//! `DICTATE_TEST_WAV=/path/to/speech.wav cargo test -- --ignored`.
+//! Transcribes a real clip with the downloaded model. Ignored by default;
+//! run with `cargo test -- --ignored`. Uses `$DICTATE_TEST_WAV` when set,
+//! otherwise `tests/fixtures/jfk.wav`.
 
 #[test]
 #[ignore]
 fn transcribe_with_downloaded_model() {
-    let wav = std::env::var("DICTATE_TEST_WAV")
-        .expect("set DICTATE_TEST_WAV to a WAV file to run this test");
+    let wav = std::env::var("DICTATE_TEST_WAV").unwrap_or_else(|_| {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/jfk.wav").to_string()
+    });
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_dictate"))
         .args(["transcribe", &wav])
         .output()
@@ -17,5 +18,9 @@ fn transcribe_with_downloaded_model() {
         String::from_utf8_lossy(&output.stderr)
     );
     let text = String::from_utf8_lossy(&output.stdout);
-    assert!(!text.trim().is_empty(), "transcription was empty");
+    assert!(
+        text.to_lowercase()
+            .contains("ask not what your country can do for you"),
+        "unexpected transcription: {text}"
+    );
 }
