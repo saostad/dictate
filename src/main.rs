@@ -17,7 +17,7 @@ mod hotkey;
 mod mic;
 mod model;
 mod notify;
-mod segment;
+mod stream;
 mod tray;
 mod typer;
 
@@ -91,25 +91,49 @@ fn transcribe(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Test hook: transcribe a file through the same feeder path the streaming
-/// daemon uses (100 ms pushes at the file's rate, per-segment transcribe,
-/// same join rule). Prints the joined text to stdout and per-segment timings
-/// to stderr.
+/// Test hook: transcribe a file through the same buffered-streaming engine
+/// the daemon uses (simulated 100 ms chunks at the file's rate, resampled
+/// once, decoded synchronously when triggered, same commit and join rules).
+/// Prints the joined text to stdout and per-decode timings to stderr.
 fn transcribe_segmented(path: &Path) -> anyhow::Result<()> {
     let dir = model::model_dir_checked()?;
     let (mono, rate) = audio::load_wav_mono(path)?;
+    if rate == 0 {
+        anyhow::bail!("Invalid sample rate 0 Hz");
+    }
     let start = std::time::Instant::now();
     let mut asr = asr::Asr::load(&dir)?;
     eprintln!("model loaded in {} ms", start.elapsed().as_millis());
-    let mut feeder = segment::Feeder::new(rate)?;
-    let mut run = SegmentRun::default();
+    let mut resampler = if rate == audio::TARGET_SAMPLE_RATE {
+        None
+    } else {
+        Some(audio::StreamResampler::new(rate)?)
+    };
+    let mut run = StreamRun::default();
     let chunk = (rate as usize / 10).max(1);
     for piece in mono.chunks(chunk) {
-        let segments = feeder.push(piece)?;
-        transcribe_segments(&mut asr, &segments, &mut run)?;
+        let out16 = match &mut resampler {
+            Some(resampler) => resampler.push(piece)?,
+            None => piece.to_vec(),
+        };
+        if out16.is_empty() {
+            continue;
+        }
+        run.stream.push(&out16);
+        if run.stream.should_decode() {
+            decode_mid(&mut asr, &mut run)?;
+        }
     }
-    let segments = feeder.finish()?;
-    transcribe_segments(&mut asr, &segments, &mut run)?;
+    let tail16 = match &mut resampler {
+        Some(resampler) => resampler.finish()?,
+        None => Vec::new(),
+    };
+    if !tail16.is_empty() {
+        run.stream.push(&tail16);
+    }
+    if !run.stream.is_empty() {
+        decode_final(&mut asr, &mut run)?;
+    }
     if run.joined.is_empty() {
         let seconds = mono.len() as f32 / rate.max(1) as f32;
         eprintln!("{}", asr::no_speech_message(seconds));
@@ -122,53 +146,131 @@ fn transcribe_segmented(path: &Path) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Joined-text state for one `--segmented` run.
+/// Joined-text state for one `--segmented` run: the same engine state the
+/// daemon worker holds, appending to a string instead of typing.
 #[derive(Default)]
-struct SegmentRun {
-    seq: usize,
+struct StreamRun {
+    stream: stream::Stream,
     joined: String,
     typed_words: Vec<String>,
     pending: Option<char>,
 }
 
-/// Transcribe feeder segments like the daemon worker: decode with left
-/// context, skip empties silently, join with the same rule, log per-segment
-/// timings to stderr.
-fn transcribe_segments(
-    asr: &mut asr::Asr,
-    segments: &[segment::Segment],
-    run: &mut SegmentRun,
-) -> anyhow::Result<()> {
-    for segment in segments {
-        run.seq += 1;
-        let seconds = segment.audio.len() as f32 / 16_000.0;
-        let context_s = segment.context.len() as f32 / 16_000.0;
-        let start = std::time::Instant::now();
-        let (kept_texts, boundary) =
-            asr.transcribe_segment_pieces(&segment.context, &segment.audio)?;
-        let ms = start.elapsed().as_millis();
-        if kept_texts.is_empty() {
-            continue;
-        }
-        eprintln!(
-            "segment {}: {seconds:.1} s audio (context {context_s:.1} s), transcribed in {ms} ms",
-            run.seq
-        );
-        let tail_start = run.typed_words.len().saturating_sub(2);
-        let (to_type, new_pending) = asr::join_piece(
-            &run.typed_words[tail_start..],
-            run.pending,
-            boundary,
-            &kept_texts,
-        );
-        run.pending = new_pending;
-        if to_type.is_empty() {
-            continue;
-        }
-        run.joined.push_str(&to_type);
-        asr::append_typed_words(&mut run.typed_words, &to_type);
+/// Decode the current window like the daemon worker: commit with the guard,
+/// join with the same rule, append, log one `decode N` line to stderr.
+fn decode_mid(asr: &mut asr::Asr, run: &mut StreamRun) -> anyhow::Result<()> {
+    let window = run.stream.window();
+    let words = transcribe_window(asr, &run.stream)?;
+    let took_ms = words.1;
+    let words = words.0;
+    let boundary = asr::boundary_punct_before(&words, window.ctx_s);
+    let (committed, new_end) =
+        stream::commit_words(&words, window.ctx_s, window.window_s, window.guard_s);
+    run.stream.mark_decoded();
+    if let Some(end_s) = new_end {
+        run.stream.advance(window.start, end_s);
     }
+    let decode_n = run.stream.decodes();
+    if committed.is_empty() {
+        eprintln!(
+            "decode {decode_n}: window {:.1} s (ctx {:.1} s), took {took_ms} ms, committed 0 words, typed 0 chars",
+            window.window_s, window.ctx_s
+        );
+        return Ok(());
+    }
+    let kept_texts: Vec<String> = committed.iter().map(|word| word.text.clone()).collect();
+    append_committed(
+        run,
+        &kept_texts,
+        boundary,
+        decode_n,
+        &window,
+        took_ms,
+        committed.len(),
+    );
     Ok(())
+}
+
+/// Final decode like the daemon worker: commit everything remaining.
+fn decode_final(asr: &mut asr::Asr, run: &mut StreamRun) -> anyhow::Result<()> {
+    let window = run.stream.window();
+    let words = transcribe_window(asr, &run.stream)?;
+    let took_ms = words.1;
+    let words = words.0;
+    let boundary = asr::boundary_punct_before(&words, window.ctx_s);
+    let kept = asr::keep_words_after(&words, window.ctx_s);
+    let new_end = kept.last().map(|word| word.end);
+    run.stream.mark_decoded();
+    if let Some(end_s) = new_end {
+        run.stream.advance(window.start, end_s);
+    }
+    let decode_n = run.stream.decodes();
+    if kept.is_empty() {
+        eprintln!(
+            "decode {decode_n}: window {:.1} s (ctx {:.1} s), took {took_ms} ms, committed 0 words, typed 0 chars",
+            window.window_s, window.ctx_s
+        );
+        return Ok(());
+    }
+    let kept_texts: Vec<String> = kept.iter().map(|word| word.text.clone()).collect();
+    append_committed(
+        run,
+        &kept_texts,
+        boundary,
+        decode_n,
+        &window,
+        took_ms,
+        kept.len(),
+    );
+    Ok(())
+}
+
+/// Transcribe the stream's current window, returning the words plus the
+/// decode time in milliseconds.
+fn transcribe_window(
+    asr: &mut asr::Asr,
+    stream: &stream::Stream,
+) -> anyhow::Result<(Vec<asr::Word>, u128)> {
+    let window_audio = stream.window_audio().to_vec();
+    let start = std::time::Instant::now();
+    let words = asr.transcribe_words(&window_audio)?;
+    Ok((words, start.elapsed().as_millis()))
+}
+
+/// Join committed words onto the run text with the same rule the daemon
+/// worker types with, and log one `decode N` line (`typed` counts appended
+/// chars here).
+fn append_committed(
+    run: &mut StreamRun,
+    kept_texts: &[String],
+    boundary: Option<char>,
+    decode_n: usize,
+    window: &stream::Window,
+    took_ms: u128,
+    committed_words: usize,
+) {
+    let tail_start = run.typed_words.len().saturating_sub(2);
+    let (to_type, new_pending) = asr::join_piece(
+        &run.typed_words[tail_start..],
+        run.pending,
+        boundary,
+        kept_texts,
+    );
+    run.pending = new_pending;
+    if to_type.is_empty() {
+        eprintln!(
+            "decode {decode_n}: window {:.1} s (ctx {:.1} s), took {took_ms} ms, committed {committed_words} words, typed 0 chars",
+            window.window_s, window.ctx_s
+        );
+        return;
+    }
+    let chars = to_type.chars().count();
+    run.joined.push_str(&to_type);
+    asr::append_typed_words(&mut run.typed_words, &to_type);
+    eprintln!(
+        "decode {decode_n}: window {:.1} s (ctx {:.1} s), took {took_ms} ms, committed {committed_words} words, typed {chars} chars",
+        window.window_s, window.ctx_s
+    );
 }
 
 fn listen() -> anyhow::Result<()> {

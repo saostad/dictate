@@ -140,9 +140,10 @@ running headless.
 
 ## Type while speaking
 
-An optional mode (off by default): each pause segment is transcribed and
-typed while you keep talking, so only the last short piece remains after
-release. Turn it on with the tray menu's "Type while speaking" checkbox or
+An optional mode (off by default): the recording is decoded while you
+keep talking and words are typed once the model is sure about them, so only
+the last second or so remains after release. Turn it on with the tray menu's
+"Type while speaking" checkbox or
 `streaming = true` in the settings file. Cancel can't un-type pieces already
 typed. Leave it off to type once at stop, as before. It's faster on long
 dictations: most of the text is already typed when you stop.
@@ -162,7 +163,7 @@ All keys are optional; a missing file means defaults:
 ```toml
 sounds = true                 # short tone when recording starts/stops
 notifications = true          # desktop notifications for errors
-streaming = false             # type each pause segment while speaking
+streaming = false             # type while speaking
 hotkey = "Ctrl+Shift+Space"   # global shortcut: tap to toggle, hold to talk
 ```
 
@@ -217,7 +218,7 @@ If the library is not on the default search path, point at it with
 
 ## Troubleshooting
 
-Streaming diagnosis: set `DICTATE_DEBUG_SEGMENTS=<dir>` to save every emitted segment (`<recording>-<N>.wav` plus its `<recording>-<N>-ctx.wav` context prefix) and the whole recording (`<recording>-full.wav`) as 16 kHz WAVs.
+Streaming diagnosis: set `DICTATE_DEBUG_SEGMENTS=<dir>` to save every decode window (`<recording>-<N>.wav`, context prefix included) and the whole recording (`<recording>-full.wav`) as 16 kHz WAVs.
 
 ## License
 

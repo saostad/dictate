@@ -259,7 +259,7 @@ fn escape(value: &str) -> String {
 /// Render all keys, each with a one-line comment.
 fn render(settings: &Settings) -> String {
     format!(
-        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Type each pause segment while speaking (off: type once at stop).\nstreaming = {}\n# Global hotkey: tap to toggle, hold to talk.\nhotkey = \"{}\"\n",
+        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Type while speaking (off: type once at stop).\nstreaming = {}\n# Global hotkey: tap to toggle, hold to talk.\nhotkey = \"{}\"\n",
         settings.sounds,
         settings.notifications,
         settings.streaming,

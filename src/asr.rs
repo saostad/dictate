@@ -86,15 +86,15 @@ pub(crate) fn no_speech_message(seconds: f32) -> String {
 }
 
 /// One word with its timestamps in seconds.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Word {
     pub text: String,
     pub start: f32,
     pub end: f32,
 }
 
-/// Keep the words decoded at/after the context boundary: a word belongs to
-/// the segment when its midpoint is at or past `context_s` (seconds).
+/// Keep the words decoded at/after the context boundary: a word is new
+/// when its midpoint is at or past `context_s` (seconds).
 pub(crate) fn keep_words_after(words: &[Word], context_s: f32) -> Vec<Word> {
     words
         .iter()
@@ -173,20 +173,14 @@ pub(crate) fn join_piece(
     let _ = pending_punct;
     let mut kept: Vec<String> = kept_words.to_vec();
     // Strip leading punctuation (standalone tokens and prefixes).
-    while !kept.is_empty() {
-        let stripped = kept[0].trim_start_matches(BOUNDARY_PUNCT).to_string();
-        if stripped.is_empty() {
-            kept.remove(0);
-        } else {
-            if stripped.len() != kept[0].len() {
-                kept[0] = stripped;
-            }
-            break;
-        }
-    }
+    strip_leading_punct(&mut kept);
     // Overlap dedupe: drop the first 1-2 kept words when they equal the last
     // 1-2 typed words (case and punctuation-insensitive).
     dedupe_overlap(prev_tail_words, &mut kept);
+    // Dedupe can expose a leading standalone mark (kept ["you", ",", "and"]
+    // with prev ending in "you" leaves [",", "and"]). Strip again so it
+    // never reaches the page as "you , and".
+    strip_leading_punct(&mut kept);
     // Hold back the new trailing punctuation.
     let mut new_pending = None;
     if let Some(last) = kept.last_mut()
@@ -227,6 +221,21 @@ pub(crate) fn join_piece(
     match context_boundary_punct {
         Some(boundary) => (format!("{boundary} {joined}"), new_pending),
         None => (format!(" {joined}"), new_pending),
+    }
+}
+
+/// Drop leading punctuation tokens and prefixes (`.,?!;:`) from kept words.
+fn strip_leading_punct(kept: &mut Vec<String>) {
+    while !kept.is_empty() {
+        let stripped = kept[0].trim_start_matches(BOUNDARY_PUNCT).to_string();
+        if stripped.is_empty() {
+            kept.remove(0);
+        } else {
+            if stripped.len() != kept[0].len() {
+                kept[0] = stripped;
+            }
+            break;
+        }
     }
 }
 
@@ -324,37 +333,6 @@ impl Asr {
             })
             .collect())
     }
-
-    /// Transcribe one streaming segment, returning the kept word texts plus
-    /// the boundary punctuation from the context decode. Segments after the
-    /// first are decoded with left `context` audio for accuracy at the cut,
-    /// then trimmed to the words at/after the context boundary; the boundary
-    /// is the trailing punctuation on the last context word before it. The
-    /// first segment (empty context) decodes alone via plain transcribe, split
-    /// into words. Empty results are `(empty, None)` and skipped silently.
-    pub(crate) fn transcribe_segment_pieces(
-        &mut self,
-        context: &[f32],
-        segment: &[f32],
-    ) -> anyhow::Result<(Vec<String>, Option<char>)> {
-        if context.is_empty() {
-            let text = self.transcribe(segment)?;
-            if is_empty_transcript(&text) {
-                return Ok((Vec::new(), None));
-            }
-            let words = text.split_whitespace().map(str::to_string).collect();
-            return Ok((words, None));
-        }
-        let mut audio = Vec::with_capacity(context.len() + segment.len());
-        audio.extend_from_slice(context);
-        audio.extend_from_slice(segment);
-        let words = self.transcribe_words(&audio)?;
-        let context_s = context.len() as f32 / 16_000.0;
-        let boundary = boundary_punct_before(&words, context_s);
-        let kept = keep_words_after(&words, context_s);
-        let texts = kept.into_iter().map(|word| word.text).collect();
-        Ok((texts, boundary))
-    }
 }
 
 fn load_inner(dir: &Path) -> anyhow::Result<Asr> {
@@ -411,7 +389,7 @@ mod tests {
 
     #[test]
     fn keep_words_after_keeps_boundary_word() {
-        // Midpoint exactly on the boundary belongs to the segment.
+        // Midpoint exactly on the boundary counts as new.
         let words = vec![word("ask", 1.4, 1.6)];
         assert_eq!(kept_texts(&words, 1.5), vec!["ask"]);
     }
@@ -552,6 +530,20 @@ mod tests {
         let prev = texts(&["for", "you"]);
         let (text, pending) = join_piece(&prev, Some('.'), Some(','), &texts(&["you"]));
         assert_eq!((text.as_str(), pending), (",", None));
+    }
+
+    #[test]
+    fn join_piece_dedupe_leaves_no_space_before_comma() {
+        // Kept ["you", ",", "and"] with prev ending in "you": dedupe drops
+        // "you", exposing a leading ",". It must be stripped, not typed as
+        // "for you , and".
+        let prev = texts(&["for", "you"]);
+        let kept = texts(&["you", ",", "and"]);
+        let (text, pending) = join_piece(&prev, None, None, &kept);
+        assert_eq!((text.as_str(), pending), (" and", None));
+        // With a context boundary, the boundary is typed once, not doubled.
+        let (text, pending) = join_piece(&prev, None, Some(','), &kept);
+        assert_eq!((text.as_str(), pending), (", and", None));
     }
 
     #[test]
