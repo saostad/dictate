@@ -75,7 +75,7 @@ Most x86_64 PCs want `dictate-linux-x86_64.tar.gz`. If your CPU has no
 AVX2, that binary exits with:
 
 ```text
-This CPU has no AVX2, but this build bundles an ONNX Runtime that needs AVX2. Install ONNX Runtime from your package manager (Arch: sudo pacman -S onnxruntime-cpu) and rebuild with: cargo build --release --no-default-features --features system-ort
+This CPU has no AVX2, but this build bundles an ONNX Runtime that needs AVX2. Download the prebuilt Linux release from https://github.com/saostad/dictate/releases/latest (it works on any x86_64 CPU), or rebuild with: cargo build --release --no-default-features --features system-ort
 ```
 
 In that case use `dictate-linux-x86_64-system-ort.tar.gz` instead,
@@ -156,6 +156,11 @@ app that runs `dictate daemon`.
 
 Speech recognition uses NVIDIA Parakeet TDT 0.6B v2 (English), released under
 CC-BY-4.0, using the int8 ONNX export by istupakov.
+
+The model lives in the platform data directory
+(`~/.local/share/dictate/models/parakeet-tdt-0.6b-v2-int8` on Linux). Set
+`DICTATE_MODEL_DIR` to keep it elsewhere; `download` and every command that
+loads the model honor it.
 
 ## CPUs without AVX2 / system ONNX Runtime
 

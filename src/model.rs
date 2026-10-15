@@ -14,14 +14,30 @@ const MODEL_FILES: &[&str] = &[
 const PROGRESS_STEP_PERCENT: u64 = 5;
 const MB: u64 = 1_000_000;
 
-/// Directory the model files live in. Creates nothing.
+/// The model directory, honoring `DICTATE_MODEL_DIR` when it is set and
+/// non-empty. Creates nothing.
 pub fn model_dir() -> anyhow::Result<PathBuf> {
+    model_dir_with(std::env::var_os("DICTATE_MODEL_DIR"))
+}
+
+fn model_dir_with(env: Option<std::ffi::OsString>) -> anyhow::Result<PathBuf> {
+    if let Some(dir) = model_dir_override(env) {
+        return Ok(dir);
+    }
     let dirs = directories::ProjectDirs::from("", "", "dictate")
         .ok_or_else(|| anyhow::anyhow!("Could not find a home/data directory for this user"))?;
     Ok(dirs
         .data_dir()
         .join("models")
         .join("parakeet-tdt-0.6b-v2-int8"))
+}
+
+/// `DICTATE_MODEL_DIR` value as a path: `Some` when set and non-empty.
+fn model_dir_override(env: Option<std::ffi::OsString>) -> Option<PathBuf> {
+    match env {
+        Some(dir) if !dir.is_empty() => Some(PathBuf::from(dir)),
+        _ => None,
+    }
 }
 
 /// Error unless every model file exists in `dir`.
@@ -184,5 +200,40 @@ mod tests {
         }
         check_model_dir(&dir).unwrap();
         cleanup(&dir);
+    }
+
+    #[test]
+    fn model_dir_override_uses_env_when_set() {
+        assert_eq!(
+            model_dir_override(Some("/tmp/dictate-models".into())),
+            Some(PathBuf::from("/tmp/dictate-models"))
+        );
+    }
+
+    #[test]
+    fn model_dir_override_ignores_empty_env() {
+        assert_eq!(model_dir_override(Some("".into())), None);
+    }
+
+    #[test]
+    fn model_dir_override_is_none_when_unset() {
+        assert_eq!(model_dir_override(None), None);
+    }
+
+    #[test]
+    fn model_dir_with_env_uses_override() {
+        let dir = model_dir_with(Some("/tmp/dictate-models".into())).unwrap();
+        assert_eq!(dir, PathBuf::from("/tmp/dictate-models"));
+    }
+
+    #[test]
+    fn model_dir_with_unset_env_uses_project_data_dir() {
+        let dir = model_dir_with(None).unwrap();
+        assert!(
+            dir.join("encoder-model.int8.onnx")
+                .ends_with("models/parakeet-tdt-0.6b-v2-int8/encoder-model.int8.onnx"),
+            "unexpected: {}",
+            dir.display()
+        );
     }
 }

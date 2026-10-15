@@ -29,7 +29,7 @@ fn build_environment() -> anyhow::Result<Environment> {
     #[cfg(any(target_arch = "x86", target_arch = "x86_64"))]
     if !std::arch::is_x86_feature_detected!("avx2") {
         anyhow::bail!(
-            "This CPU has no AVX2, but this build bundles an ONNX Runtime that needs AVX2. Install ONNX Runtime from your package manager (Arch: sudo pacman -S onnxruntime-cpu) and rebuild with: cargo build --release --no-default-features --features system-ort"
+            "This CPU has no AVX2, but this build bundles an ONNX Runtime that needs AVX2. Download the prebuilt Linux release from https://github.com/saostad/dictate/releases/latest (it works on any x86_64 CPU), or rebuild with: cargo build --release --no-default-features --features system-ort"
         );
     }
     Ok(parakeet_rs::ort::init().build()?)
@@ -37,25 +37,42 @@ fn build_environment() -> anyhow::Result<Environment> {
 
 #[cfg(feature = "system-ort")]
 fn build_environment() -> anyhow::Result<Environment> {
-    let path = ort_dylib_path(std::env::var_os("ORT_DYLIB_PATH"));
+    let exe = std::env::current_exe().ok();
+    let exe_dir = exe.as_ref().and_then(|p| p.parent());
+    let path = ort_dylib_path(std::env::var_os("ORT_DYLIB_PATH"), exe_dir, |p| p.exists());
     let builder = parakeet_rs::ort::init_from(&path).map_err(|err| {
         anyhow::anyhow!(
-            "Could not load ONNX Runtime from {}: {err:#}. Install it (Arch: sudo pacman -S onnxruntime-cpu) or set ORT_DYLIB_PATH to the full path of the onnxruntime library file.",
+            "Could not load ONNX Runtime from {}: {err:#}. Put the onnxruntime library next to the dictate binary, install it (Arch: sudo pacman -S onnxruntime-cpu), or set ORT_DYLIB_PATH to its full path.",
             path.display()
         )
     })?;
     Ok(builder.build()?)
 }
 
-/// Path of the system ONNX Runtime library: `ORT_DYLIB_PATH` when it is set
-/// and non-empty, otherwise the platform's default library file name.
+/// Path of the ONNX Runtime library for system-ort builds: `ORT_DYLIB_PATH`
+/// when it is set and non-empty, otherwise the library file next to the
+/// running binary when it exists, otherwise the platform's default library
+/// file name (resolved through the system search path).
 #[cfg(feature = "system-ort")]
-fn ort_dylib_path(env: Option<std::ffi::OsString>) -> std::path::PathBuf {
+fn ort_dylib_path(
+    env: Option<std::ffi::OsString>,
+    exe_dir: Option<&Path>,
+    mut exists: impl FnMut(&Path) -> bool,
+) -> std::path::PathBuf {
     use std::env::consts::{DLL_PREFIX, DLL_SUFFIX};
-    match env {
-        Some(path) if !path.is_empty() => std::path::PathBuf::from(path),
-        _ => std::path::PathBuf::from(format!("{DLL_PREFIX}onnxruntime{DLL_SUFFIX}")),
+    if let Some(path) = env
+        && !path.is_empty()
+    {
+        return std::path::PathBuf::from(path);
     }
+    let file_name = format!("{DLL_PREFIX}onnxruntime{DLL_SUFFIX}");
+    if let Some(dir) = exe_dir {
+        let next_to_binary = dir.join(&file_name);
+        if exists(&next_to_binary) {
+            return next_to_binary;
+        }
+    }
+    std::path::PathBuf::from(file_name)
 }
 
 /// True when the transcript holds no recognized speech.
@@ -121,18 +138,54 @@ mod system_ort_tests {
 
     #[test]
     fn ort_dylib_path_uses_env_when_set() {
-        let path = ort_dylib_path(Some("/opt/ort/libonnxruntime.so".into()));
+        let path = ort_dylib_path(Some("/opt/ort/libonnxruntime.so".into()), None, |_| true);
         assert_eq!(path, PathBuf::from("/opt/ort/libonnxruntime.so"));
     }
 
     #[test]
-    fn ort_dylib_path_falls_back_on_empty_env() {
-        let path = ort_dylib_path(Some("".into()));
+    fn ort_dylib_path_env_wins_over_bundled_lib() {
+        let path = ort_dylib_path(
+            Some("/opt/ort/libonnxruntime.so".into()),
+            Some(Path::new("/opt/dictate")),
+            |_| true,
+        );
+        assert_eq!(path, PathBuf::from("/opt/ort/libonnxruntime.so"));
+    }
+
+    #[test]
+    fn ort_dylib_path_uses_lib_next_to_binary() {
+        let dir = Path::new("/opt/dictate");
+        let path = ort_dylib_path(None, Some(dir), |_| true);
+        assert_eq!(path, dir.join(default_lib_name()));
+    }
+
+    #[test]
+    fn ort_dylib_path_empty_env_falls_through_to_bundled_lib() {
+        let dir = Path::new("/opt/dictate");
+        let path = ort_dylib_path(Some("".into()), Some(dir), |_| true);
+        assert_eq!(path, dir.join(default_lib_name()));
+    }
+
+    #[test]
+    fn ort_dylib_path_probes_exe_dir() {
+        let dir = Path::new("/opt/dictate");
+        let mut probed = Vec::new();
+        let path = ort_dylib_path(None, Some(dir), |p| {
+            probed.push(p.to_path_buf());
+            false
+        });
+        assert_eq!(probed, vec![dir.join(default_lib_name())]);
         assert_eq!(path, default_lib_name());
     }
 
     #[test]
     fn ort_dylib_path_falls_back_when_unset() {
-        assert_eq!(ort_dylib_path(None), default_lib_name());
+        assert_eq!(ort_dylib_path(None, None, |_| true), default_lib_name());
+    }
+
+    #[test]
+    fn ort_dylib_path_falls_back_on_empty_env() {
+        let path = ort_dylib_path(Some("".into()), None, |_| true);
+        assert_eq!(path, default_lib_name());
     }
 }
