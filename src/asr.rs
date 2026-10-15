@@ -58,6 +58,16 @@ fn ort_dylib_path(env: Option<std::ffi::OsString>) -> std::path::PathBuf {
     }
 }
 
+/// True when the transcript holds no recognized speech.
+pub(crate) fn is_empty_transcript(text: &str) -> bool {
+    text.trim().is_empty()
+}
+
+/// Message for `stderr` when no speech was recognized in `seconds` of audio.
+pub(crate) fn no_speech_message(seconds: f32) -> String {
+    format!("No speech recognized in {seconds:.1} s of audio.")
+}
+
 impl Asr {
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
         load_inner(dir)
@@ -77,6 +87,26 @@ fn load_inner(dir: &Path) -> anyhow::Result<Asr> {
     let config = ExecutionConfig::new().with_environment(env);
     let model = ParakeetTDT::from_pretrained(dir, Some(config))?;
     Ok(Asr { model })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_transcript_check_ignores_whitespace() {
+        assert!(is_empty_transcript(""));
+        assert!(is_empty_transcript("   "));
+        assert!(!is_empty_transcript("hello"));
+    }
+
+    #[test]
+    fn no_speech_message_names_duration() {
+        assert_eq!(
+            no_speech_message(3.9),
+            "No speech recognized in 3.9 s of audio."
+        );
+    }
 }
 
 #[cfg(all(test, feature = "system-ort"))]

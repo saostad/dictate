@@ -65,6 +65,10 @@ fn transcribe(path: &Path) -> anyhow::Result<()> {
         "transcribed {seconds:.1} s of audio in {} ms",
         start.elapsed().as_millis()
     );
+    if asr::is_empty_transcript(&text) {
+        eprintln!("{}", asr::no_speech_message(seconds));
+        return Ok(());
+    }
     println!("{text}");
     Ok(())
 }
@@ -95,6 +99,10 @@ fn listen() -> anyhow::Result<()> {
         "recorded {seconds:.1} s, transcribed in {} ms",
         start.elapsed().as_millis()
     );
+    if asr::is_empty_transcript(&text) {
+        eprintln!("{}", asr::no_speech_message(seconds));
+        return Ok(());
+    }
     println!("{text}");
     Ok(())
 }
