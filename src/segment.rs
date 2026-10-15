@@ -3,10 +3,12 @@
 //! Splits mono audio at natural pauses so the daemon can transcribe and type
 //! each piece while the user keeps talking. Energy VAD on 30 ms frames (RMS)
 //! with an adaptive threshold; cuts at ≥ 450 ms of silence after speech
-//! (segment ≥ 1.2 s) in the middle of the silence, force-cuts at 8 s at the
-//! quietest frame in the last 2 s. Segments are a contiguous partition of the
-//! whole recording: the first starts at sample 0, each cut is in the middle
-//! of a pause, and only all-silence segments are skipped.
+//! (segment ≥ 1.2 s) at the quietest frame of the pause, force-cuts at 15 s at
+//! the quietest frame in the last 3 s. A pause cut needs a clearly quieter
+//! frame (≤ 0.4 × the speech median); unclear "pauses" never split, the
+//! recording just keeps accumulating. Segments are a contiguous partition of
+//! the whole recording: the first starts at sample 0, each cut is inside a
+//! pause, and only all-silence segments are skipped.
 //!
 //! `Feeder` is the shared streaming path (daemon + `transcribe --segmented`):
 //! it resamples the continuous stream to 16 kHz once (stateful, so there are
@@ -21,9 +23,14 @@ const SILENCE_CUT_MS: u32 = 450;
 /// Minimum segment length for a pause cut.
 const MIN_SEGMENT_MS: u32 = 1200;
 /// Segment length that triggers a force-cut.
-const MAX_SEGMENT_MS: u32 = 8000;
+const MAX_SEGMENT_MS: u32 = 15000;
 /// Search window for the force-cut point.
-const FORCE_SEARCH_MS: u32 = 2000;
+const FORCE_SEARCH_MS: u32 = 3000;
+/// A pause cut needs its quietest frame at or below this fraction of the
+/// speech-frame RMS median: unclear "pauses" must not split words.
+const CONTRAST_RATIO: f32 = 0.4;
+/// Silence kept on each side of a pause cut where possible.
+const CUT_MARGIN_MS: u32 = 200;
 /// Floor of the adaptive speech threshold.
 const MIN_THRESHOLD: f32 = 0.008;
 /// Speech threshold is this multiple of the noise floor.
@@ -144,6 +151,7 @@ pub(crate) struct Segmenter {
     min_segment_samples: usize,
     max_segment_samples: usize,
     force_search_frames: usize,
+    cut_margin_frames: usize,
 }
 
 impl Segmenter {
@@ -156,6 +164,9 @@ impl Segmenter {
         let max_segment_samples = sample_rate as usize * MAX_SEGMENT_MS as usize / 1000;
         let force_search_frames =
             ((sample_rate as usize * FORCE_SEARCH_MS as usize) / 1000 / frame_len).max(1);
+        let cut_margin_frames = (sample_rate as usize * CUT_MARGIN_MS as usize)
+            .div_ceil(1000 * frame_len)
+            .max(1);
         Self {
             frame_len,
             noise_floor: INITIAL_NOISE_FLOOR,
@@ -169,6 +180,7 @@ impl Segmenter {
             min_segment_samples,
             max_segment_samples,
             force_search_frames,
+            cut_margin_frames,
         }
     }
 
@@ -248,8 +260,9 @@ impl Segmenter {
         }
         if self.trailing_silence >= self.silence_cut_frames
             && self.samples.len() >= self.min_segment_samples
+            && let Some(segment) = self.cut_pause()
         {
-            return Some(self.cut_pause());
+            return Some(segment);
         }
         if self.samples.len() >= self.max_segment_samples {
             return self.cut_force();
@@ -257,12 +270,43 @@ impl Segmenter {
         None
     }
 
-    /// Cut in the middle of the trailing silence; the remainder carries over.
-    /// The caller guarantees the segment holds speech. Nothing is trimmed:
-    /// the head plus the remainder exactly partition the buffered audio.
-    fn cut_pause(&mut self) -> Vec<f32> {
+    /// Median RMS of the speech frames buffered in the current segment.
+    fn speech_median(&self) -> Option<f32> {
+        let mut speech_rms: Vec<f32> = self
+            .rms
+            .iter()
+            .zip(&self.speech)
+            .filter(|&(_, &speech)| speech)
+            .map(|(&rms, _)| rms)
+            .collect();
+        speech_rms.sort_by(f32::total_cmp);
+        speech_rms.get(speech_rms.len() / 2).copied()
+    }
+
+    /// Cut after the quietest frame of the trailing silence; the remainder
+    /// carries over. Refuses (`None`) when the pause is not clearly quieter
+    /// than the speech, so the recording keeps accumulating instead of
+    /// splitting a word. Nothing is trimmed: the head plus the remainder
+    /// exactly partition the buffered audio.
+    fn cut_pause(&mut self) -> Option<Vec<f32>> {
         let silence = self.trailing_silence;
-        let keep_in_first = silence / 2;
+        let pause_start = self.speech.len() - silence;
+        let mut quiet = pause_start;
+        for index in pause_start + 1..self.speech.len() {
+            if self.rms[index] < self.rms[quiet] {
+                quiet = index;
+            }
+        }
+        if let Some(median) = self.speech_median()
+            && self.rms[quiet] > CONTRAST_RATIO * median
+        {
+            return None;
+        }
+        // Keep ≥ 200 ms of the pause on each side where possible.
+        let margin = self.cut_margin_frames;
+        let min_keep = margin.min(silence);
+        let max_keep = silence.saturating_sub(margin).max(min_keep);
+        let keep_in_first = (quiet - pause_start + 1).clamp(min_keep, max_keep);
         let remainder_frames = silence - keep_in_first;
         let cut = self.samples.len() - remainder_frames * self.frame_len;
         let first_frames = self.speech.len() - remainder_frames;
@@ -275,11 +319,11 @@ impl Segmenter {
         self.speech = remainder_speech;
         self.has_speech = self.speech.iter().any(|&speech| speech);
         self.trailing_silence = trailing_count(&self.speech);
-        head
+        Some(head)
     }
 
     /// Force-cut a long segment at the end of the quietest frame in the last
-    /// 2 s. A first half with no speech frames is skipped (`None`); otherwise
+    /// 3 s. A first half with no speech frames is skipped (`None`); otherwise
     /// nothing is trimmed.
     fn cut_force(&mut self) -> Option<Vec<f32>> {
         let frames = self.speech.len();
@@ -413,22 +457,106 @@ mod tests {
     }
 
     #[test]
-    fn long_tone_force_cuts_at_or_before_eight_seconds() {
-        let audio = tone(12.0);
+    fn long_tone_force_cuts_after_eight_seconds_at_or_before_fifteen() {
+        let audio = tone(20.0);
         let mut segmenter = Segmenter::new(RATE);
         let segments = push_chunked(&mut segmenter, &audio);
         assert!(
             !segments.is_empty(),
-            "12 s of continuous tone must force-cut"
+            "20 s of continuous tone must force-cut"
         );
-        let limit = RATE as usize * 8 + RATE as usize * FRAME_MS as usize / 1000;
+        assert!(
+            segments[0].len() > RATE as usize * 8,
+            "the force-cut limit is 15 s, not 8 s (first segment {})",
+            segments[0].len()
+        );
+        let limit = RATE as usize * 15 + RATE as usize * FRAME_MS as usize / 1000;
         assert!(
             segments[0].len() <= limit,
-            "first segment is {} samples, over 8 s + one frame",
+            "first segment is {} samples, over 15 s + one frame",
             segments[0].len()
         );
         let tail = segmenter.finish();
         assert!(tail.is_some(), "the remainder is the tail");
+    }
+
+    #[test]
+    fn low_contrast_audio_does_not_cut() {
+        // Speech at 0.05, "pause" at 0.044: the pause is so loud it never
+        // reads as silence (RMS 0.031 > threshold 0.008), so no cut is even
+        // considered.
+        let speech = tone_at(RATE, 0.05, 2.0);
+        let pause = tone_at(RATE, 0.044, 0.6);
+        let split = speech.len() + pause.len();
+        let mut audio = speech;
+        audio.extend(pause);
+        audio.extend(tone_at(RATE, 0.05, 2.0));
+        let mut segmenter = Segmenter::new(RATE);
+        let segments = push_chunked(&mut segmenter, &audio[..split]);
+        assert!(segments.is_empty(), "low-contrast audio must not cut");
+        assert_eq!(
+            segmenter.trailing_silence, 0,
+            "the 0.044 pause must read as speech, not silence"
+        );
+        let segments = push_chunked(&mut segmenter, &audio[split..]);
+        assert!(segments.is_empty(), "low-contrast audio must not cut");
+        let tail = segmenter.finish().expect("one uncut tail");
+        assert_eq!(tail, audio, "nothing may be dropped");
+    }
+
+    #[test]
+    fn contrast_guard_blocks_pause_that_is_not_clearly_quieter() {
+        // Speech at 0.02, "pause" at 0.009: the pause reads as silence (RMS
+        // 0.0064 < threshold 0.008) but is not clearly quieter than the
+        // speech (0.0064 > 0.4 x speech median 0.014), so the contrast guard
+        // refuses the cut and the recording keeps accumulating.
+        let speech = tone_at(RATE, 0.02, 2.0);
+        let pause = tone_at(RATE, 0.009, 0.6);
+        let split = speech.len() + pause.len();
+        let mut audio = speech;
+        audio.extend(pause);
+        audio.extend(tone_at(RATE, 0.02, 2.0));
+        let mut segmenter = Segmenter::new(RATE);
+        let segments = push_chunked(&mut segmenter, &audio[..split]);
+        assert!(segments.is_empty(), "an unclear pause must not cut");
+        // The pause really is a long silence in a long-enough segment: only
+        // the contrast guard stands between this fixture and a cut.
+        assert!(
+            segmenter.trailing_silence >= segmenter.silence_cut_frames,
+            "the pause must read as a long silence (trailing {})",
+            segmenter.trailing_silence
+        );
+        assert!(
+            segmenter.samples.len() >= segmenter.min_segment_samples,
+            "the segment must be long enough to cut"
+        );
+        let segments = push_chunked(&mut segmenter, &audio[split..]);
+        assert!(segments.is_empty(), "an unclear pause must not cut");
+        let tail = segmenter.finish().expect("one uncut tail");
+        assert_eq!(tail, audio, "nothing may be dropped");
+    }
+
+    #[test]
+    fn clear_pause_cuts_at_quietest_frame() {
+        // Speech at 0.1, pause at 0.005 with one distinctly quieter frame
+        // off-center (absolute frame 74, samples 35520..36000): the cut lands
+        // right after it, not at the pause middle (35520).
+        let mut audio = tone_at(RATE, 0.1, 2.0);
+        let mut pause = tone_at(RATE, 0.005, 0.6);
+        for (index, sample) in pause.iter_mut().enumerate().take(4000).skip(3520) {
+            *sample = 0.0001
+                * (index as f32 * 440.0 * 2.0 * std::f32::consts::PI / RATE as f32).sin();
+        }
+        audio.extend(pause);
+        audio.extend(tone_at(RATE, 0.1, 2.0));
+        let mut segmenter = Segmenter::new(RATE);
+        let segments = push_chunked(&mut segmenter, &audio);
+        assert_eq!(segments.len(), 1, "the clear pause must cut once");
+        assert_eq!(
+            segments[0].len(),
+            36_000,
+            "the cut must land right after the quietest frame (frame 74)"
+        );
     }
 
     #[test]
@@ -490,7 +618,7 @@ mod tests {
             ("pause split", pause),
             ("short pause", short),
             ("leading silence", leading),
-            ("long tone", tone(12.0)),
+            ("long tone", tone(20.0)),
         ];
         for (name, audio) in &fixtures {
             let mut segmenter = Segmenter::new(RATE);
