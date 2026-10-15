@@ -10,6 +10,8 @@ compile_error!(
 
 mod asr;
 mod audio;
+#[cfg(unix)]
+mod daemon;
 mod mic;
 mod model;
 
@@ -34,6 +36,8 @@ fn run() -> anyhow::Result<()> {
     match command.as_str() {
         "download" => model::download(),
         "listen" => listen(),
+        "daemon" => run_daemon(),
+        "toggle" | "start" | "stop" | "cancel" | "status" => run_client(&command),
         "transcribe" => {
             let Some(file) = args.next() else {
                 eprintln!("Usage: dictate transcribe <file.wav>");
@@ -107,6 +111,26 @@ fn listen() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(unix)]
+fn run_daemon() -> anyhow::Result<()> {
+    daemon::run_daemon()
+}
+
+#[cfg(not(unix))]
+fn run_daemon() -> anyhow::Result<()> {
+    anyhow::bail!("\"dictate daemon\" is not supported on this OS yet.")
+}
+
+#[cfg(unix)]
+fn run_client(cmd: &str) -> anyhow::Result<()> {
+    daemon::client_command(cmd)
+}
+
+#[cfg(not(unix))]
+fn run_client(cmd: &str) -> anyhow::Result<()> {
+    anyhow::bail!("\"dictate {cmd}\" is not supported on this OS yet.")
+}
+
 fn usage() -> &'static str {
-    "Usage: dictate <command> [args]\n\nCommands:\n  download               Download the speech model (about 660 MB)\n  transcribe <file.wav>  Transcribe a WAV file and print the text\n  listen                 Record from the microphone and print the text\n  help                   Show this help"
+    "Usage: dictate <command> [args]\n\nCommands:\n  download               Download the speech model (about 660 MB)\n  transcribe <file.wav>  Transcribe a WAV file and print the text\n  listen                 Record from the microphone and print the text\n  daemon                 Run the dictation daemon (keeps the model loaded)\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  help                   Show this help"
 }
