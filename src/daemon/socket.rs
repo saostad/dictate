@@ -57,7 +57,7 @@ pub(crate) fn socket_path() -> anyhow::Result<PathBuf> {
 pub(crate) fn client_command(cmd: &str) -> anyhow::Result<()> {
     if let Err(err) = client_command_inner(cmd) {
         if cmd != "status" {
-            crate::notify::show(crate::notify::Kind::Error, "dictate", &format!("{err:#}"));
+            crate::notify::show_now(crate::notify::Kind::Error, "dictate", &format!("{err:#}"));
         }
         return Err(err);
     }
