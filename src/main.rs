@@ -12,6 +12,8 @@ mod asr;
 mod audio;
 #[cfg(unix)]
 mod daemon;
+#[cfg(unix)]
+mod hotkey;
 mod mic;
 mod model;
 #[cfg(unix)]

@@ -48,6 +48,26 @@ bindr = SUPER, D, exec, dictate stop
 On GNOME or KDE, bind the same commands in Settings → Keyboard → Custom
 Shortcuts.
 
+## Global hotkey
+
+Outside a Wayland session, `dictate daemon` also registers a global hotkey:
+**Ctrl+Shift+Space** by default, or whatever `DICTATE_HOTKEY` holds:
+
+```sh
+DICTATE_HOTKEY=Alt+F9 dictate daemon
+```
+
+- Tap (press and release quickly): toggles recording on and off.
+- Hold (keep it pressed): records while held and transcribes on release
+  (push-to-talk).
+
+On Wayland, apps cannot register global hotkeys, so the daemon skips this and
+prints a note; bind `dictate toggle` (or `start`/`stop`) in your compositor
+instead (see above).
+
+On macOS, grant Accessibility (for typing) and Microphone to the terminal or
+app that runs `dictate daemon`.
+
 ## Model
 
 Speech recognition uses NVIDIA Parakeet TDT 0.6B v2 (English), released under

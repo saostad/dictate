@@ -1,18 +1,29 @@
-//! Long-running dictation daemon, controlled over a Unix socket.
+//! Long-running dictation daemon, controlled over a Unix socket or hotkey.
 //!
 //! `dictate daemon` keeps the speech model loaded. `dictate
 //! toggle|start|stop|cancel|status` sends one line to the socket and prints the
-//! one-line reply. The accept loop owns the [`Recorder`](crate::mic::Recorder)
-//! (cpal streams are not `Send` everywhere); one worker thread owns the
-//! [`Asr`](crate::asr::Asr) and transcribes audio sent over an mpsc channel.
+//! one-line reply; a global hotkey (tap to toggle, hold to talk) triggers the
+//! same commands without a terminal.
+//!
+//! The main thread runs a windowless winit event loop. It owns the state, the
+//! [`Recorder`](crate::mic::Recorder) and the hotkey manager (cpal streams are
+//! not `Send` everywhere, and the manager belongs on the event-loop thread).
+//! The socket accept loop runs on a thread and forwards commands as user
+//! events; one worker thread owns the [`Asr`](crate::asr::Asr) and transcribes
+//! audio sent over an mpsc channel.
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
+use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
+use winit::application::ApplicationHandler;
+use winit::event::WindowEvent;
+use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
+use winit::window::WindowId;
 
 /// A control command sent by a client (one line on the socket).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,10 +110,23 @@ pub(crate) fn socket_path() -> anyhow::Result<PathBuf> {
     Ok(socket_path_for(dirs.runtime_dir(), dirs.data_dir()))
 }
 
+/// Events handled on the daemon's event-loop thread.
+#[derive(Debug)]
+enum UserEvent {
+    /// A command from a socket client; the reply goes back on the channel.
+    Command(Command, mpsc::Sender<String>),
+    /// The worker finished one transcription; back to Idle.
+    WorkerDone,
+    /// A global hotkey press or release.
+    HotKey(GlobalHotKeyEvent),
+}
+
 /// Run `dictate daemon`: load the model, bind the socket, serve commands.
 pub(crate) fn run_daemon() -> anyhow::Result<()> {
     let dir = crate::model::model_dir_checked()?;
-    let start = std::time::Instant::now();
+    let hotkey = crate::hotkey::resolve_hotkey(std::env::var("DICTATE_HOTKEY").ok().as_deref())
+        .map_err(|message| anyhow::anyhow!("{message}"))?;
+    let start = Instant::now();
     let asr = crate::asr::Asr::load(&dir)?;
     eprintln!(
         "model loaded in {} ms. Ready: run \"dictate toggle\" to start/stop recording.",
@@ -118,12 +142,188 @@ pub(crate) fn run_daemon() -> anyhow::Result<()> {
         })?;
     }
     let listener = bind_listener(&path)?;
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("Could not start the daemon event loop")?;
     let (to_worker, worker_rx) = mpsc::channel::<Vec<f32>>();
-    let (done_tx, from_worker) = mpsc::channel::<()>();
-    std::thread::spawn(move || transcribe_worker(worker_rx, done_tx, asr));
-    serve(listener, to_worker, from_worker);
+    let worker_proxy = event_loop.create_proxy();
+    let worker = std::thread::spawn(move || transcribe_worker(worker_rx, worker_proxy, asr));
+    let socket_proxy = event_loop.create_proxy();
+    std::thread::spawn(move || serve_socket(listener, socket_proxy));
+    let mut app = DaemonApp::new(to_worker, worker);
+    setup_hotkey(&event_loop, &hotkey, &mut app);
+    event_loop
+        .run_app(&mut app)
+        .context("The daemon event loop failed")?;
     remove_socket_file(&path);
     Ok(())
+}
+
+/// Register the global hotkey (except on Wayland) and keep its manager alive
+/// in the app. Never fatal: the socket commands always keep working.
+fn setup_hotkey(
+    event_loop: &EventLoop<UserEvent>,
+    config: &crate::hotkey::HotkeyConfig,
+    app: &mut DaemonApp,
+) {
+    if crate::hotkey::wayland_session() {
+        eprintln!(
+            "Wayland session: global hotkeys are not available to apps. Bind \"dictate toggle\" (or start/stop) in your compositor; see README."
+        );
+        return;
+    }
+    let manager = match GlobalHotKeyManager::new().and_then(|manager| {
+        manager.register(config.hotkey)?;
+        Ok(manager)
+    }) {
+        Ok(manager) => manager,
+        Err(err) => {
+            eprintln!(
+                "Could not register hotkey {}: {err}. Socket commands still work.",
+                config.display
+            );
+            return;
+        }
+    };
+    app.hotkey_id = Some(config.hotkey.id());
+    app._hotkey_manager = Some(manager);
+    let proxy = event_loop.create_proxy();
+    GlobalHotKeyEvent::set_event_handler(Some(move |event| {
+        if proxy.send_event(UserEvent::HotKey(event)).is_err() {
+            // The event loop is closed; the daemon is shutting down.
+        }
+    }));
+    eprintln!("Hotkey: {} (tap to toggle, hold to talk)", config.display);
+}
+
+/// Daemon state, owned by the event-loop thread: the recording state, the
+/// `Recorder`, the hotkey manager and the tap-vs-hold tracking.
+struct DaemonApp {
+    state: State,
+    recorder: Option<crate::mic::Recorder>,
+    to_worker: mpsc::Sender<Vec<f32>>,
+    worker: std::thread::JoinHandle<()>,
+    hotkey_id: Option<u32>,
+    press_started: Option<Instant>,
+    tap_armed: bool,
+    /// Held so the registration stays alive; dropping it would unregister.
+    /// Never read, hence the underscore.
+    _hotkey_manager: Option<GlobalHotKeyManager>,
+}
+
+impl DaemonApp {
+    fn new(to_worker: mpsc::Sender<Vec<f32>>, worker: std::thread::JoinHandle<()>) -> Self {
+        Self {
+            state: State::Idle,
+            recorder: None,
+            to_worker,
+            worker,
+            hotkey_id: None,
+            press_started: None,
+            tap_armed: false,
+            _hotkey_manager: None,
+        }
+    }
+
+    /// Run one command through the state machine and return the one-line
+    /// reply. A dead worker is logged here and turns every reply into `err`.
+    fn handle_command(&mut self, cmd: Command) -> String {
+        if self.worker.is_finished() {
+            eprintln!("error: The transcription worker thread ended unexpectedly");
+            return "err transcription worker stopped; restart \"dictate daemon\"".to_string();
+        }
+        let (new_state, action, ok_reply) = next(self.state, cmd);
+        let reply = run_action(
+            action,
+            new_state,
+            ok_reply,
+            &mut self.state,
+            &mut self.recorder,
+            &self.to_worker,
+        );
+        if self.state != State::Recording {
+            self.tap_armed = false;
+        }
+        reply
+    }
+
+    /// Map a hotkey press/release to a command and run it. A hotkey has no
+    /// requester, so the reply is dropped; genuine failures are already
+    /// logged by [`run_action`].
+    fn handle_hotkey(&mut self, event: GlobalHotKeyEvent) {
+        if Some(event.id) != self.hotkey_id {
+            return;
+        }
+        match event.state {
+            HotKeyState::Pressed => {
+                self.press_started = Some(Instant::now());
+                if let Some(cmd) = crate::hotkey::hotkey_action(
+                    self.state,
+                    HotKeyState::Pressed,
+                    0,
+                    self.tap_armed,
+                ) {
+                    self.tap_armed = false;
+                    drop(self.handle_command(cmd));
+                }
+            }
+            HotKeyState::Released => {
+                let held_ms = self
+                    .press_started
+                    .map(|started| started.elapsed().as_millis() as u64)
+                    .unwrap_or(0);
+                self.press_started = None;
+                if let Some(cmd) = crate::hotkey::hotkey_action(
+                    self.state,
+                    HotKeyState::Released,
+                    held_ms,
+                    self.tap_armed,
+                ) {
+                    self.tap_armed = false;
+                    drop(self.handle_command(cmd));
+                } else if self.state == State::Recording
+                    && held_ms < crate::hotkey::HOLD_THRESHOLD_MS
+                {
+                    // Short tap while recording: keep recording; the next
+                    // press stops it.
+                    self.tap_armed = true;
+                }
+            }
+        }
+    }
+}
+
+impl ApplicationHandler<UserEvent> for DaemonApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        // No windows, no polling: sleep until a socket, worker or hotkey
+        // event arrives.
+        event_loop.set_control_flow(ControlFlow::Wait);
+    }
+
+    fn window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        _window_id: WindowId,
+        _event: WindowEvent,
+    ) {
+        // The daemon never creates a window.
+    }
+
+    fn user_event(&mut self, _event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Command(cmd, reply_tx) => {
+                let reply = self.handle_command(cmd);
+                if reply_tx.send(reply).is_err() {
+                    eprintln!("error: Could not reply to a daemon client: the connection closed");
+                }
+            }
+            UserEvent::WorkerDone => {
+                self.state = State::Idle;
+                self.tap_armed = false;
+            }
+            UserEvent::HotKey(event) => self.handle_hotkey(event),
+        }
+    }
 }
 
 /// Run one client command: send it to the daemon and print the reply.
@@ -211,45 +411,28 @@ fn remove_socket_file(path: &Path) {
     }
 }
 
-/// Accept loop: owns the `Recorder`, forwards stopped audio to the worker and
-/// returns the state to Idle on completion. Blocking accept, so an idle daemon
-/// sleeps; every per-request failure is logged and the loop continues.
-fn serve(
-    listener: UnixListener,
-    to_worker: mpsc::Sender<Vec<f32>>,
-    from_worker: mpsc::Receiver<()>,
-) {
-    let mut state = State::Idle;
-    let mut recorder: Option<crate::mic::Recorder> = None;
+/// Socket accept loop, on its own thread: blocking accept (an idle daemon
+/// sleeps), one command per connection, forwarded to the event loop.
+fn serve_socket(listener: UnixListener, proxy: EventLoopProxy<UserEvent>) {
     for stream in listener.incoming() {
         match stream {
-            Ok(stream) => {
-                handle_connection(stream, &mut state, &mut recorder, &to_worker, &from_worker);
-            }
+            Ok(stream) => handle_connection(stream, &proxy),
             Err(err) => eprintln!("error: Could not accept a daemon connection: {err:#}"),
         }
     }
 }
 
-/// Serve one client connection. Never exits the daemon; failures are logged.
-fn handle_connection(
-    stream: UnixStream,
-    state: &mut State,
-    recorder: &mut Option<crate::mic::Recorder>,
-    to_worker: &mpsc::Sender<Vec<f32>>,
-    from_worker: &mpsc::Receiver<()>,
-) {
-    if let Err(err) = handle_connection_inner(stream, state, recorder, to_worker, from_worker) {
+/// Serve one client connection: read one line, forward the command to the
+/// event loop, write back the reply. Failures are logged, never fatal.
+fn handle_connection(stream: UnixStream, proxy: &EventLoopProxy<UserEvent>) {
+    if let Err(err) = handle_connection_inner(stream, proxy) {
         eprintln!("error: {err:#}");
     }
 }
 
 fn handle_connection_inner(
     stream: UnixStream,
-    state: &mut State,
-    recorder: &mut Option<crate::mic::Recorder>,
-    to_worker: &mpsc::Sender<Vec<f32>>,
-    from_worker: &mpsc::Receiver<()>,
+    proxy: &EventLoopProxy<UserEvent>,
 ) -> anyhow::Result<()> {
     // `accept()` inherits O_NONBLOCK from the listener on macOS/BSD, which
     // would make `read_line` fail with WouldBlock; force blocking mode. The
@@ -272,42 +455,27 @@ fn handle_connection_inner(
         // `dictate daemon`. Close it with no reply and no log.
         return Ok(());
     }
-    if poll_worker_done(from_worker, state) {
-        let mut stream = stream;
-        writeln!(
-            stream,
-            "err transcription worker stopped; restart \"dictate daemon\""
-        )
-        .context("Could not reply to a daemon client")?;
-        return Ok(());
-    }
     let reply = match parse_command(&line) {
         None => {
             let text = line.trim();
             format!("err unknown command \"{text}\"")
         }
-        Some(cmd) => {
-            let (new_state, action, ok_reply) = next(*state, cmd);
-            run_action(action, new_state, ok_reply, state, recorder, to_worker)
-        }
+        Some(cmd) => forward_command(cmd, proxy),
     };
     let mut stream = stream;
     writeln!(stream, "{reply}").context("Could not reply to a daemon client")?;
     Ok(())
 }
 
-/// Drain queued worker completions into `state`. Returns true when the
-/// worker thread is gone (logged here; the caller replies `err`).
-fn poll_worker_done(from_worker: &mpsc::Receiver<()>, state: &mut State) -> bool {
-    loop {
-        match from_worker.try_recv() {
-            Ok(()) => *state = State::Idle,
-            Err(mpsc::TryRecvError::Empty) => return false,
-            Err(mpsc::TryRecvError::Disconnected) => {
-                eprintln!("error: The transcription worker thread ended unexpectedly");
-                return true;
-            }
-        }
+/// Send a command to the event loop and wait for its reply.
+fn forward_command(cmd: Command, proxy: &EventLoopProxy<UserEvent>) -> String {
+    let (reply_tx, reply_rx) = mpsc::channel::<String>();
+    if proxy.send_event(UserEvent::Command(cmd, reply_tx)).is_err() {
+        return "err daemon did not answer".to_string();
+    }
+    match reply_rx.recv_timeout(Duration::from_secs(2)) {
+        Ok(reply) => reply,
+        Err(_) => "err daemon did not answer".to_string(),
     }
 }
 
@@ -375,7 +543,7 @@ fn run_action(
 /// Never exits while the daemon runs; every failure is logged.
 fn transcribe_worker(
     rx: mpsc::Receiver<Vec<f32>>,
-    done: mpsc::Sender<()>,
+    proxy: EventLoopProxy<UserEvent>,
     mut asr: crate::asr::Asr,
 ) {
     let mut typer = crate::typer::Typer::new();
@@ -388,7 +556,7 @@ fn transcribe_worker(
             let ms = samples.len() as u64 * 1000 / 16_000;
             eprintln!("Recording too short ({ms} ms); nothing to transcribe.");
         } else {
-            let start = std::time::Instant::now();
+            let start = Instant::now();
             match asr.transcribe(&samples) {
                 Ok(text) => {
                     if crate::asr::is_empty_transcript(&text) {
@@ -400,7 +568,7 @@ fn transcribe_worker(
                 Err(err) => eprintln!("error: {err:#}"),
             }
         }
-        if done.send(()).is_err() {
+        if proxy.send_event(UserEvent::WorkerDone).is_err() {
             break;
         }
     }
@@ -411,7 +579,7 @@ fn transcribe_worker(
 fn type_and_log(
     text: &str,
     seconds: f32,
-    start: std::time::Instant,
+    start: Instant,
     typer: Result<&mut crate::typer::Typer, &mut anyhow::Error>,
 ) {
     let typed = match typer {
