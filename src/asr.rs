@@ -122,15 +122,6 @@ pub(crate) fn join_words(words: &[Word]) -> String {
     out
 }
 
-/// Lowercase the first word of a mid-sentence continuation piece, except "I"
-/// and I-contractions.
-pub(crate) fn decapitalize_continuation(piece: &str) -> String {
-    match piece.split_once(' ') {
-        None => decapitalize_word(piece),
-        Some((first, rest)) => format!("{} {rest}", decapitalize_word(first)),
-    }
-}
-
 /// Punctuation held back between streaming pieces.
 const BOUNDARY_PUNCT: &[char] = &['.', ',', '!', '?', ';', ':'];
 
@@ -155,15 +146,18 @@ pub(crate) fn boundary_punct_before(words: &[Word], context_s: f32) -> Option<ch
 ///
 /// `prev_tail_words` are the last up to 2 typed words (for overlap dedupe).
 /// `pending_punct` is the previous piece's held trailing punctuation: it is
-/// superseded by `context_boundary_punct` (typed instead, or dropped when the
-/// context has none) and only reaches the page at `End`, so this function
-/// takes it to make the replacement explicit and then ignores it.
-/// `context_boundary_punct` is the punctuation from the context decode on the
-/// last context word before the boundary. `kept_words` are the current
-/// piece's decoded word texts (at/after the boundary).
+/// superseded by the boundary (typed instead, or dropped when there is none)
+/// and only reaches the page at `End`, so this function takes it to make the
+/// replacement explicit and then ignores it. `context_boundary_punct` is the
+/// punctuation from the context decode on the last context word before the
+/// boundary; punctuation leading the kept words supersedes it (the fresher
+/// decode). `kept_words` are the current piece's decoded word texts (at/after
+/// the boundary).
 ///
 /// Returns the text to type (boundary punctuation plus spacing included) and
 /// the new pending trailing punctuation (held for the next boundary or `End`).
+/// Kept words are typed exactly as decoded: no lowercasing, since the context
+/// decode already capitalizes correctly.
 pub(crate) fn join_piece(
     prev_tail_words: &[String],
     pending_punct: Option<char>,
@@ -172,21 +166,16 @@ pub(crate) fn join_piece(
 ) -> (String, Option<char>) {
     let _ = pending_punct;
     let mut kept: Vec<String> = kept_words.to_vec();
-    // Strip leading punctuation (standalone tokens and prefixes).
-    while !kept.is_empty() {
-        let stripped = kept[0].trim_start_matches(BOUNDARY_PUNCT).to_string();
-        if stripped.is_empty() {
-            kept.remove(0);
-        } else {
-            if stripped.len() != kept[0].len() {
-                kept[0] = stripped;
-            }
-            break;
-        }
-    }
+    let mut boundary = context_boundary_punct;
+    // Leading punctuation (standalone tokens and prefixes) is the boundary:
+    // the context decode placed it at/after the cut.
+    strip_leading_punct(&mut kept, &mut boundary);
     // Overlap dedupe: drop the first 1-2 kept words when they equal the last
     // 1-2 typed words (case and punctuation-insensitive).
     dedupe_overlap(prev_tail_words, &mut kept);
+    // Dedupe can expose a new leading punctuation token; it is a boundary
+    // too (and never typed with a space before it).
+    strip_leading_punct(&mut kept, &mut boundary);
     // Hold back the new trailing punctuation.
     let mut new_pending = None;
     if let Some(last) = kept.last_mut()
@@ -197,14 +186,6 @@ pub(crate) fn join_piece(
         if last.is_empty() {
             kept.pop();
         }
-    }
-    // Mid-sentence continuations keep the model's capitalization only after a
-    // sentence-ending boundary; the first piece keeps it always.
-    if !prev_tail_words.is_empty()
-        && !kept.is_empty()
-        && !matches!(context_boundary_punct, Some('.' | '?' | '!'))
-    {
-        kept[0] = decapitalize_continuation(&kept[0]);
     }
     let dummy: Vec<Word> = kept
         .iter()
@@ -219,14 +200,31 @@ pub(crate) fn join_piece(
         return (joined, new_pending);
     }
     if joined.is_empty() {
-        let boundary = context_boundary_punct
-            .map(|c| c.to_string())
-            .unwrap_or_default();
+        let boundary = boundary.map(|c| c.to_string()).unwrap_or_default();
         return (boundary, new_pending);
     }
-    match context_boundary_punct {
+    match boundary {
         Some(boundary) => (format!("{boundary} {joined}"), new_pending),
         None => (format!(" {joined}"), new_pending),
+    }
+}
+
+/// Move leading punctuation (standalone tokens and prefixes) into the
+/// boundary; the last one wins. Boundary punctuation is ASCII, so the byte
+/// split below always lands on a char boundary.
+fn strip_leading_punct(kept: &mut Vec<String>, boundary: &mut Option<char>) {
+    while !kept.is_empty() {
+        let stripped = kept[0].trim_start_matches(BOUNDARY_PUNCT).to_string();
+        if stripped.len() == kept[0].len() {
+            break;
+        }
+        *boundary = kept[0][..kept[0].len() - stripped.len()].chars().last();
+        if stripped.is_empty() {
+            kept.remove(0);
+        } else {
+            kept[0] = stripped;
+            break;
+        }
     }
 }
 
@@ -274,23 +272,6 @@ pub(crate) fn append_typed_words(typed_words: &mut Vec<String>, to_type: &str) {
         words.next();
     }
     typed_words.extend(words.map(|word| word.to_string()));
-}
-
-fn decapitalize_word(word: &str) -> String {
-    if is_capital_i(word) {
-        word.to_string()
-    } else {
-        word.to_lowercase()
-    }
-}
-
-/// "I" (possibly with trailing punctuation attached) or an I-contraction.
-fn is_capital_i(word: &str) -> bool {
-    if word == "I" || word.starts_with("I'") || word.starts_with("I\u{2019}") {
-        return true;
-    }
-    word.strip_prefix('I')
-        .is_some_and(|rest| !rest.is_empty() && rest.chars().all(|c| !c.is_alphabetic()))
 }
 
 impl Asr {
@@ -439,22 +420,6 @@ mod tests {
         assert_eq!(join_words(&[]), "");
     }
 
-    #[test]
-    fn decapitalize_continuation_lowercases_first_word() {
-        assert_eq!(decapitalize_continuation("Ask what"), "ask what");
-        assert_eq!(decapitalize_continuation("Ask"), "ask");
-        assert_eq!(decapitalize_continuation("ask what"), "ask what");
-        assert_eq!(decapitalize_continuation(""), "");
-    }
-
-    #[test]
-    fn decapitalize_continuation_keeps_capital_i() {
-        assert_eq!(decapitalize_continuation("I ask"), "I ask");
-        assert_eq!(decapitalize_continuation("I'm asking"), "I'm asking");
-        assert_eq!(decapitalize_continuation("I'll go"), "I'll go");
-        assert_eq!(decapitalize_continuation("I, for one"), "I, for one");
-    }
-
     fn texts(words: &[&str]) -> Vec<String> {
         words.iter().map(|word| (*word).to_string()).collect()
     }
@@ -537,14 +502,40 @@ mod tests {
     }
 
     #[test]
-    fn join_piece_capitalization_follows_boundary_punctuation() {
-        let prev = texts(&["you"]);
+    fn join_piece_keeps_model_capitalization() {
+        // No lowercasing: the context decode already capitalizes correctly
+        // (lowercasing turned "Americans" into "americans" mid-sentence).
+        let prev = texts(&["my", "fellow"]);
+        let (text, _) = join_piece(&prev, None, Some(','), &texts(&["Americans", "ask"]));
+        assert_eq!(text, ", Americans ask");
         let (text, _) = join_piece(&prev, None, Some('.'), &texts(&["Ask"]));
         assert_eq!(text, ". Ask");
-        let (text, _) = join_piece(&prev, None, Some(','), &texts(&["Ask"]));
+    }
+
+    #[test]
+    fn join_piece_leading_punctuation_becomes_boundary() {
+        // `for you` + `, ask`: the kept comma sits past the boundary, so it
+        // is the boundary instead of being stripped (it used to be lost).
+        let prev = texts(&["for", "you"]);
+        let (text, pending) = join_piece(&prev, None, None, &texts(&[",", "ask"]));
+        assert_eq!((text.as_str(), pending), (", ask", None));
+        // The kept punctuation is the fresher decode, so it wins over the
+        // context boundary.
+        let (text, _) = join_piece(&prev, None, Some('.'), &texts(&[",", "ask"]));
         assert_eq!(text, ", ask");
-        let (text, _) = join_piece(&prev, None, Some(','), &texts(&["I'm", "here"]));
-        assert_eq!(text, ", I'm here");
+        // Prefix form.
+        let (text, _) = join_piece(&prev, None, None, &texts(&[",ask"]));
+        assert_eq!(text, ", ask");
+    }
+
+    #[test]
+    fn join_piece_dedupe_exposed_punctuation_becomes_boundary() {
+        // Dedupe dropping "you" exposes a standalone `,`: it becomes the
+        // boundary (`, and`), never a space-separated `you , and`.
+        let prev = texts(&["for", "you"]);
+        let (text, pending) =
+            join_piece(&prev, None, Some('.'), &texts(&["you", ",", "and"]));
+        assert_eq!((text.as_str(), pending), (", and", None));
     }
 
     #[test]
