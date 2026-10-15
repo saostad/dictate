@@ -74,7 +74,7 @@ pub(crate) fn resample(mono: &[f32], sample_rate: u32) -> anyhow::Result<Vec<f32
 /// Stateful resampler to 16 kHz for the streaming feeder: `push` device-rate
 /// chunks as they arrive, `finish` flushes the tail. Output matches the
 /// one-shot [`resample`] exactly (same resampler, startup delay trimmed,
-/// exact end length), so streaming the live feed equals streaming a file.
+/// exact end length), so segmenting the live stream equals segmenting a file.
 pub(crate) struct StreamResampler {
     inner: Fft<f32>,
     from_rate: u32,

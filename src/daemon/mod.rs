@@ -97,9 +97,8 @@ pub(crate) fn next(state: State, cmd: Command) -> (State, Action, &'static str) 
 pub(crate) enum Job {
     /// Whole recording at 16 kHz (streaming off): today's exact path.
     Full(Vec<f32>),
-    /// Raw 16 kHz audio (streaming on): the feeder resamples and sends it,
-    /// the worker buffers it and decodes windows from it.
-    Chunk(Vec<f32>),
+    /// One pause segment at 16 kHz plus its left context (streaming on).
+    Segment(crate::segment::Segment),
     /// End of a streaming recording: whole-recording duration plus the moment
     /// Stop was handled, so the worker can log latency after release.
     End {
@@ -744,7 +743,7 @@ impl DaemonApp {
     }
 
     /// Cancel the recording. Streaming on: the feeder sends `Cancel` and the
-    /// worker discards the buffered audio (already-typed text stays).
+    /// worker discards queued segments (already-typed text stays).
     fn cancel_recording(&mut self, new_state: State, ok_reply: &str) -> String {
         self.finish_feeder(FeederCmd::Cancel);
         self.recorder = None;
@@ -835,60 +834,68 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
 }
 
 /// Streaming feeder thread: while Recording, wake every 100 ms, drain new
-/// device-rate samples, resample them to 16 kHz and send the raw chunk to
-/// the worker (which buffers it and decodes windows from it). On `Stop` the
-/// resampled tail plus `End` go out; on `Cancel` a single `Cancel` goes out.
-/// Only the `Arc` buffer crosses threads; the `Recorder` stays on the
-/// event-loop thread.
+/// device-rate samples and push them through the shared [`Feeder`](crate::segment::Feeder)
+/// (continuous resample to 16 kHz, then pause segmentation), sending each
+/// finished segment to the worker. On `Stop` the tail plus `End` go out; on
+/// `Cancel` a single `Cancel` goes out. Only the `Arc` buffer crosses
+/// threads; the `Recorder` stays on the event-loop thread.
 fn feeder_loop(
     buffer: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
     sample_rate: u32,
     control_rx: mpsc::Receiver<FeederCmd>,
     to_worker: mpsc::Sender<Job>,
 ) {
-    if sample_rate == 0 {
-        feeder_failed(
-            &to_worker,
-            anyhow::anyhow!("Invalid microphone sample rate 0 Hz"),
-        );
-        return;
-    }
-    let mut resampler = if sample_rate == crate::audio::TARGET_SAMPLE_RATE {
-        None
-    } else {
-        match crate::audio::StreamResampler::new(sample_rate) {
-            Ok(resampler) => Some(resampler),
-            Err(err) => {
-                feeder_failed(&to_worker, err);
-                return;
-            }
+    let mut feeder = match crate::segment::Feeder::new(sample_rate) {
+        Ok(feeder) => feeder,
+        Err(err) => {
+            feeder_failed(&to_worker, err);
+            return;
         }
     };
     let mut total_device_samples: u64 = 0;
+    let mut dump = SegmentDump::new();
+    let mut full_device: Vec<f32> = Vec::new();
     loop {
         match control_rx.recv_timeout(std::time::Duration::from_millis(100)) {
             Ok(FeederCmd::Stop) => {
                 let new = crate::mic::take_buffer(&buffer);
                 total_device_samples += new.len() as u64;
-                match resample_push(&mut resampler, &new) {
-                    Ok(chunk) => send_chunk(&to_worker, chunk),
+                if dump.is_some() {
+                    full_device.extend_from_slice(&new);
+                }
+                let pushed = match feeder.push(&new) {
+                    Ok(segments) => segments,
                     Err(err) => {
                         feeder_failed(&to_worker, err);
                         break;
                     }
+                };
+                for segment in pushed {
+                    if let Some(dump) = dump.as_mut() {
+                        dump.dump_segment(&segment);
+                    }
+                    send_segment(&to_worker, segment);
                 }
-                let tail = match &mut resampler {
-                    Some(resampler) => match resampler.finish() {
-                        Ok(tail) => tail,
+                let total_seconds = total_device_samples as f32 / sample_rate.max(1) as f32;
+                // Recordings under 0.3 s keep today's too-short message: drop
+                // the tail so the worker sees only `End`.
+                let too_short = total_device_samples * 1000 < u64::from(sample_rate.max(1)) * 300;
+                if !too_short {
+                    match feeder.finish() {
+                        Ok(segments) => {
+                            for segment in segments {
+                                if let Some(dump) = dump.as_mut() {
+                                    dump.dump_segment(&segment);
+                                }
+                                send_segment(&to_worker, segment);
+                            }
+                        }
                         Err(err) => {
                             feeder_failed(&to_worker, err);
                             break;
                         }
-                    },
-                    None => Vec::new(),
-                };
-                send_chunk(&to_worker, tail);
-                let total_seconds = total_device_samples as f32 / sample_rate.max(1) as f32;
+                    }
+                }
                 if to_worker
                     .send(Job::End {
                         total_seconds,
@@ -897,6 +904,9 @@ fn feeder_loop(
                     .is_err()
                 {
                     // The worker is gone; the event loop reports that itself.
+                }
+                if let Some(dump) = dump.as_mut() {
+                    dump.dump_full(&full_device, sample_rate);
                 }
                 break;
             }
@@ -912,12 +922,21 @@ fn feeder_loop(
                     continue;
                 }
                 total_device_samples += new.len() as u64;
-                match resample_push(&mut resampler, &new) {
-                    Ok(chunk) => send_chunk(&to_worker, chunk),
+                if dump.is_some() {
+                    full_device.extend_from_slice(&new);
+                }
+                let pushed = match feeder.push(&new) {
+                    Ok(segments) => segments,
                     Err(err) => {
                         feeder_failed(&to_worker, err);
                         break;
                     }
+                };
+                for segment in pushed {
+                    if let Some(dump) = dump.as_mut() {
+                        dump.dump_segment(&segment);
+                    }
+                    send_segment(&to_worker, segment);
                 }
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
@@ -932,44 +951,30 @@ fn feeder_loop(
     }
 }
 
-/// Resample device-rate samples to 16 kHz (`None` resampler means the device
-/// already runs at 16 kHz). Output may be empty (hold-back); the caller
-/// skips empty chunks.
-fn resample_push(
-    resampler: &mut Option<crate::audio::StreamResampler>,
-    samples: &[f32],
-) -> anyhow::Result<Vec<f32>> {
-    match resampler {
-        Some(resampler) => resampler.push(samples),
-        None => Ok(samples.to_vec()),
-    }
-}
-
-/// Queue one 16 kHz chunk for transcription. Empty chunks (resampler
-/// hold-back) are skipped.
-fn send_chunk(to_worker: &mpsc::Sender<Job>, chunk: Vec<f32>) {
-    if chunk.is_empty() {
+/// Queue one 16 kHz segment for transcription.
+fn send_segment(to_worker: &mpsc::Sender<Job>, segment: crate::segment::Segment) {
+    if segment.audio.is_empty() {
         return;
     }
-    if to_worker.send(Job::Chunk(chunk)).is_err() {
+    if to_worker.send(Job::Segment(segment)).is_err() {
         // The worker is gone; the event loop reports that itself.
     }
 }
 
-/// Per-recording decode dump for streaming diagnosis. When
-/// `DICTATE_DEBUG_SEGMENTS` holds a non-empty directory, every decode window
-/// is written as `<id>-<N>.wav` (16 kHz mono f32, exactly the samples sent to
-/// the model, context prefix included) and the whole recording as
-/// `<id>-full.wav`. A write failure is logged once and disables the rest of
-/// the recording; dictation itself never fails.
-struct DecodeDump {
+/// Per-recording segment dump for streaming diagnosis. When
+/// `DICTATE_DEBUG_SEGMENTS` holds a non-empty directory, every emitted
+/// segment is written as `<id>-<N>.wav` (16 kHz mono f32, exactly the samples
+/// sent to the model) plus `<id>-<N>-ctx.wav` for its context prefix, and the
+/// whole recording as `<id>-full.wav`. A write failure is logged once and
+/// disables the rest of the recording; dictation itself never fails.
+struct SegmentDump {
     dir: PathBuf,
     recording_ms: u128,
     next_n: usize,
     failed: bool,
 }
 
-impl DecodeDump {
+impl SegmentDump {
     /// Enable dumping for one recording when the env var holds a non-empty
     /// directory. Creates the directory; on failure logs once and stays off.
     fn new() -> Option<Self> {
@@ -997,27 +1002,45 @@ impl DecodeDump {
         })
     }
 
-    /// Dump one decode window (called for every successful decode, so N
-    /// matches the worker's `decode N` log).
-    fn dump_window(&mut self, window_audio: &[f32]) {
-        if self.failed {
+    /// Dump one emitted segment (empty audio is skipped, like the send path,
+    /// so N matches the worker's per-segment log).
+    fn dump_segment(&mut self, segment: &crate::segment::Segment) {
+        if self.failed || segment.audio.is_empty() {
             return;
         }
         let n = self.next_n;
         self.next_n += 1;
-        let path = decode_dump_path(&self.dir, self.recording_ms, n);
-        if let Err(err) = write_dump_wav(&path, window_audio) {
+        let (path, ctx_path) = segment_dump_paths(&self.dir, self.recording_ms, n);
+        if let Err(err) = write_dump_wav(&path, &segment.audio) {
+            self.fail_once(err);
+            return;
+        }
+        if !segment.context.is_empty()
+            && let Err(err) = write_dump_wav(&ctx_path, &segment.context)
+        {
             self.fail_once(err);
         }
     }
 
-    /// Dump the whole 16 kHz recording.
-    fn dump_full(&mut self, samples_16k: &[f32]) {
+    /// Dump the whole device-rate recording, resampled to 16 kHz.
+    fn dump_full(&mut self, device_samples: &[f32], sample_rate: u32) {
         if self.failed {
             return;
         }
+        let samples_16k =
+            if device_samples.is_empty() || sample_rate == crate::audio::TARGET_SAMPLE_RATE {
+                device_samples.to_vec()
+            } else {
+                match crate::audio::resample(device_samples, sample_rate) {
+                    Ok(samples) => samples,
+                    Err(err) => {
+                        self.fail_once(err);
+                        return;
+                    }
+                }
+            };
         let path = full_dump_path(&self.dir, self.recording_ms);
-        if let Err(err) = write_dump_wav(&path, samples_16k) {
+        if let Err(err) = write_dump_wav(&path, &samples_16k) {
             self.fail_once(err);
         }
     }
@@ -1031,9 +1054,13 @@ impl DecodeDump {
     }
 }
 
-/// Pure dump file name for decode window N (1-based).
-fn decode_dump_path(dir: &Path, recording_ms: u128, n: usize) -> PathBuf {
-    dir.join(format!("{recording_ms}-{n}.wav"))
+/// Pure dump file names for segment N (1-based): the segment plus its
+/// context prefix.
+fn segment_dump_paths(dir: &Path, recording_ms: u128, n: usize) -> (PathBuf, PathBuf) {
+    (
+        dir.join(format!("{recording_ms}-{n}.wav")),
+        dir.join(format!("{recording_ms}-{n}-ctx.wav")),
+    )
 }
 
 /// Pure dump file name for the whole recording.
@@ -1063,7 +1090,7 @@ fn write_dump_wav(path: &Path, samples: &[f32]) -> anyhow::Result<()> {
 }
 
 /// Abort a streaming recording after a feeder failure: log + notify, and send
-/// `Cancel` so the worker discards the buffered audio and returns to Idle
+/// `Cancel` so the worker discards queued segments and returns to Idle
 /// (already-typed text stays).
 fn feeder_failed(to_worker: &mpsc::Sender<Job>, err: anyhow::Error) {
     let message = format!("{err:#}");
@@ -1082,12 +1109,9 @@ fn feeder_failed(to_worker: &mpsc::Sender<Job>, err: anyhow::Error) {
 /// Never exits while the daemon runs; every failure is logged.
 ///
 /// `Full` is the streaming-off path (today's exact behavior).
-/// `Chunk`/`End`/`Cancel` are the streaming path (buffered streaming): chunks
-/// accumulate in a [`Stream`](crate::stream::Stream), windows decode every 3 s
-/// of new audio and commit words clear of the guard, at `End` the final
-/// decode commits everything plus the pending punctuation and the latency
-/// line goes out, and `Cancel` discards the buffered audio without typing
-/// anything more (already-typed text stays).
+/// `Segment`/`End`/`Cancel` are the streaming path: each segment is typed
+/// as it finishes, at `End` the pending punctuation plus the latency line go
+/// out, and `Cancel` discards queued segments without typing anything more.
 fn transcribe_worker(
     rx: mpsc::Receiver<Job>,
     proxy: EventLoopProxy<UserEvent>,
@@ -1097,12 +1121,15 @@ fn transcribe_worker(
     if let Err(err) = &typer {
         dlog!("error: {err:#}");
     }
-    // Local queue: jobs drained while a transcription was running wait here,
-    // in order, so a `Cancel` spotted mid-transcription can discard them
-    // before anything more is typed.
+    // Local queue: segments drained while a transcription was running wait
+    // here, in order, so a `Cancel` spotted mid-transcription can discard
+    // them before anything more is typed.
     let mut queue: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
     // Per-recording streaming state.
-    let mut streaming = StreamingState::default();
+    let mut typed_words: Vec<String> = Vec::new();
+    let mut pending_punct: Option<char> = None;
+    let mut segments: usize = 0;
+    let mut failures: usize = 0;
     let worker_done =
         |proxy: &EventLoopProxy<UserEvent>| proxy.send_event(UserEvent::WorkerDone).is_err();
     loop {
@@ -1121,137 +1148,15 @@ fn transcribe_worker(
                     break;
                 }
             }
-            Job::Chunk(chunk) => {
-                streaming.push_chunk(&chunk);
-                // Catch up with chunks that arrived while a decode was
-                // running, so one decode covers all of them; `End`/`Cancel`
-                // stay queued in order.
-                while let Ok(pending) = rx.try_recv() {
-                    queue.push_back(pending);
-                }
-                while matches!(queue.front(), Some(Job::Chunk(_))) {
-                    if let Some(Job::Chunk(next)) = queue.pop_front() {
-                        streaming.push_chunk(&next);
-                    }
-                }
-                if !streaming.stream.should_decode() {
-                    continue;
-                }
-                let window = streaming.stream.window();
-                let window_audio = streaming.stream.window_audio().to_vec();
+            Job::Segment(segment) => {
+                segments += 1;
+                let seq = segments;
+                let seconds = segment.audio.len() as f32 / 16_000.0;
+                let context_s = segment.context.len() as f32 / 16_000.0;
                 let start = Instant::now();
-                let words = match asr.transcribe_words(&window_audio) {
-                    Ok(words) => words,
-                    Err(err) => {
-                        dlog!("error: {err:#}");
-                        crate::notify::show(
-                            crate::notify::Kind::Error,
-                            "dictate: transcription failed",
-                            &format!("{err:#}"),
-                        );
-                        streaming.failures += 1;
-                        streaming.stream.mark_failed();
-                        continue;
-                    }
-                };
-                let took_ms = start.elapsed().as_millis();
-                // A `Cancel` that arrived mid-transcription discards this
-                // decode and every queued job up to it, without typing.
-                while let Ok(pending) = rx.try_recv() {
-                    queue.push_back(pending);
-                }
-                if let Some(position) = queue.iter().position(|job| matches!(job, Job::Cancel)) {
-                    for _ in 0..=position {
-                        queue.pop_front();
-                    }
-                    streaming = StreamingState::default();
-                    if worker_done(&proxy) {
-                        break;
-                    }
-                    continue;
-                }
-                let boundary = crate::asr::boundary_punct_before(&words, window.ctx_s);
-                let (committed, new_end) = crate::stream::commit_words(
-                    &words,
-                    window.ctx_s,
-                    window.window_s,
-                    window.guard_s,
-                );
-                streaming.stream.mark_decoded();
-                if let Some(end_s) = new_end {
-                    streaming.stream.advance(window.start, end_s);
-                }
-                let decode_n = streaming.stream.decodes();
-                if let Some(dump) = streaming.dump.as_mut() {
-                    dump.dump_window(&window_audio);
-                }
-                if committed.is_empty() {
-                    dlog!(
-                        "decode {decode_n}: window {:.1} s (ctx {:.1} s), took {took_ms} ms, committed 0 words, typed 0 chars",
-                        window.window_s,
-                        window.ctx_s
-                    );
-                    continue;
-                }
-                let kept_texts: Vec<String> =
-                    committed.iter().map(|word| word.text.clone()).collect();
-                streaming.type_committed(
-                    &kept_texts,
-                    boundary,
-                    typer.as_mut(),
-                    decode_n,
-                    &window,
-                    took_ms,
-                    committed.len(),
-                );
-            }
-            Job::End {
-                total_seconds,
-                stop_time,
-            } => {
-                if let Some(dump) = streaming.dump.as_mut() {
-                    dump.dump_full(streaming.stream.audio());
-                }
-                let too_short = total_seconds * 1000.0
-                    < crate::mic::MIN_RECORDING_SAMPLES as f32 / 16_000.0 * 1000.0;
-                if !too_short && !streaming.stream.is_empty() {
-                    let window = streaming.stream.window();
-                    let window_audio = streaming.stream.window_audio().to_vec();
-                    let start = Instant::now();
-                    match asr.transcribe_words(&window_audio) {
-                        Ok(words) => {
-                            let took_ms = start.elapsed().as_millis();
-                            let boundary = crate::asr::boundary_punct_before(&words, window.ctx_s);
-                            let kept = crate::asr::keep_words_after(&words, window.ctx_s);
-                            let new_end = kept.last().map(|word| word.end);
-                            streaming.stream.mark_decoded();
-                            if let Some(end_s) = new_end {
-                                streaming.stream.advance(window.start, end_s);
-                            }
-                            let decode_n = streaming.stream.decodes();
-                            if let Some(dump) = streaming.dump.as_mut() {
-                                dump.dump_window(&window_audio);
-                            }
-                            if kept.is_empty() {
-                                dlog!(
-                                    "decode {decode_n}: window {:.1} s (ctx {:.1} s), took {took_ms} ms, committed 0 words, typed 0 chars",
-                                    window.window_s,
-                                    window.ctx_s
-                                );
-                            } else {
-                                let kept_texts: Vec<String> =
-                                    kept.iter().map(|word| word.text.clone()).collect();
-                                streaming.type_committed(
-                                    &kept_texts,
-                                    boundary,
-                                    typer.as_mut(),
-                                    decode_n,
-                                    &window,
-                                    took_ms,
-                                    kept.len(),
-                                );
-                            }
-                        }
+                let (kept_texts, boundary) =
+                    match asr.transcribe_segment_pieces(&segment.context, &segment.audio) {
+                        Ok(pieces) => pieces,
                         Err(err) => {
                             dlog!("error: {err:#}");
                             crate::notify::show(
@@ -1259,12 +1164,78 @@ fn transcribe_worker(
                                 "dictate: transcription failed",
                                 &format!("{err:#}"),
                             );
-                            streaming.failures += 1;
+                            failures += 1;
+                            continue;
                         }
+                    };
+                let transcribe_ms = start.elapsed().as_millis();
+                if kept_texts.is_empty() {
+                    continue;
+                }
+                // A `Cancel` that arrived mid-transcription discards this
+                // segment's text and every queued job up to it.
+                while let Ok(pending) = rx.try_recv() {
+                    queue.push_back(pending);
+                }
+                if let Some(position) = queue.iter().position(|job| matches!(job, Job::Cancel)) {
+                    for _ in 0..=position {
+                        queue.pop_front();
+                    }
+                    typed_words.clear();
+                    pending_punct = None;
+                    segments = 0;
+                    failures = 0;
+                    if worker_done(&proxy) {
+                        break;
+                    }
+                    continue;
+                }
+                let tail_start = typed_words.len().saturating_sub(2);
+                let (to_type, new_pending) = crate::asr::join_piece(
+                    &typed_words[tail_start..],
+                    pending_punct,
+                    boundary,
+                    &kept_texts,
+                );
+                if to_type.is_empty() {
+                    // Deduped to nothing with no boundary: drop the old
+                    // pending without typing.
+                    pending_punct = new_pending;
+                    continue;
+                }
+                let type_start = Instant::now();
+                let typed = match typer.as_mut() {
+                    Ok(typer) => typer.type_text(&to_type),
+                    Err(err) => Err(anyhow::anyhow!("{err:#}")),
+                };
+                let type_ms = type_start.elapsed().as_millis();
+                match typed {
+                    Ok(()) => {
+                        crate::asr::append_typed_words(&mut typed_words, &to_type);
+                        pending_punct = new_pending;
+                        dlog!(
+                            "segment {seq}: {seconds:.1} s audio (context {context_s:.1} s), transcribed in {transcribe_ms} ms, typed {} chars in {type_ms} ms",
+                            to_type.chars().count()
+                        );
+                    }
+                    Err(err) => {
+                        failures += 1;
+                        dlog!("error: {err:#}");
+                        dlog!("Text that was not typed: {to_type}");
+                        crate::notify::show(
+                            crate::notify::Kind::Error,
+                            "dictate: could not type the text",
+                            &crate::notify::typing_failure_body(&format!("{err:#}"), &to_type),
+                        );
                     }
                 }
-                if !streaming.typed_words.is_empty() {
-                    if let Some(punct) = streaming.pending_punct {
+            }
+            Job::End {
+                total_seconds,
+                stop_time,
+            } => {
+                if !typed_words.is_empty() {
+                    if let Some(punct) = pending_punct {
                         let text = punct.to_string();
                         let typed = match typer.as_mut() {
                             Ok(typer) => typer.type_text(&text),
@@ -1281,12 +1252,13 @@ fn transcribe_worker(
                         }
                     }
                     dlog!(
-                        "done {} ms after stop (total {total_seconds:.1} s audio, {} decodes)",
-                        stop_time.elapsed().as_millis(),
-                        streaming.stream.decodes()
+                        "done {} ms after stop (total {total_seconds:.1} s audio, {segments} segments)",
+                        stop_time.elapsed().as_millis()
                     );
-                } else if streaming.failures == 0 {
-                    if too_short {
+                } else if failures == 0 {
+                    if total_seconds * 1000.0
+                        < crate::mic::MIN_RECORDING_SAMPLES as f32 / 16_000.0 * 1000.0
+                    {
                         let ms = (total_seconds * 1000.0) as u64;
                         let message =
                             format!("Recording too short ({ms} ms); nothing to transcribe.");
@@ -1298,102 +1270,22 @@ fn transcribe_worker(
                         crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
                     }
                 }
-                streaming = StreamingState::default();
+                typed_words.clear();
+                pending_punct = None;
+                segments = 0;
+                failures = 0;
                 if worker_done(&proxy) {
                     break;
                 }
             }
             Job::Cancel => {
-                streaming = StreamingState::default();
+                typed_words.clear();
+                pending_punct = None;
+                segments = 0;
+                failures = 0;
                 if worker_done(&proxy) {
                     break;
                 }
-            }
-        }
-    }
-}
-
-/// Per-recording streaming state, owned by the worker: the buffered audio
-/// plus commit positions, the typed-text join state, and the decode dump.
-#[derive(Default)]
-struct StreamingState {
-    stream: crate::stream::Stream,
-    typed_words: Vec<String>,
-    pending_punct: Option<char>,
-    failures: usize,
-    dump: Option<DecodeDump>,
-}
-
-impl StreamingState {
-    /// Buffer one chunk, enabling the decode dump for this recording.
-    fn push_chunk(&mut self, chunk: &[f32]) {
-        if self.dump.is_none() {
-            self.dump = DecodeDump::new();
-        }
-        self.stream.push(chunk);
-    }
-
-    /// Join committed words onto the typed text and type the result,
-    /// logging one `decode N` line. Only typed text advances the join
-    /// state; a typing failure is logged with the untyped text.
-    #[allow(clippy::too_many_arguments)]
-    fn type_committed(
-        &mut self,
-        kept_texts: &[String],
-        boundary: Option<char>,
-        typer: Result<&mut crate::typer::Typer, &mut anyhow::Error>,
-        decode_n: usize,
-        window: &crate::stream::Window,
-        took_ms: u128,
-        committed_words: usize,
-    ) {
-        let tail_start = self.typed_words.len().saturating_sub(2);
-        let (to_type, new_pending) = crate::asr::join_piece(
-            &self.typed_words[tail_start..],
-            self.pending_punct,
-            boundary,
-            kept_texts,
-        );
-        if to_type.is_empty() {
-            // Deduped to nothing with no boundary: drop the old
-            // pending without typing.
-            self.pending_punct = new_pending;
-            dlog!(
-                "decode {decode_n}: window {:.1} s (ctx {:.1} s), took {took_ms} ms, committed {committed_words} words, typed 0 chars",
-                window.window_s,
-                window.ctx_s
-            );
-            return;
-        }
-        let typed = match typer {
-            Ok(typer) => typer.type_text(&to_type),
-            Err(err) => Err(anyhow::anyhow!("{err:#}")),
-        };
-        match typed {
-            Ok(()) => {
-                let chars = to_type.chars().count();
-                crate::asr::append_typed_words(&mut self.typed_words, &to_type);
-                self.pending_punct = new_pending;
-                dlog!(
-                    "decode {decode_n}: window {:.1} s (ctx {:.1} s), took {took_ms} ms, committed {committed_words} words, typed {chars} chars",
-                    window.window_s,
-                    window.ctx_s
-                );
-            }
-            Err(err) => {
-                self.failures += 1;
-                dlog!("error: {err:#}");
-                dlog!("Text that was not typed: {to_type}");
-                crate::notify::show(
-                    crate::notify::Kind::Error,
-                    "dictate: could not type the text",
-                    &crate::notify::typing_failure_body(&format!("{err:#}"), &to_type),
-                );
-                dlog!(
-                    "decode {decode_n}: window {:.1} s (ctx {:.1} s), took {took_ms} ms, committed {committed_words} words, typed 0 chars",
-                    window.window_s,
-                    window.ctx_s
-                );
             }
         }
     }
@@ -1534,12 +1426,11 @@ mod tests {
     }
 
     #[test]
-    fn decode_dump_paths_name_window_and_full() {
+    fn segment_dump_paths_name_segment_context_and_full() {
         let dir = Path::new("/tmp/seg");
-        assert_eq!(
-            decode_dump_path(dir, 123, 2),
-            PathBuf::from("/tmp/seg/123-2.wav")
-        );
+        let (segment, ctx) = segment_dump_paths(dir, 123, 2);
+        assert_eq!(segment, PathBuf::from("/tmp/seg/123-2.wav"));
+        assert_eq!(ctx, PathBuf::from("/tmp/seg/123-2-ctx.wav"));
         assert_eq!(
             full_dump_path(dir, 123),
             PathBuf::from("/tmp/seg/123-full.wav")

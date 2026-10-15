@@ -125,16 +125,15 @@ fn segmented_transcribe_at_48k_keeps_word_onsets() {
         ),
         "segmented transcription differs: {text}"
     );
-    // The onset check is only meaningful if streaming decodes actually
-    // happened (one decode would equal plain transcribe, already covered
-    // above).
+    // The onset check is only meaningful if segmentation actually happened
+    // (one segment would equal plain transcribe, already covered above).
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("decode 1:"),
-        "expected streaming output, stderr: {stderr}"
+        stderr.contains("segment 1:"),
+        "expected segmented output, stderr: {stderr}"
     );
     assert!(
-        stderr.contains("decode 2:"),
-        "expected at least two decodes, stderr: {stderr}"
+        stderr.contains("segment 2:"),
+        "expected at least two segments, stderr: {stderr}"
     );
 }
