@@ -2,6 +2,7 @@ use std::str::FromStr;
 #[cfg(target_os = "linux")]
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::Context;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
@@ -15,6 +16,35 @@ pub(crate) const MIN_RECORDING_SAMPLES: usize = 4800;
 fn mlog(message: &str) {
     eprintln!("{message}");
     crate::daemon::mirror_to_log(message);
+}
+
+/// Debug timing for mic starts is off unless `DICTATE_DEBUG_MIC` is set to a
+/// non-empty value other than `0`.
+fn mic_debug() -> bool {
+    matches!(std::env::var("DICTATE_DEBUG_MIC").as_deref(), Ok(value) if !value.is_empty() && value != "0")
+}
+
+/// One timed step of a mic start, for `DICTATE_DEBUG_MIC` profiling.
+struct StartStep {
+    name: &'static str,
+    ms: u128,
+}
+
+/// Log each step's ms at debug level (`DICTATE_DEBUG_MIC=1`); silent otherwise.
+fn debug_mic_start(steps: &[StartStep], cached: bool) {
+    if !mic_debug() {
+        return;
+    }
+    let total: u128 = steps.iter().map(|step| step.ms).sum();
+    let parts: Vec<String> = steps
+        .iter()
+        .map(|step| format!("{}={}ms", step.name, step.ms))
+        .collect();
+    mlog(&format!(
+        "mic start ({}): {} (total {total}ms)",
+        if cached { "cached" } else { "fresh" },
+        parts.join(" ")
+    ));
 }
 
 /// The audio host to record from and list microphones on. On Linux this is
@@ -242,93 +272,144 @@ fn device_label(device: &cpal::Device) -> (String, String) {
     (id, name)
 }
 
-impl Recorder {
-    /// Start recording from `mic` (a `"host:device"` id, `None` or empty for
-    /// the system default). A missing or unparsable id falls back to the
-    /// default with a log + notification; the saved choice is kept.
-    pub(crate) fn start(mic: Option<&str>) -> anyhow::Result<Self> {
-        let host = audio_host();
-        let device = match mic {
-            Some(selected) if !selected.is_empty() => match device_by_id_str(&host, selected) {
-                Some(device) => device,
-                None => fallback_to_default(&host, selected)?,
-            },
-            _ => default_input_device(&host)?,
-        };
-        let (mic_id, mic_name) = device_label(&device);
-        mlog(&format!("recording from: {mic_name} ({mic_id})"));
-        let default_supported = device
-            .default_input_config()
-            .context("Could not get the microphone's default input config")?;
-        // Prefer float samples when the device offers them; otherwise use the
-        // default config (any PCM format it reports is handled below).
-        let (config, format) = match device.supported_input_configs() {
-            Ok(ranges) => {
-                let plain: Vec<ConfigRange> = ranges
-                    .map(|range| ConfigRange {
-                        channels: range.channels(),
-                        min_rate: range.min_sample_rate(),
-                        max_rate: range.max_sample_rate(),
-                        format: range.sample_format(),
-                    })
-                    .collect();
-                match prefer_f32_config(&plain, default_supported.sample_rate()) {
-                    Some(config) => (config, SampleFormat::F32),
-                    None => (
-                        default_supported.config(),
-                        default_supported.sample_format(),
-                    ),
-                }
-            }
-            Err(err) => {
-                mlog(&format!(
-                    "warning: could not list the microphone's supported configs ({err}); using the default config"
-                ));
-                (
+/// A microphone resolved to a device and stream config, ready to open.
+/// The daemon caches one per selected microphone in [`MicSession`].
+struct ResolvedMic {
+    device: cpal::Device,
+    config: cpal::StreamConfig,
+    format: SampleFormat,
+    mic_id: String,
+    mic_name: String,
+}
+
+/// Resolve `mic` (a `"host:device"` id, `None` or empty for the system default)
+/// to a device and stream config on an already-opened host. A missing or
+/// unparsable id falls back to the default with a log + notification; the
+/// saved choice is kept.
+fn resolve_mic(
+    host: &cpal::Host,
+    mic: Option<&str>,
+    steps: &mut Vec<StartStep>,
+) -> anyhow::Result<ResolvedMic> {
+    let lookup_start = Instant::now();
+    let device = match mic {
+        Some(selected) if !selected.is_empty() => match device_by_id_str(host, selected) {
+            Some(device) => device,
+            None => fallback_to_default(host, selected)?,
+        },
+        _ => default_input_device(host)?,
+    };
+    steps.push(StartStep {
+        name: "lookup",
+        ms: lookup_start.elapsed().as_millis(),
+    });
+    let (mic_id, mic_name) = device_label(&device);
+    let config_start = Instant::now();
+    let default_supported = device
+        .default_input_config()
+        .context("Could not get the microphone's default input config")?;
+    // Prefer float samples when the device offers them; otherwise use the
+    // default config (any PCM format it reports is handled below).
+    let (config, format) = match device.supported_input_configs() {
+        Ok(ranges) => {
+            let plain: Vec<ConfigRange> = ranges
+                .map(|range| ConfigRange {
+                    channels: range.channels(),
+                    min_rate: range.min_sample_rate(),
+                    max_rate: range.max_sample_rate(),
+                    format: range.sample_format(),
+                })
+                .collect();
+            match prefer_f32_config(&plain, default_supported.sample_rate()) {
+                Some(config) => (config, SampleFormat::F32),
+                None => (
                     default_supported.config(),
                     default_supported.sample_format(),
-                )
+                ),
             }
-        };
-        let channels = usize::from(config.channels);
-        let sample_rate = config.sample_rate;
-        mlog(&format!(
-            "mic format: {format:?} {channels}ch {sample_rate} Hz"
-        ));
-        let samples = Arc::new(Mutex::new(Vec::with_capacity((sample_rate as usize) * 60)));
-        let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let stream = match format {
-            SampleFormat::I8 => build_stream::<i8>(&device, &config, channels, &samples, &stream_error),
+        }
+        Err(err) => {
+            mlog(&format!(
+                "warning: could not list the microphone's supported configs ({err}); using the default config"
+            ));
+            (
+                default_supported.config(),
+                default_supported.sample_format(),
+            )
+        }
+    };
+    steps.push(StartStep {
+        name: "config",
+        ms: config_start.elapsed().as_millis(),
+    });
+    let resolved = ResolvedMic {
+        device,
+        config,
+        format,
+        mic_id,
+        mic_name,
+    };
+    log_recording_from(&resolved);
+    Ok(resolved)
+}
+
+/// Log which microphone a recording uses. Every recording logs these lines,
+/// whether its device was freshly resolved or came from the cache.
+fn log_recording_from(resolved: &ResolvedMic) {
+    mlog(&format!(
+        "recording from: {} ({})",
+        resolved.mic_name, resolved.mic_id
+    ));
+    let channels = usize::from(resolved.config.channels);
+    let sample_rate = resolved.config.sample_rate;
+    mlog(&format!(
+        "mic format: {:?} {channels}ch {sample_rate} Hz",
+        resolved.format
+    ));
+}
+
+/// Open the stream for a resolved microphone and start recording.
+fn open_recorder(resolved: &ResolvedMic, steps: &mut Vec<StartStep>) -> anyhow::Result<Recorder> {
+    let open_start = Instant::now();
+    let device = &resolved.device;
+    let config = &resolved.config;
+    let format = resolved.format;
+    let channels = usize::from(config.channels);
+    let sample_rate = config.sample_rate;
+    let samples = Arc::new(Mutex::new(Vec::with_capacity((sample_rate as usize) * 60)));
+    let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let stream = match format {
+            SampleFormat::I8 => build_stream::<i8>(device, config, channels, &samples, &stream_error),
             SampleFormat::I16 => {
-                build_stream::<i16>(&device, &config, channels, &samples, &stream_error)
+                build_stream::<i16>(device, config, channels, &samples, &stream_error)
             }
             SampleFormat::I24 => {
-                build_stream::<I24>(&device, &config, channels, &samples, &stream_error)
+                build_stream::<I24>(device, config, channels, &samples, &stream_error)
             }
             SampleFormat::I32 => {
-                build_stream::<i32>(&device, &config, channels, &samples, &stream_error)
+                build_stream::<i32>(device, config, channels, &samples, &stream_error)
             }
             SampleFormat::I64 => {
-                build_stream::<i64>(&device, &config, channels, &samples, &stream_error)
+                build_stream::<i64>(device, config, channels, &samples, &stream_error)
             }
-            SampleFormat::U8 => build_stream::<u8>(&device, &config, channels, &samples, &stream_error),
+            SampleFormat::U8 => build_stream::<u8>(device, config, channels, &samples, &stream_error),
             SampleFormat::U16 => {
-                build_stream::<u16>(&device, &config, channels, &samples, &stream_error)
+                build_stream::<u16>(device, config, channels, &samples, &stream_error)
             }
             SampleFormat::U24 => {
-                build_stream::<U24>(&device, &config, channels, &samples, &stream_error)
+                build_stream::<U24>(device, config, channels, &samples, &stream_error)
             }
             SampleFormat::U32 => {
-                build_stream::<u32>(&device, &config, channels, &samples, &stream_error)
+                build_stream::<u32>(device, config, channels, &samples, &stream_error)
             }
             SampleFormat::U64 => {
-                build_stream::<u64>(&device, &config, channels, &samples, &stream_error)
+                build_stream::<u64>(device, config, channels, &samples, &stream_error)
             }
             SampleFormat::F32 => {
-                build_stream::<f32>(&device, &config, channels, &samples, &stream_error)
+                build_stream::<f32>(device, config, channels, &samples, &stream_error)
             }
             SampleFormat::F64 => {
-                build_stream::<f64>(&device, &config, channels, &samples, &stream_error)
+                build_stream::<f64>(device, config, channels, &samples, &stream_error)
             }
             format => {
                 anyhow::bail!(
@@ -337,16 +418,141 @@ impl Recorder {
             }
         }
         .context("Could not open the microphone input stream")?;
-        stream
-            .play()
-            .context("Could not start the microphone stream")?;
-        Ok(Self {
-            stream,
-            samples,
-            stream_error,
-            sample_rate,
-            mic_name,
-        })
+    stream
+        .play()
+        .context("Could not start the microphone stream")?;
+    steps.push(StartStep {
+        name: "open",
+        ms: open_start.elapsed().as_millis(),
+    });
+    Ok(Recorder {
+        stream,
+        samples,
+        stream_error,
+        sample_rate,
+        mic_name: resolved.mic_name.clone(),
+    })
+}
+
+/// Long-lived audio session for the daemon: one cpal host plus the resolved
+/// device and stream config for the selected microphone. Creating a host
+/// re-connects to the audio server, so keeping one (and the resolved device)
+/// is what makes `start` fast.
+pub(crate) struct MicSession {
+    host: cpal::Host,
+    cached: Option<CachedMic>,
+}
+
+/// A resolved microphone plus the selection it was resolved for (`""` is the
+/// system default).
+struct CachedMic {
+    selection: String,
+    resolved: ResolvedMic,
+}
+
+impl MicSession {
+    /// Open the audio host once; the daemon keeps the session for its whole run.
+    pub(crate) fn new() -> Self {
+        let host_start = Instant::now();
+        let host = audio_host();
+        if mic_debug() {
+            mlog(&format!("mic host: {}ms", host_start.elapsed().as_millis()));
+        }
+        Self { host, cached: None }
+    }
+
+    /// List the microphones on the kept host (no reconnect). Enumeration
+    /// always queries the server, so this sees plug/unplug.
+    pub(crate) fn list_microphones(&self) -> anyhow::Result<Vec<Mic>> {
+        list_microphones_on(&self.host)
+    }
+
+    /// Drop the cached device and stream config (a mic change, or a listing
+    /// change on refresh). The host is kept.
+    pub(crate) fn invalidate(&mut self) {
+        self.cached = None;
+    }
+
+    /// Start recording from `mic` (a `"host:device"` id, `None` or empty for
+    /// the system default), reusing the cached device and config when the
+    /// selection matches. When opening fails, the cache is dropped and the
+    /// start is retried once with a fresh host and lookup.
+    pub(crate) fn start(&mut self, mic: Option<&str>) -> anyhow::Result<Recorder> {
+        let selection = mic.unwrap_or("").to_string();
+        if let Some(cached) = &self.cached
+            && cached.selection == selection
+        {
+            let mut steps = Vec::new();
+            log_recording_from(&cached.resolved);
+            match open_recorder(&cached.resolved, &mut steps) {
+                Ok(recorder) => {
+                    debug_mic_start(&steps, true);
+                    return Ok(recorder);
+                }
+                Err(err) => {
+                    if mic_debug() {
+                        mlog(&format!(
+                            "mic start: cached open failed ({err:#}); retrying with a fresh lookup"
+                        ));
+                    }
+                    self.cached = None;
+                }
+            }
+        } else {
+            // A different selection than the cached one: re-resolve.
+            self.cached = None;
+        }
+        let mut steps = Vec::new();
+        let resolved = resolve_mic(&self.host, mic, &mut steps)?;
+        match open_recorder(&resolved, &mut steps) {
+            Ok(recorder) => {
+                debug_mic_start(&steps, false);
+                self.cached = Some(CachedMic {
+                    selection,
+                    resolved,
+                });
+                Ok(recorder)
+            }
+            Err(err) => {
+                if mic_debug() {
+                    mlog(&format!(
+                        "mic start: open failed ({err:#}); retrying once with a fresh host"
+                    ));
+                }
+                // Retry once: the server may have restarted, so reconnect.
+                self.host = audio_host();
+                self.cached = None;
+                let mut steps = Vec::new();
+                let resolved = resolve_mic(&self.host, mic, &mut steps)?;
+                let recorder = open_recorder(&resolved, &mut steps)?;
+                debug_mic_start(&steps, false);
+                self.cached = Some(CachedMic {
+                    selection,
+                    resolved,
+                });
+                Ok(recorder)
+            }
+        }
+    }
+}
+
+impl Recorder {
+    /// Start recording from `mic` (a `"host:device"` id, `None` or empty for
+    /// the system default). One-shot host for short-lived callers (`listen`);
+    /// the daemon uses [`MicSession`] instead. A missing or unparsable id
+    /// falls back to the default with a log + notification; the choice is kept.
+    pub(crate) fn start(mic: Option<&str>) -> anyhow::Result<Self> {
+        let mut steps = Vec::new();
+        let host_start = Instant::now();
+        let host = audio_host();
+        steps.push(StartStep {
+            name: "host",
+            ms: host_start.elapsed().as_millis(),
+        });
+        let resolved = resolve_mic(&host, mic, &mut steps)?;
+        let recorder = open_recorder(&resolved, &mut steps)?;
+        debug_mic_start(&steps, false);
+        Ok(recorder)
     }
 
     /// Device sample rate of this recording.

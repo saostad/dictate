@@ -270,13 +270,22 @@ fn handle_connection_inner(
     Ok(())
 }
 
+/// How long the accept thread waits for the event loop's reply. Starts open
+/// the microphone, which can take a moment; everything else answers at once.
+fn reply_timeout(cmd: Command) -> Duration {
+    match cmd {
+        Command::Start | Command::Toggle => Duration::from_secs(5),
+        Command::Stop | Command::Cancel | Command::Status => Duration::from_secs(2),
+    }
+}
+
 /// Send a command to the event loop and wait for its reply.
 fn forward_command(cmd: Command, proxy: &EventLoopProxy<UserEvent>) -> String {
     let (reply_tx, reply_rx) = mpsc::channel::<String>();
     if proxy.send_event(UserEvent::Command(cmd, reply_tx)).is_err() {
         return "err daemon did not answer".to_string();
     }
-    match reply_rx.recv_timeout(Duration::from_secs(2)) {
+    match reply_rx.recv_timeout(reply_timeout(cmd)) {
         Ok(reply) => reply,
         Err(_) => "err daemon did not answer".to_string(),
     }
@@ -317,5 +326,14 @@ mod tests {
             Some("busy transcribing")
         );
         assert_eq!(reply_error("err"), Some(""));
+    }
+
+    #[test]
+    fn starts_wait_longer_for_a_reply() {
+        assert_eq!(reply_timeout(Command::Start), Duration::from_secs(5));
+        assert_eq!(reply_timeout(Command::Toggle), Duration::from_secs(5));
+        assert_eq!(reply_timeout(Command::Stop), Duration::from_secs(2));
+        assert_eq!(reply_timeout(Command::Cancel), Duration::from_secs(2));
+        assert_eq!(reply_timeout(Command::Status), Duration::from_secs(2));
     }
 }

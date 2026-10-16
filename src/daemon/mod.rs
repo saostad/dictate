@@ -112,6 +112,18 @@ fn selected_mic_name(selected: &str, mics: &[crate::mic::Mic]) -> Option<String>
     default_mic_name(mics)
 }
 
+/// True when a refreshed microphone listing changed (device ids or the
+/// default), so the cached recording device must be re-resolved. Pure, for
+/// tests. Names are display-only and don't affect the cache.
+fn mic_listing_changed(old: &[crate::mic::Mic], new: &[crate::mic::Mic]) -> bool {
+    if old.len() != new.len() {
+        return true;
+    }
+    old.iter()
+        .zip(new.iter())
+        .any(|(before, after)| before.id != after.id || before.is_default != after.is_default)
+}
+
 /// One unit of work for the transcription worker.
 pub(crate) enum Job {
     /// Whole recording at 16 kHz (whole mode): today's exact path.
@@ -569,6 +581,9 @@ struct DaemonApp {
     mode_switch: Option<ModeSwitch>,
     tray: Option<crate::tray::Tray>,
     tray_attempted: bool,
+    /// Audio session: one cpal host plus the cached recording device and
+    /// config, so `start` doesn't re-connect to the audio server.
+    mic_session: crate::mic::MicSession,
     /// Cached microphone listing for the tray submenu and labels, refreshed
     /// at startup, on `Refresh list`, and when a recording starts.
     mics: Vec<crate::mic::Mic>,
@@ -607,6 +622,7 @@ impl DaemonApp {
             mode_switch: None,
             tray: None,
             tray_attempted: false,
+            mic_session: crate::mic::MicSession::new(),
             mics: Vec::new(),
             active_mic: None,
             menu_proxy,
@@ -730,10 +746,17 @@ impl DaemonApp {
     }
 
     /// Re-list the microphones into the cache and rebuild the tray submenu.
-    /// A listing failure is logged and keeps the old entries.
+    /// A listing failure is logged and keeps the old entries. When the
+    /// listing changed, the cached recording device is dropped so the next
+    /// `start` re-resolves (a removed mic falls back, a returned one is
+    /// used again); an unchanged listing keeps the cache, which is what
+    /// keeps `start` fast.
     fn refresh_microphones(&mut self) {
-        match crate::mic::list_microphones() {
+        match self.mic_session.list_microphones() {
             Ok(mics) => {
+                if mic_listing_changed(&self.mics, &mics) {
+                    self.mic_session.invalidate();
+                }
                 self.mics = mics;
                 if let Some(tray) = self.tray.as_mut()
                     && let Err(err) =
@@ -773,6 +796,7 @@ impl DaemonApp {
                 .unwrap_or_else(|| id.to_string())
         };
         self.settings.microphone = id.to_string();
+        self.mic_session.invalidate();
         self.report_save_error(crate::config::save(&self.settings));
         self.sync_microphone_checks();
         Self::confirm_settings_change(
@@ -1098,7 +1122,7 @@ impl DaemonApp {
             &self.settings.microphone,
             std::env::var("DICTATE_MICROPHONE").ok().as_deref(),
         );
-        match crate::mic::Recorder::start(mic.as_deref()) {
+        match self.mic_session.start(mic.as_deref()) {
             Ok(started) => {
                 self.active_mic = Some(started.mic_name().to_string());
                 match self.current_mode() {
@@ -2554,6 +2578,31 @@ mod tests {
             Some("Built-in Audio Analog Stereo".to_string())
         );
         assert_eq!(selected_mic_name("", &[]), None);
+    }
+
+    #[test]
+    fn mic_listing_change_tracks_ids_and_default() {
+        let mics = test_mics();
+        assert!(!mic_listing_changed(&mics, &test_mics()));
+        assert!(!mic_listing_changed(&[], &[]));
+        // A renamed mic is display-only: the cache stays.
+        let mut renamed = test_mics();
+        renamed[0].name = "USB Mic Renamed".to_string();
+        assert!(!mic_listing_changed(&mics, &renamed));
+        // A removed or added mic invalidates.
+        assert!(mic_listing_changed(&mics, &mics[1..]));
+        let mut added = test_mics();
+        added.push(crate::mic::Mic {
+            id: "pulseaudio:alsa_input.hdmi".to_string(),
+            name: "HDMI".to_string(),
+            is_default: false,
+        });
+        assert!(mic_listing_changed(&mics, &added));
+        // A moved default invalidates.
+        let mut moved = test_mics();
+        moved[0].is_default = true;
+        moved[1].is_default = false;
+        assert!(mic_listing_changed(&mics, &moved));
     }
 
     #[test]
