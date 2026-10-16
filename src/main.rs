@@ -10,6 +10,7 @@ compile_error!(
 
 mod asr;
 mod audio;
+mod autostart;
 mod config;
 mod cue;
 mod daemon;
@@ -40,7 +41,7 @@ fn run() -> anyhow::Result<()> {
     let Some(command) = args.next() else {
         // Opened as Dictate.app (Finder, Spotlight, login item): run the daemon.
         if launched_as_macos_app() {
-            return run_daemon();
+            return run_daemon(false);
         }
         eprintln!("{}", usage());
         std::process::exit(2);
@@ -67,7 +68,32 @@ fn run() -> anyhow::Result<()> {
         }
         "listen" => listen(),
         "mics" => mics(),
-        "daemon" => run_daemon(),
+        "autostart" => {
+            let Some(action) = args.next() else {
+                eprintln!("Usage: dictate autostart on|off|status");
+                std::process::exit(2);
+            };
+            if args.next().is_some() {
+                eprintln!("Usage: dictate autostart on|off|status");
+                std::process::exit(2);
+            }
+            autostart_cmd(&action)
+        }
+        "daemon" => {
+            let background = match args.next().as_deref() {
+                None => false,
+                Some("--background") => true,
+                Some(_) => {
+                    eprintln!("Usage: dictate daemon [--background]");
+                    std::process::exit(2);
+                }
+            };
+            if args.next().is_some() {
+                eprintln!("Usage: dictate daemon [--background]");
+                std::process::exit(2);
+            }
+            run_daemon(background)
+        }
         "toggle" | "start" | "stop" | "cancel" | "status" => run_client(&command),
         "transcribe" => {
             let Some(first) = args.next() else {
@@ -337,8 +363,43 @@ fn mics() -> anyhow::Result<()> {
     Ok(())
 }
 
-fn run_daemon() -> anyhow::Result<()> {
-    daemon::run_daemon()
+/// Turn start-at-login on or off, or show whether it is on.
+fn autostart_cmd(action: &str) -> anyhow::Result<()> {
+    match action {
+        "on" => autostart::enable(),
+        "off" => autostart::disable(),
+        "status" => autostart_status(),
+        _ => {
+            eprintln!("Usage: dictate autostart on|off|status");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Print `Start at login: on (<target>)` (plus a note when the entry points
+/// elsewhere and will be updated) or `Start at login: off`.
+fn autostart_status() -> anyhow::Result<()> {
+    let state = autostart::status()?;
+    if !state.enabled {
+        println!("Start at login: off");
+        return Ok(());
+    }
+    if state.stale {
+        let current = std::env::current_exe()
+            .map(|exe| exe.display().to_string())
+            .unwrap_or_else(|_| state.target.clone().unwrap_or_default());
+        let old = state.target.as_deref().unwrap_or("?");
+        println!("Start at login: on ({current}) (entry points to {old}; will be updated)");
+    } else if let Some(target) = &state.target {
+        println!("Start at login: on ({target})");
+    } else {
+        println!("Start at login: on");
+    }
+    Ok(())
+}
+
+fn run_daemon(background: bool) -> anyhow::Result<()> {
+    daemon::run_daemon(background)
 }
 
 #[cfg(unix)]
@@ -358,7 +419,7 @@ fn launched_as_macos_app() -> bool {
         && std::env::current_exe().is_ok_and(|exe| is_app_bundle_executable(&exe))
 }
 
-fn is_app_bundle_executable(exe: &Path) -> bool {
+pub(crate) fn is_app_bundle_executable(exe: &Path) -> bool {
     let Some(macos_dir) = exe.parent() else {
         return false;
     };
@@ -374,7 +435,8 @@ fn is_app_bundle_executable(exe: &Path) -> bool {
 }
 
 fn usage() -> &'static str {
-    "Usage: dictate <command> [args]\n\nCommands:\n  download [--live]      Download the speech model (about 660 MB; --live also fetches the Live model, about 900 MB)\n  transcribe [--live] <file.wav>  Transcribe a WAV file and print the text\n  listen                 Record from the microphone and print the text\n  mics                   List the microphones and the selected one\n  daemon                 Run the dictation daemon (keeps the model loaded)\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  help                   Show this help"
+    "Usage: dictate <command> [args]\n\nCommands:\n  download [--live]      Download the speech model (about 660 MB; --live also fetches the Live model, about 900 MB)\n  transcribe [--live] <file.wav>  Transcribe a WAV file and print the text\n  listen                 Record from the microphone and print the text\n  mics                   List the microphones and the selected one\n  daemon [--background]  Run the dictation daemon (keeps the model loaded)
+  autostart on|off|status  Turn start-at-login on or off, or show the setting\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  help                   Show this help"
 }
 
 #[cfg(test)]

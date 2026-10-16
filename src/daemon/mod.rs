@@ -305,12 +305,53 @@ pub(crate) fn mirror_to_log(line: &str) {
 
 /// Run `dictate daemon`. A fatal startup failure is mirrored to the log
 /// file too (its stderr twin is printed by `main`).
-pub(crate) fn run_daemon() -> anyhow::Result<()> {
+pub(crate) fn run_daemon(background: bool) -> anyhow::Result<()> {
+    detach_console(background);
     init_file_log();
+    repair_autostart();
     run_daemon_inner().map_err(|err| {
         mirror_to_log(&format!("error: {err:#}"));
         err
     })
+}
+
+/// Detach from the console for login launches (`daemon --background`); a
+/// no-op on other platforms and without the flag.
+#[cfg(target_os = "windows")]
+fn detach_console(background: bool) {
+    if background {
+        // SAFETY: FreeConsole only detaches this process from its console; it
+        // has no preconditions and its return value needs no handling here.
+        unsafe { FreeConsole() };
+    }
+}
+
+/// Detach from the console for login launches (`daemon --background`); a
+/// no-op on other platforms and without the flag.
+#[cfg(not(target_os = "windows"))]
+fn detach_console(_background: bool) {}
+
+#[cfg(target_os = "windows")]
+#[link(name = "kernel32")]
+unsafe extern "system" {
+    fn FreeConsole() -> i32;
+}
+
+/// Self-repair: when start-at-login is on but the entry points at a different
+/// executable (the binary was moved), rewrite it for this one. A check or
+/// rewrite failure is logged and never stops the daemon.
+fn repair_autostart() {
+    match crate::autostart::status() {
+        Ok(state) if state.enabled && state.stale => match crate::autostart::enable() {
+            Ok(()) => match std::env::current_exe() {
+                Ok(exe) => dlog!("autostart: updated entry to {}", exe.display()),
+                Err(_) => dlog!("autostart: updated the start-at-login entry"),
+            },
+            Err(err) => dlog!("error: Could not update the start-at-login entry: {err:#}"),
+        },
+        Ok(_) => {}
+        Err(err) => dlog!("error: Could not check the start-at-login entry: {err:#}"),
+    }
 }
 
 /// Load the model, bind the socket (Unix), serve commands.
