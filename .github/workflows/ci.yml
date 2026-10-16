@@ -47,7 +47,13 @@ jobs:
         with:
           path: .model
           key: parakeet-tdt-0.6b-v2-int8-0bbb45a
+      - uses: actions/cache@v4
+        with:
+          path: nemotron-streaming-en-0.6b-int8
+          key: nemotron-en-0.6b-int8-95df6c8
       - name: Download model
         run: cargo run --release -- download
+      - name: Download Live model
+        run: cargo run --release -- download --live
       - name: Transcribe real clip
-        run: cargo test --release -- --ignored
+        run: cargo test --release -- --ignored --nocapture

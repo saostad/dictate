@@ -76,6 +76,34 @@ fn resample_linear(mono: &[f32], from_rate: u32, to_rate: u32) -> Vec<f32> {
 
 #[test]
 #[ignore]
+fn live_transcribe_reports_text_and_speed() {
+    let wav = test_wav();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dictate"))
+        .args(["transcribe", "--live", &wav])
+        .output()
+        .expect("run dictate transcribe --live");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.to_lowercase()
+            .contains("ask not what your country can do for you"),
+        "unexpected live transcription: {text}"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let rtf_line = stderr
+        .lines()
+        .find(|line| line.starts_with("live: avg"))
+        .unwrap_or_else(|| panic!("expected a live RTF line, stderr: {stderr}"));
+    // Printed for the CI log, so every runner reports its real number.
+    println!("{rtf_line}");
+}
+
+#[test]
+#[ignore]
 fn segmented_transcribe_at_48k_keeps_word_onsets() {
     // Device-rate path: resample the 16 kHz fixture to 48 kHz, then run the
     // same feeder path the streaming daemon uses.

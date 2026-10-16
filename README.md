@@ -138,19 +138,34 @@ compositor keybinds instead), opens the settings file, and quits the daemon.
 Without a tray host the daemon logs `dictate: no tray icon` once and keeps
 running headless.
 
-## Type while speaking
+## Modes
 
-An optional mode (off by default): each pause segment is transcribed and
-typed while you keep talking, so only the last short piece remains after
-release. Turn it on with the tray menu's "Type while speaking" checkbox or
-`streaming = true` in the settings file. Cancel can't un-type pieces already
-typed. Leave it off to type once at stop, as before. It's faster on long
-dictations: most of the text is already typed when you stop.
+| Mode | Setting | What happens | Accuracy | Speed |
+|---|---|---|---|---|
+| Whole (default) | `mode = "whole"` | types once at stop | highest: hears everything at once | slowest after release on long dictations |
+| Pauses | `mode = "pauses"` | types each pause segment while speaking | high: 1.5 s of left context per piece | most text is already typed at stop |
+| Live | `mode = "live"` | types while speaking, chunk by chunk | good: true streaming model | fastest: text appears as you talk |
 
-Trade-off: each piece is transcribed with only 1.5 s of the audio before it,
-so a word right after a long pause is occasionally misheard (whole-recording
-mode hears everything at once and is the most accurate). Pauses are found by
-the Silero voice detector, which `dictate download` fetches (2.3 MB).
+Set the mode in the settings file or with `DICTATE_MODE=live`. The tray
+menu's "Type while speaking" checkbox toggles pauses mode for now (a Mode
+submenu is coming).
+
+Pauses mode finds pauses with the Silero voice detector, which
+`dictate download` fetches (2.3 MB). Cancel can't un-type pieces already
+typed. Trade-off: each piece is transcribed with only 1.5 s of the audio
+before it, so a word right after a long pause is occasionally misheard.
+
+Live mode needs its own model and a fast machine:
+
+```sh
+dictate download --live   # about 900 MB, NVIDIA Nemotron streaming 0.6B (English)
+```
+
+At startup the daemon benchmarks the model (3 chunks): it stays in Live only
+when the median chunk takes under 392 ms per 560 ms of audio. Otherwise it
+logs and notifies (`dictate: this computer is too slow for Live mode`) and
+uses whole mode for that session. Without the model it does the same
+(`dictate: Live model missing`).
 
 ## Settings file
 
@@ -167,14 +182,15 @@ All keys are optional; a missing file means defaults:
 ```toml
 sounds = true                 # short tone when recording starts/stops
 notifications = true          # desktop notifications for errors
-streaming = false             # type each pause segment while speaking
+mode = "whole"                # dictation mode: "whole", "pauses" or "live"
 hotkey = "Ctrl+Shift+Space"   # global shortcut: tap to toggle, hold to talk
 ```
 
 The environment wins: `DICTATE_SOUNDS=0`, `DICTATE_NOTIFY=0`,
-`DICTATE_STREAMING=0` and `DICTATE_HOTKEY=...` override the file. The tray
-menu edits the file for you; `Open settings file` creates it with defaults
-when missing.
+`DICTATE_MODE=...` and `DICTATE_HOTKEY=...` override the file. The old
+`streaming` key and `DICTATE_STREAMING` still work (they map to whole/pauses).
+The tray menu edits the file for you; `Open settings file` creates it with
+defaults when missing.
 
 ## Global hotkey
 
@@ -199,9 +215,11 @@ app that runs `dictate daemon`.
 ## Model
 
 Speech recognition uses NVIDIA Parakeet TDT 0.6B v2 (English), released under
-CC-BY-4.0, using the int8 ONNX export by istupakov. Pause segmentation ("Type
-while speaking") uses Silero VAD v6, released under MIT; `dictate download`
-fetches it too (2.3 MB, next to the speech model).
+CC-BY-4.0, using the int8 ONNX export by istupakov. Pause segmentation (pauses
+mode) uses Silero VAD v6, released under MIT; `dictate download` fetches it
+too (2.3 MB, next to the speech model). Live mode uses NVIDIA Nemotron
+streaming 0.6B (English), int8 ONNX, fetched by `dictate download --live`
+(about 900 MB, next to the speech model).
 
 The model lives in the platform data directory
 (`~/.local/share/dictate/models/parakeet-tdt-0.6b-v2-int8` on Linux). Set
@@ -229,4 +247,6 @@ Streaming diagnosis: set `DICTATE_DEBUG_SEGMENTS=<dir>` to save every emitted se
 ## License
 
 Code: MIT (see LICENSE). Speech model: NVIDIA Parakeet TDT 0.6B v2,
-CC-BY-4.0, downloaded at runtime by `dictate download` — not bundled.
+CC-BY-4.0, downloaded at runtime by `dictate download` — not bundled. Live
+model: NVIDIA Nemotron streaming 0.6B, downloaded at runtime by
+`dictate download --live` — not bundled.
