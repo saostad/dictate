@@ -11,6 +11,14 @@ const MODEL_FILES: &[&str] = &[
     "decoder_joint-model.int8.onnx",
     "vocab.txt",
 ];
+const VAD_URL: &str = "https://github.com/snakers4/silero-vad/raw/1e261b036686cd0017d500ee96acd1c4ba572a9d/src/silero_vad/data/silero_vad.onnx";
+const VAD_DIR_NAME: &str = "silero-vad-v6";
+const VAD_FILE_NAME: &str = "silero_vad.onnx";
+/// Exact size of the pinned `silero_vad.onnx`. `sha2` is not in Cargo.lock,
+/// so the download is verified by exact size instead of sha256 (pinned
+/// sha256 `1a153a22f4509e292a94e67d6f9b85e8deb25b4988682b7e174c65279d8788e3`,
+/// for reference if hashing ever becomes available).
+const VAD_FILE_SIZE: u64 = 2_327_524;
 const PROGRESS_STEP_PERCENT: u64 = 5;
 const MB: u64 = 1_000_000;
 
@@ -60,6 +68,41 @@ pub fn model_dir_checked() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// Voice-detector dir for a parakeet model dir: the sibling
+/// `silero-vad-v6` under the same models dir.
+fn vad_dir_for(model_dir: &Path) -> PathBuf {
+    match model_dir.parent() {
+        Some(models) => models.join(VAD_DIR_NAME),
+        None => model_dir.join(VAD_DIR_NAME),
+    }
+}
+
+/// Path of the voice-detector model. Creates nothing.
+pub fn vad_model_path() -> anyhow::Result<PathBuf> {
+    Ok(vad_dir_for(&model_dir()?).join(VAD_FILE_NAME))
+}
+
+/// The voice-detector path, checked for presence.
+pub fn vad_model_path_checked() -> anyhow::Result<PathBuf> {
+    let path = vad_model_path()?;
+    check_vad_file(&path)?;
+    Ok(path)
+}
+
+/// Error unless the voice-detector file exists at `path`.
+fn check_vad_file(path: &Path) -> anyhow::Result<()> {
+    if path.is_file() {
+        return Ok(());
+    }
+    let dir = path
+        .parent()
+        .map(|parent| parent.display().to_string())
+        .unwrap_or_else(|| ".".to_string());
+    anyhow::bail!(
+        "Voice detector {VAD_FILE_NAME} is missing in {dir}. Run \"dictate download\" first (about 2.3 MB)."
+    );
+}
+
 /// Download any missing model files into the model directory.
 pub fn download() -> anyhow::Result<()> {
     let dir = model_dir()?;
@@ -81,8 +124,56 @@ pub fn download() -> anyhow::Result<()> {
         download_file(&url, name, &dest)
             .with_context(|| format!("Downloading {name} from {url} failed"))?;
     }
+    download_vad()?;
     println!("Model ready in {}", dir.display());
     Ok(())
+}
+
+/// Download the voice-detector model next to the speech model, unless it is
+/// already there with the exact pinned size. A wrong-sized file is deleted
+/// and reported clearly, never trusted.
+fn download_vad() -> anyhow::Result<()> {
+    let dest = vad_model_path()?;
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .with_context(|| format!("Could not create model directory {}", parent.display()))?;
+    }
+    let present_len = dest.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+    if dest.is_file() && present_len == VAD_FILE_SIZE {
+        println!("{VAD_FILE_NAME}: already present");
+        return Ok(());
+    }
+    if dest.is_file() {
+        eprintln!(
+            "{VAD_FILE_NAME}: wrong size ({present_len} bytes, expected {VAD_FILE_SIZE}); re-downloading"
+        );
+    }
+    download_file(VAD_URL, VAD_FILE_NAME, &dest)
+        .with_context(|| format!("Downloading {VAD_FILE_NAME} from {VAD_URL} failed"))?;
+    verify_file_size(&dest, VAD_FILE_SIZE)
+        .with_context(|| format!("Downloading {VAD_FILE_NAME} from {VAD_URL} failed"))?;
+    Ok(())
+}
+
+/// The downloaded file must have exactly `expected` bytes (the integrity
+/// check: exact size stands in for the sha256). A mismatch deletes the file
+/// and errors clearly.
+fn verify_file_size(path: &Path, expected: u64) -> anyhow::Result<()> {
+    let len = fs::metadata(path)
+        .with_context(|| format!("Could not read metadata of {}", path.display()))?
+        .len();
+    if len == expected {
+        return Ok(());
+    }
+    if let Err(err) = fs::remove_file(path) {
+        eprintln!(
+            "warning: could not delete wrong-sized download {}: {err}",
+            path.display()
+        );
+    }
+    anyhow::bail!(
+        "{VAD_FILE_NAME} has wrong size: {len} bytes, expected {expected} bytes (the file was deleted)"
+    );
 }
 
 fn download_file(url: &str, name: &str, dest: &Path) -> anyhow::Result<()> {
@@ -199,6 +290,71 @@ mod tests {
             fs::write(dir.join(name), b"stub").unwrap();
         }
         check_model_dir(&dir).unwrap();
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn vad_dir_is_a_sibling_of_the_speech_model_dir() {
+        let model_dir = Path::new("/data/models/parakeet-tdt-0.6b-v2-int8");
+        assert_eq!(
+            vad_dir_for(model_dir),
+            PathBuf::from("/data/models/silero-vad-v6")
+        );
+        assert_eq!(
+            vad_dir_for(model_dir).join(VAD_FILE_NAME),
+            PathBuf::from("/data/models/silero-vad-v6/silero_vad.onnx")
+        );
+    }
+
+    #[test]
+    fn missing_vad_error_names_file_and_suggests_download() {
+        let dir = fresh_dir("vad-missing");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(VAD_FILE_NAME);
+        let err = check_vad_file(&path).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(VAD_FILE_NAME), "unexpected: {msg}");
+        assert!(msg.contains("dictate download"), "unexpected: {msg}");
+        assert!(
+            msg.contains(&dir.display().to_string()),
+            "unexpected: {msg}"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn present_vad_file_passes_check() {
+        let dir = fresh_dir("vad-present");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(VAD_FILE_NAME);
+        fs::write(&path, b"stub").unwrap();
+        check_vad_file(&path).unwrap();
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn verify_file_size_accepts_exact_size() {
+        let dir = fresh_dir("vad-size-ok");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(VAD_FILE_NAME);
+        fs::write(&path, b"12345").unwrap();
+        verify_file_size(&path, 5).unwrap();
+        assert!(path.is_file(), "a good file must be kept");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn verify_file_size_deletes_wrong_size() {
+        let dir = fresh_dir("vad-size-bad");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join(VAD_FILE_NAME);
+        fs::write(&path, b"1234").unwrap();
+        let err = verify_file_size(&path, 5).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains(VAD_FILE_NAME), "unexpected: {msg}");
+        assert!(msg.contains('4'), "unexpected: {msg}");
+        assert!(msg.contains('5'), "unexpected: {msg}");
+        assert!(!path.exists(), "a wrong-sized file must be deleted");
         cleanup(&dir);
     }
 

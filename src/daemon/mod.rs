@@ -116,10 +116,12 @@ enum FeederCmd {
     Cancel,
 }
 
-/// A running feeder thread (streaming on, while Recording only).
+/// A running feeder thread (streaming on, while Recording only). The thread
+/// hands the Vad back on exit (`None` when feeder setup consumed it); the
+/// daemon reuses one Vad across recordings.
 struct FeederSession {
     control_tx: mpsc::Sender<FeederCmd>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Option<std::thread::JoinHandle<Option<crate::vad::Vad>>>,
 }
 
 /// Effective streaming switch (settings file + `DICTATE_STREAMING`).
@@ -342,6 +344,9 @@ struct DaemonApp {
     state: State,
     recorder: Option<crate::mic::Recorder>,
     feeder: Option<FeederSession>,
+    /// The shared voice detector, reused across streaming recordings. Moved
+    /// into the feeder thread while Recording, handed back when it exits.
+    vad: Option<crate::vad::Vad>,
     to_worker: mpsc::Sender<Job>,
     worker: std::thread::JoinHandle<()>,
     hotkey: Option<HotKey>,
@@ -369,6 +374,7 @@ impl DaemonApp {
             state: State::Idle,
             recorder: None,
             feeder: None,
+            vad: None,
             to_worker,
             worker,
             hotkey: None,
@@ -645,26 +651,35 @@ impl DaemonApp {
         }
     }
 
-    /// Start the mic, and the feeder thread when streaming is on.
+    /// Start the mic, and the feeder thread when streaming is on and a
+    /// voice detector is available. Otherwise the recording runs in
+    /// whole-recording mode (the fallback is logged + notified, not silent).
     fn start_recording(&mut self, new_state: State, ok_reply: &str) -> String {
         match crate::mic::Recorder::start() {
             Ok(started) => {
                 if streaming_enabled() {
-                    let buffer = started.buffer_handle();
-                    let sample_rate = started.sample_rate();
-                    let (control_tx, control_rx) = mpsc::channel::<FeederCmd>();
-                    let to_worker = self.to_worker.clone();
-                    let thread = std::thread::spawn(move || {
-                        feeder_loop(buffer, sample_rate, control_rx, to_worker);
-                    });
-                    self.feeder = Some(FeederSession {
-                        control_tx,
-                        thread: Some(thread),
-                    });
-                    self.recorder = Some(started);
-                } else {
-                    self.recorder = Some(started);
+                    match self.take_streaming_vad() {
+                        Some(mut vad) => {
+                            vad.reset();
+                            let buffer = started.buffer_handle();
+                            let sample_rate = started.sample_rate();
+                            let (control_tx, control_rx) = mpsc::channel::<FeederCmd>();
+                            let to_worker = self.to_worker.clone();
+                            let thread = std::thread::spawn(move || {
+                                feeder_loop(vad, buffer, sample_rate, control_rx, to_worker)
+                            });
+                            self.feeder = Some(FeederSession {
+                                control_tx,
+                                thread: Some(thread),
+                            });
+                        }
+                        None => {
+                            // No voice detector: whole-recording mode for
+                            // this recording (already logged + notified).
+                        }
+                    }
                 }
+                self.recorder = Some(started);
                 self.state = new_state;
                 crate::cue::play_start();
                 ok_reply.to_string()
@@ -677,6 +692,39 @@ impl DaemonApp {
                     &format!("{err:#}"),
                 );
                 format!("err {err:#}")
+            }
+        }
+    }
+
+    /// A voice detector for a streaming recording, reusing the daemon's Vad
+    /// across recordings (loaded lazily on the first one). `None` means
+    /// whole-recording mode for this recording: the missing or broken file
+    /// was already logged + notified, so the fallback is explicit.
+    fn take_streaming_vad(&mut self) -> Option<crate::vad::Vad> {
+        if let Some(vad) = self.vad.take() {
+            return Some(vad);
+        }
+        if crate::model::vad_model_path_checked().is_err() {
+            let body = "Run \"dictate download\" to enable Type while speaking. Using whole-recording mode.";
+            dlog!("error: dictate: voice detector missing: {body}");
+            crate::notify::show(
+                crate::notify::Kind::Error,
+                "dictate: voice detector missing",
+                body,
+            );
+            return None;
+        }
+        match crate::vad::Vad::load_default() {
+            Ok(vad) => Some(vad),
+            Err(err) => {
+                let body = format!("{err:#}. Using whole-recording mode.");
+                dlog!("error: dictate: voice detector failed: {body}");
+                crate::notify::show(
+                    crate::notify::Kind::Error,
+                    "dictate: voice detector failed",
+                    &body,
+                );
+                None
             }
         }
     }
@@ -751,17 +799,19 @@ impl DaemonApp {
         ok_reply.to_string()
     }
 
-    /// Signal the feeder thread (`Stop`/`Cancel`) and wait for it to exit.
-    /// No feeder: no-op. A dead feeder unblocks the worker with `Cancel`.
+    /// Signal the feeder thread (`Stop`/`Cancel`) and wait for it to exit,
+    /// taking the Vad back for the next recording. No feeder: no-op. A dead
+    /// feeder unblocks the worker with `Cancel`.
     fn finish_feeder(&mut self, cmd: FeederCmd) {
         let Some(mut session) = self.feeder.take() else {
             return;
         };
         let signalled = session.control_tx.send(cmd).is_ok();
-        if let Some(thread) = session.thread.take()
-            && thread.join().is_err()
-        {
-            dlog!("error: the streaming feeder thread panicked");
+        if let Some(thread) = session.thread.take() {
+            match thread.join() {
+                Ok(vad) => self.vad = vad,
+                Err(_) => dlog!("error: the streaming feeder thread panicked"),
+            }
         }
         if !signalled && self.to_worker.send(Job::Cancel).is_err() {
             // The worker is gone; `handle_command` reports that itself.
@@ -835,21 +885,23 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
 
 /// Streaming feeder thread: while Recording, wake every 100 ms, drain new
 /// device-rate samples and push them through the shared [`Feeder`](crate::segment::Feeder)
-/// (continuous resample to 16 kHz, then pause segmentation), sending each
+/// (continuous resample to 16 kHz, then VAD pause segmentation), sending each
 /// finished segment to the worker. On `Stop` the tail plus `End` go out; on
 /// `Cancel` a single `Cancel` goes out. Only the `Arc` buffer crosses
-/// threads; the `Recorder` stays on the event-loop thread.
+/// threads; the `Recorder` stays on the event-loop thread. Hands the Vad back
+/// on exit (`None` when feeder setup consumed it).
 fn feeder_loop(
+    vad: crate::vad::Vad,
     buffer: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
     sample_rate: u32,
     control_rx: mpsc::Receiver<FeederCmd>,
     to_worker: mpsc::Sender<Job>,
-) {
-    let mut feeder = match crate::segment::Feeder::new(sample_rate) {
+) -> Option<crate::vad::Vad> {
+    let mut feeder = match crate::segment::Feeder::new(sample_rate, vad) {
         Ok(feeder) => feeder,
         Err(err) => {
             feeder_failed(&to_worker, err);
-            return;
+            return None;
         }
     };
     let mut total_device_samples: u64 = 0;
@@ -949,6 +1001,7 @@ fn feeder_loop(
             }
         }
     }
+    Some(feeder.into_scorer())
 }
 
 /// Queue one 16 kHz segment for transcription.

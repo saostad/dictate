@@ -20,6 +20,7 @@ mod notify;
 mod segment;
 mod tray;
 mod typer;
+mod vad;
 
 use std::path::Path;
 
@@ -98,10 +99,11 @@ fn transcribe(path: &Path) -> anyhow::Result<()> {
 fn transcribe_segmented(path: &Path) -> anyhow::Result<()> {
     let dir = model::model_dir_checked()?;
     let (mono, rate) = audio::load_wav_mono(path)?;
+    let vad = vad::Vad::load_default()?;
     let start = std::time::Instant::now();
     let mut asr = asr::Asr::load(&dir)?;
     eprintln!("model loaded in {} ms", start.elapsed().as_millis());
-    let mut feeder = segment::Feeder::new(rate)?;
+    let mut feeder = segment::Feeder::new(rate, vad)?;
     let mut run = SegmentRun::default();
     let chunk = (rate as usize / 10).max(1);
     for piece in mono.chunks(chunk) {

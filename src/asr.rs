@@ -9,7 +9,7 @@ pub struct Asr {
     model: ParakeetTDT,
 }
 
-fn shared_environment() -> anyhow::Result<Environment> {
+pub(crate) fn shared_environment() -> anyhow::Result<Environment> {
     static ENV: OnceLock<Environment> = OnceLock::new();
     if let Some(env) = ENV.get() {
         return Ok(env.clone());

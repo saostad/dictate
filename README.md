@@ -194,7 +194,9 @@ app that runs `dictate daemon`.
 ## Model
 
 Speech recognition uses NVIDIA Parakeet TDT 0.6B v2 (English), released under
-CC-BY-4.0, using the int8 ONNX export by istupakov.
+CC-BY-4.0, using the int8 ONNX export by istupakov. Pause segmentation ("Type
+while speaking") uses Silero VAD v6, released under MIT; `dictate download`
+fetches it too (2.3 MB, next to the speech model).
 
 The model lives in the platform data directory
 (`~/.local/share/dictate/models/parakeet-tdt-0.6b-v2-int8` on Linux). Set
