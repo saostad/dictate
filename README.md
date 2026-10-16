@@ -8,7 +8,16 @@ file from the command line.
 
 ## Install
 
-Download the archive for your OS from
+On Linux or macOS, the install script fetches the latest release, checks its
+SHA256 and links `dictate` into `~/.local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/saostad/dictate/main/install.sh | sh
+```
+
+Then run `dictate download` and `dictate daemon` (steps 2 and 3 below).
+
+Or download the archive for your OS from
 [the latest release](https://github.com/saostad/dictate/releases/latest):
 
 | OS | CPU | File |
@@ -49,14 +58,30 @@ The Linux binaries need glibc 2.39+ (Ubuntu 24.04+, Fedora 40+, Arch).
 
 ### macOS notes
 
-The binary is unsigned, so remove the quarantine flag after unpacking:
+The binary is not notarized by Apple, so after a browser download macOS
+refuses to run it (or kills it silently). The install script avoids this
+(curl downloads aren't quarantined). If you downloaded the archive in a
+browser, remove the quarantine flag from the unpacked folder:
 
 ```sh
-xattr -d com.apple.quarantine ./dictate
+xattr -dr com.apple.quarantine ./dictate-macos-aarch64
 ```
 
 Grant Microphone and Accessibility to the terminal (or app) that runs
 `dictate daemon` (System Settings → Privacy & Security).
+
+To run dictate as a regular menu bar app instead (its own "Dictate" entries
+in Privacy & Security, no terminal), build it from source:
+
+```sh
+scripts/macos-app.sh   # builds Dictate.app and installs it to /Applications
+open /Applications/Dictate.app
+```
+
+The script signs the app with a self-signed certificate it creates in its own
+keychain (`dictate-signing.keychain-db`), so no Apple Developer account is
+needed and macOS keeps the permissions across rebuilds. Add Dictate under
+System Settings → General → Login Items to start it at login.
 
 ### Windows notes
 
