@@ -459,10 +459,11 @@ impl DaemonApp {
         }
     }
 
-    /// Refresh the tray icon and menu after a state change (no tray: no-op).
+    /// Refresh the tray icon and menu after a state or settings change
+    /// (no tray: no-op).
     fn sync_tray(&self) {
         if let Some(tray) = &self.tray
-            && let Err(err) = tray.sync_state(self.state)
+            && let Err(err) = tray.sync_state(self.state, self.settings.streaming)
         {
             dlog!("error: {err:#}");
         }
@@ -502,6 +503,7 @@ impl DaemonApp {
         }
         self.report_save_error(crate::config::save(&self.settings));
         Self::confirm_settings_change(&crate::tray::SettingsChange::Sounds(new), false);
+        self.sync_tray();
     }
 
     /// Flip the `Notifications` check, update the effective switch, save.
@@ -516,6 +518,7 @@ impl DaemonApp {
         // Turning notifications off is confirmed even though they are now
         // off: the notification is the confirmation of that action.
         Self::confirm_settings_change(&crate::tray::SettingsChange::Notifications(new), !new);
+        self.sync_tray();
     }
 
     /// Flip the `Type while speaking` check, update the effective switch, save.
@@ -528,6 +531,7 @@ impl DaemonApp {
         }
         self.report_save_error(crate::config::save(&self.settings));
         Self::confirm_settings_change(&crate::tray::SettingsChange::Streaming(new), false);
+        self.sync_tray();
     }
 
     /// Log a settings change and confirm it with an Info notification, so a
@@ -608,6 +612,7 @@ impl DaemonApp {
             &crate::tray::SettingsChange::Shortcut(display.to_string()),
             false,
         );
+        self.sync_tray();
     }
 
     /// Notify a failed shortcut switch and re-check the current shortcut.

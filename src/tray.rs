@@ -79,6 +79,17 @@ pub(crate) fn toggle_text(state: State) -> &'static str {
     }
 }
 
+/// Tooltip text for `state`: the status plus the typing mode when streaming
+/// is on, so hovering the icon shows the current mode.
+pub(crate) fn tooltip_text(state: State, streaming: bool) -> String {
+    let base = status_text(state);
+    if streaming {
+        format!("{base} (type while speaking)")
+    } else {
+        base.to_string()
+    }
+}
+
 /// A settings change made from the tray menu: a checkbox toggle or a
 /// shortcut switch. Pure, so the confirmation text is unit-testable.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -251,7 +262,7 @@ pub(crate) fn build_tray(
         .with_id(TRAY_ID)
         .with_title(TRAY_ID)
         .with_menu(Box::new(menu))
-        .with_tooltip("dictate")
+        .with_tooltip(tooltip_text(state, settings.streaming))
         .with_icon(icon)
         .build()
         .map_err(|err| anyhow::anyhow!("Could not create tray icon: {err}"))?;
@@ -278,14 +289,18 @@ pub(crate) fn build_tray(
 }
 
 impl Tray {
-    /// Refresh the icon, label and item states after a state change.
-    pub(crate) fn sync_state(&self, state: State) -> anyhow::Result<()> {
+    /// Refresh the icon, tooltip, label and item states after a state or
+    /// settings change.
+    pub(crate) fn sync_state(&self, state: State, streaming: bool) -> anyhow::Result<()> {
         let (rgba, width, height) = icon_rgba(state);
         let icon = Icon::from_rgba(rgba, width, height)
             .map_err(|err| anyhow::anyhow!("Internal error: tray icon pixels rejected: {err}"))?;
         self.icon
             .set_icon(Some(icon))
             .map_err(|err| anyhow::anyhow!("Could not update the tray icon: {err}"))?;
+        self.icon
+            .set_tooltip(Some(tooltip_text(state, streaming)))
+            .map_err(|err| anyhow::anyhow!("Could not update the tray tooltip: {err}"))?;
         self.status.set_text(status_text(state));
         self.toggle.set_text(toggle_text(state));
         self.toggle.set_enabled(state != State::Transcribing);
@@ -443,6 +458,23 @@ mod tests {
                 "{name} does not parse"
             );
         }
+    }
+
+    #[test]
+    fn tooltip_shows_state_and_streaming_mode() {
+        assert_eq!(tooltip_text(State::Idle, false), "dictate — Idle");
+        assert_eq!(
+            tooltip_text(State::Idle, true),
+            "dictate — Idle (type while speaking)"
+        );
+        assert_eq!(
+            tooltip_text(State::Recording, true),
+            "dictate — Recording… (type while speaking)"
+        );
+        assert_eq!(
+            tooltip_text(State::Transcribing, false),
+            "dictate — Transcribing…"
+        );
     }
 
     #[test]
