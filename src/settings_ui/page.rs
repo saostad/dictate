@@ -11,6 +11,15 @@ use crate::mic::Mic;
 /// GitHub releases page (the About section's "Check for updates" button).
 pub(crate) const RELEASES_URL: &str = "https://github.com/saostad/dictate/releases/latest";
 
+/// Page margin in logical pixels: the CentralPanel frame's inner margin, so
+/// content never touches the window edge.
+pub(crate) const PAGE_MARGIN: f32 = 16.0;
+/// Explanation text size in logical pixels. egui's `small()` is 9 px by
+/// default, too small to read; the page renders it at 12 px instead.
+pub(crate) const EXPLAIN_SIZE: f32 = 12.0;
+/// Space above and below each section separator.
+const SECTION_GAP: f32 = 8.0;
+
 /// Dictation modes offered on the page, in order, with their radio label and
 /// one-line explanation.
 pub(crate) const MODE_OPTIONS: [(Mode, &str, &str); 3] = [
@@ -111,19 +120,39 @@ pub(crate) fn wayland_shortcut_line(configured: Option<&str>) -> Option<String> 
 
 /// Render one page frame, collecting the user's intents.
 pub(crate) fn show_page(ui: &mut egui::Ui, view: &PageView) -> Vec<PageAction> {
+    ui.style_mut().text_styles.insert(
+        egui::TextStyle::Small,
+        egui::FontId::proportional(EXPLAIN_SIZE),
+    );
     let mut actions = Vec::new();
-    egui::ScrollArea::vertical().show(ui, |ui| {
-        microphone_section(ui, view, &mut actions);
-        ui.separator();
-        mode_section(ui, view, &mut actions);
-        ui.separator();
-        shortcut_section(ui, view, &mut actions);
-        ui.separator();
-        general_section(ui, view, &mut actions);
-        ui.separator();
-        about_section(ui, view, &mut actions);
-    });
+    egui::CentralPanel::default()
+        .frame(egui::Frame::central_panel(ui.style()).inner_margin(PAGE_MARGIN))
+        .show(ui, |ui| {
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                microphone_section(ui, view, &mut actions);
+                section_gap(ui);
+                mode_section(ui, view, &mut actions);
+                section_gap(ui);
+                shortcut_section(ui, view, &mut actions);
+                section_gap(ui);
+                general_section(ui, view, &mut actions);
+                section_gap(ui);
+                about_section(ui, view, &mut actions);
+            });
+        });
     actions
+}
+
+/// Space between two sections: a gap, a separator, a gap.
+fn section_gap(ui: &mut egui::Ui) {
+    ui.add_space(SECTION_GAP);
+    ui.separator();
+    ui.add_space(SECTION_GAP);
+}
+
+/// A section heading: heading size, strong.
+fn heading(ui: &mut egui::Ui, text: &str) {
+    ui.label(egui::RichText::new(text).heading().strong());
 }
 
 /// One-line grey explanation under a control.
@@ -143,7 +172,7 @@ fn inline_error(ui: &mut egui::Ui, error: Option<&str>) {
 }
 
 fn microphone_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
-    ui.heading("Microphone");
+    heading(ui, "Microphone");
     let default_name = view
         .mics
         .iter()
@@ -175,7 +204,7 @@ fn microphone_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<Page
 }
 
 fn mode_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
-    ui.heading("Dictation mode");
+    heading(ui, "Dictation mode");
     for (mode, label, explanation) in MODE_OPTIONS {
         if ui.radio(view.settings.mode == mode, label).clicked() {
             actions.push(PageAction::SelectMode(mode));
@@ -196,7 +225,7 @@ fn mode_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction
 }
 
 fn shortcut_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
-    ui.heading("Shortcut");
+    heading(ui, "Shortcut");
     if view.wayland {
         ui.label("Apps can't register global shortcuts on Wayland. Bind this shortcut in your compositor:");
         if let Some(line) = wayland_shortcut_line(Some(view.hotkey_display)) {
@@ -222,7 +251,7 @@ fn shortcut_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAc
 }
 
 fn general_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
-    ui.heading("General");
+    heading(ui, "General");
     let mut autostart = view.autostart_on.unwrap_or(false);
     if ui.checkbox(&mut autostart, "Start at login").changed() {
         actions.push(PageAction::SetAutostart(autostart));
@@ -245,7 +274,7 @@ fn general_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAct
 }
 
 fn about_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
-    ui.heading("About");
+    heading(ui, "About");
     ui.label(format!("Dictate {}", view.version));
     ui.horizontal(|ui| {
         if ui.button("Open log").clicked() {
@@ -328,6 +357,13 @@ mod tests {
         );
         assert_eq!(wayland_shortcut_line(Some("")), None);
         assert_eq!(wayland_shortcut_line(None), None);
+    }
+
+    #[test]
+    fn page_layout_numbers() {
+        assert_eq!(PAGE_MARGIN, 16.0);
+        assert!(EXPLAIN_SIZE >= 12.0);
+        assert_eq!(SECTION_GAP, 8.0);
     }
 
     #[test]
