@@ -66,6 +66,7 @@ fn run() -> anyhow::Result<()> {
             }
         }
         "listen" => listen(),
+        "mics" => mics(),
         "daemon" => run_daemon(),
         "toggle" | "start" | "stop" | "cancel" | "status" => run_client(&command),
         "transcribe" => {
@@ -309,6 +310,44 @@ fn listen() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// List the microphones: each with its default/selected marks and its id
+/// on the next line, plus a hint for choosing one.
+fn mics() -> anyhow::Result<()> {
+    let (settings, problem) = config::load();
+    config::init_effective(&settings);
+    if let Some(problem) = problem {
+        eprintln!("error: {problem} Using defaults.");
+    }
+    let mics = mic::list_microphones()?;
+    if mics.is_empty() {
+        println!("No microphones found.");
+    }
+    for mic in &mics {
+        let mut line = format!("* {}", mic.name);
+        if mic.is_default {
+            line.push_str(" [default]");
+        }
+        if settings.microphone == mic.id {
+            line.push_str(" [selected]");
+        }
+        println!("{line}");
+        println!("    {}", mic.id);
+    }
+    let example = mics
+        .iter()
+        .find(|mic| mic.is_default)
+        .or(mics.first())
+        .map(|mic| mic.id.as_str())
+        .unwrap_or("<id>");
+    let path = config::config_path()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|| "<config file>".to_string());
+    println!(
+        "Choose one in the tray menu (Microphone) or set microphone = \"{example}\" in {path}."
+    );
+    Ok(())
+}
+
 fn run_daemon() -> anyhow::Result<()> {
     daemon::run_daemon()
 }
@@ -346,7 +385,7 @@ fn is_app_bundle_executable(exe: &Path) -> bool {
 }
 
 fn usage() -> &'static str {
-    "Usage: dictate <command> [args]\n\nCommands:\n  download [--live]      Download the speech model (about 660 MB; --live also fetches the Live model, about 900 MB)\n  transcribe [--live] <file.wav>  Transcribe a WAV file and print the text\n  listen                 Record from the microphone and print the text\n  daemon                 Run the dictation daemon (keeps the model loaded)\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  help                   Show this help"
+    "Usage: dictate <command> [args]\n\nCommands:\n  download [--live]      Download the speech model (about 660 MB; --live also fetches the Live model, about 900 MB)\n  transcribe [--live] <file.wav>  Transcribe a WAV file and print the text\n  listen                 Record from the microphone and print the text\n  mics                   List the microphones and the selected one\n  daemon                 Run the dictation daemon (keeps the model loaded)\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  help                   Show this help"
 }
 
 #[cfg(test)]

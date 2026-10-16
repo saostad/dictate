@@ -110,6 +110,7 @@ cargo build --release
 dictate download
 dictate transcribe x.wav
 dictate listen
+dictate mics
 ```
 
 ## Use it
@@ -210,11 +211,13 @@ sounds = true                 # short tone when recording starts/stops
 notifications = true          # desktop notifications for errors
 mode = "whole"                # dictation mode: "whole", "pauses" or "live"
 hotkey = "Ctrl+Shift+Space"   # global shortcut: tap to toggle, hold to talk
+microphone = ""               # microphone: "" = system default, or a device id (see "dictate mics")
 ```
 
 The environment wins: `DICTATE_SOUNDS=0`, `DICTATE_NOTIFY=0`,
-`DICTATE_MODE=...` and `DICTATE_HOTKEY=...` override the file. The old
-`streaming` key and `DICTATE_STREAMING` still work (they map to whole/pauses).
+`DICTATE_MODE=...`, `DICTATE_HOTKEY=...` and `DICTATE_MICROPHONE=...` override
+the file. The old `streaming` key and `DICTATE_STREAMING` still work (they map
+to whole/pauses).
 The tray menu edits the file for you; `Open settings file` creates it with
 defaults when missing.
 
