@@ -1,3 +1,4 @@
+use std::str::FromStr;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -72,7 +73,11 @@ pub(crate) struct Mic {
 /// List the microphones on [`audio_host`]: input devices only, monitors and
 /// `alsa:null` hidden, duplicate names numbered. See [`microphone_list`].
 pub(crate) fn list_microphones() -> anyhow::Result<Vec<Mic>> {
-    let host = audio_host();
+    list_microphones_on(&audio_host())
+}
+
+/// List the microphones on one already-opened host.
+fn list_microphones_on(host: &cpal::Host) -> anyhow::Result<Vec<Mic>> {
     let default_id = host
         .default_input_device()
         .and_then(|device| device.id().ok())
@@ -143,17 +148,88 @@ pub(crate) struct Recorder {
     samples: Arc<Mutex<Vec<f32>>>,
     stream_error: Arc<Mutex<Option<String>>>,
     sample_rate: u32,
+    mic_name: String,
+}
+
+/// The default input device, or the no-microphone error.
+fn default_input_device(host: &cpal::Host) -> anyhow::Result<cpal::Device> {
+    host.default_input_device().ok_or_else(|| {
+        anyhow::anyhow!(
+            "No microphone found: the system has no default input device. Check your sound settings."
+        )
+    })
+}
+
+/// Find a device by its `"host:device"` id string. `None` when the id is
+/// unparsable or no such device exists on this host.
+fn device_by_id_str(host: &cpal::Host, selected: &str) -> Option<cpal::Device> {
+    let id = cpal::DeviceId::from_str(selected).ok()?;
+    host.device_by_id(&id)
+}
+
+/// Display text for a saved microphone id: the current friendly name when the
+/// device is listed, else the raw id. Pure, for tests.
+fn saved_mic_display(mics: &[Mic], saved: &str) -> String {
+    mics.iter()
+        .find(|mic| mic.id == saved)
+        .map(|mic| mic.name.clone())
+        .unwrap_or_else(|| saved.to_string())
+}
+
+/// Record from the default because the saved microphone `selected` is gone:
+/// log + notify the fallback (the saved choice is kept, so it is used again
+/// when it comes back), and return the default device.
+fn fallback_to_default(host: &cpal::Host, selected: &str) -> anyhow::Result<cpal::Device> {
+    let device = default_input_device(host)?;
+    let default_name = device
+        .description()
+        .map(|description| description.name().to_string())
+        .unwrap_or_else(|_| "(unknown microphone)".to_string());
+    let saved = list_microphones_on(host)
+        .ok()
+        .as_deref()
+        .map(|mics| saved_mic_display(mics, selected))
+        .unwrap_or_else(|| selected.to_string());
+    let body = format!("\"{saved}\" isn't available. Using the system default: {default_name}.");
+    mlog(&format!("error: dictate: microphone not found: {body}"));
+    crate::notify::show(
+        crate::notify::Kind::Error,
+        "dictate: microphone not found",
+        &body,
+    );
+    Ok(device)
+}
+
+/// The `(id, name)` label of a device for the `recording from:` line.
+/// Identity reads only fail on a device that vanished mid-call; use
+/// placeholders rather than failing a recording that may still work.
+fn device_label(device: &cpal::Device) -> (String, String) {
+    let id = device
+        .id()
+        .map(|id| id.to_string())
+        .unwrap_or_else(|_| "<unknown>".to_string());
+    let name = device
+        .description()
+        .map(|description| description.name().to_string())
+        .unwrap_or_else(|_| id.clone());
+    (id, name)
 }
 
 impl Recorder {
-    /// Start recording from the default input device.
-    pub(crate) fn start() -> anyhow::Result<Self> {
+    /// Start recording from `mic` (a `"host:device"` id, `None` or empty for
+    /// the system default). A missing or unparsable id falls back to the
+    /// default with a log + notification; the saved choice is kept.
+    pub(crate) fn start(mic: Option<&str>) -> anyhow::Result<Self> {
         let host = audio_host();
-        let device = host.default_input_device().ok_or_else(|| {
-            anyhow::anyhow!(
-                "No microphone found: the system has no default input device. Check your sound settings."
-            )
-        })?;
+        let device = match mic {
+            Some(selected) if !selected.is_empty() => match device_by_id_str(&host, selected) {
+                Some(device) => device,
+                None => fallback_to_default(&host, selected)?,
+            },
+            _ => default_input_device(&host)?,
+        };
+        let (mic_id, mic_name) = device_label(&device);
+        mlog(&format!("recording from: {mic_name} ({mic_id})"));
         let supported = device
             .default_input_config()
             .context("Could not get the microphone's default input config")?;
@@ -187,12 +263,18 @@ impl Recorder {
             samples,
             stream_error,
             sample_rate,
+            mic_name,
         })
     }
 
     /// Device sample rate of this recording.
     pub(crate) fn sample_rate(&self) -> u32 {
         self.sample_rate
+    }
+
+    /// Display name of the microphone this recording uses (for the tray).
+    pub(crate) fn mic_name(&self) -> &str {
+        &self.mic_name
     }
 
     /// Shared capture buffer for the streaming feeder thread.
@@ -364,7 +446,10 @@ mod tests {
     fn microphone_list_hides_monitors_and_null() {
         let mics = microphone_list(
             vec![
-                entry("pulseaudio:alsa_output.pci.monitor", "Monitor of Built-in Audio"),
+                entry(
+                    "pulseaudio:alsa_output.pci.monitor",
+                    "Monitor of Built-in Audio",
+                ),
                 entry("pulseaudio:other.monitor", "Something else"),
                 entry("pulseaudio:alsa_input.pci", "Monitor of Weird Name"),
                 entry("alsa:null", "null"),
@@ -374,6 +459,24 @@ mod tests {
         );
         assert_eq!(mics.len(), 1);
         assert_eq!(mics[0].name, "Built-in Audio Analog Stereo");
+    }
+
+    #[test]
+    fn saved_mic_display_prefers_friendly_name() {
+        let mics = vec![Mic {
+            id: "pulseaudio:alsa_input.pci".to_string(),
+            name: "Built-in Audio Analog Stereo".to_string(),
+            is_default: true,
+        }];
+        assert_eq!(
+            saved_mic_display(&mics, "pulseaudio:alsa_input.pci"),
+            "Built-in Audio Analog Stereo"
+        );
+        assert_eq!(
+            saved_mic_display(&mics, "pulseaudio:gone"),
+            "pulseaudio:gone"
+        );
+        assert_eq!(saved_mic_display(&[], "not an id"), "not an id");
     }
 
     #[test]

@@ -3,14 +3,17 @@
 //! A tiny TOML subset parsed by hand (no new crates): `#` comments, blank
 //! lines, `key = true|false` and `key = "string"`. Keys are `sounds` and
 //! `notifications` (bool, default true), `mode` (`"whole"`/`"pauses"`/`"live"`,
-//! default `"whole"`) and `hotkey` (string, default `Ctrl+Shift+Space`). A
-//! missing file means defaults, never an error.
+//! default `"whole"`), `hotkey` (string, default `Ctrl+Shift+Space`) and
+//! `microphone` (string, default `""` = the system default input). A missing
+//! file means defaults, never an error.
 //!
-//! The environment still wins: `DICTATE_SOUNDS`, `DICTATE_NOTIFY`, `DICTATE_MODE`
-//! and `DICTATE_HOTKEY` override the file (`DICTATE_STREAMING` still works when
-//! `DICTATE_MODE` is unset). The daemon resolves file + env once at startup
-//! into the effective switches below, which `cue`, `notify` and the daemon read
-//! instead of touching the environment per call.
+//! The environment still wins: `DICTATE_SOUNDS`, `DICTATE_NOTIFY`, `DICTATE_MODE`,
+//! `DICTATE_HOTKEY` and `DICTATE_MICROPHONE` override the file (`DICTATE_STREAMING`
+//! still works when `DICTATE_MODE` is unset). The daemon resolves file + env once
+//! at startup into the effective switches below, which `cue`, `notify` and the
+//! daemon read instead of touching the environment per call (the microphone is
+//! resolved per recording instead: it is read rarely, and only the daemon's
+//! settings hold the file value).
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
@@ -75,6 +78,7 @@ pub(crate) struct Settings {
     pub notifications: bool,
     pub mode: Mode,
     pub hotkey: String,
+    pub microphone: String,
 }
 
 impl Default for Settings {
@@ -84,6 +88,7 @@ impl Default for Settings {
             notifications: true,
             mode: Mode::Whole,
             hotkey: crate::hotkey::DEFAULT_HOTKEY.to_string(),
+            microphone: String::new(),
         }
     }
 }
@@ -124,6 +129,22 @@ pub(crate) fn resolve_mode(
         None => file,
         Some("0") => Mode::Whole,
         Some(_) => Mode::Pauses,
+    }
+}
+
+/// Effective microphone selection: `DICTATE_MICROPHONE` wins when set and
+/// non-empty, else the file value when non-empty, else the system default
+/// (`None`). An empty value counts as unset on both sides.
+pub(crate) fn resolve_microphone(file: &str, env: Option<&str>) -> Option<String> {
+    match env {
+        Some(selected) if !selected.is_empty() => Some(selected.to_string()),
+        _ => {
+            if file.is_empty() {
+                None
+            } else {
+                Some(file.to_string())
+            }
+        }
     }
 }
 
@@ -300,6 +321,13 @@ pub(crate) fn parse(text: &str) -> Result<Settings, String> {
                     )
                 })?;
             }
+            "microphone" => {
+                settings.microphone = parse_string(value).map_err(|problem| {
+                    format!(
+                        "config.toml line {line_number}: invalid value for \"microphone\": {problem}"
+                    )
+                })?;
+            }
             _ => {
                 return Err(format!(
                     "config.toml line {line_number}: unknown key \"{key}\""
@@ -363,11 +391,12 @@ fn escape(value: &str) -> String {
 /// Render all keys, each with a one-line comment.
 fn render(settings: &Settings) -> String {
     format!(
-        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Dictation mode: \"whole\" (type once at stop), \"pauses\" (type at pauses), \"live\" (type while speaking).\nmode = \"{}\"\n# Global hotkey: tap to toggle, hold to talk.\nhotkey = \"{}\"\n",
+        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Dictation mode: \"whole\" (type once at stop), \"pauses\" (type at pauses), \"live\" (type while speaking).\nmode = \"{}\"\n# Global hotkey: tap to toggle, hold to talk.\nhotkey = \"{}\"\n# Microphone: \"\" means the system default input, or a device id (see \"dictate mics\").\nmicrophone = \"{}\"\n",
         settings.sounds,
         settings.notifications,
         settings.mode.as_str(),
-        escape(&settings.hotkey)
+        escape(&settings.hotkey),
+        escape(&settings.microphone)
     )
 }
 
@@ -430,13 +459,15 @@ mod tests {
 
     #[test]
     fn parses_all_keys() {
-        let settings =
-            parse("sounds = false\nnotifications = false\nmode = \"live\"\nhotkey = \"F8\"\n")
-                .unwrap();
+        let settings = parse(
+            "sounds = false\nnotifications = false\nmode = \"live\"\nhotkey = \"F8\"\nmicrophone = \"pulseaudio:alsa_input.pci\"\n",
+        )
+        .unwrap();
         assert!(!settings.sounds);
         assert!(!settings.notifications);
         assert_eq!(settings.mode, Mode::Live);
         assert_eq!(settings.hotkey, "F8");
+        assert_eq!(settings.microphone, "pulseaudio:alsa_input.pci");
         assert_eq!(parse("mode = \"whole\"\n").unwrap().mode, Mode::Whole);
         assert_eq!(parse("mode = \"pauses\"\n").unwrap().mode, Mode::Pauses);
     }
@@ -513,6 +544,41 @@ mod tests {
     }
 
     #[test]
+    fn microphone_defaults_to_empty_and_parses() {
+        assert_eq!(Settings::default().microphone, "");
+        let settings = parse("microphone = \"pulseaudio:alsa_input.pci\"\n").unwrap();
+        assert_eq!(settings.microphone, "pulseaudio:alsa_input.pci");
+        let settings = parse("microphone = \"\"\n").unwrap();
+        assert_eq!(settings.microphone, "");
+        let err = parse("microphone = pulseaudio:x\n").unwrap_err();
+        assert!(
+            err.contains("invalid value for \"microphone\""),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn microphone_env_precedence() {
+        // Env wins when set and non-empty, even over a file value.
+        assert_eq!(
+            resolve_microphone("pulseaudio:file", Some("pulseaudio:env")),
+            Some("pulseaudio:env".to_string())
+        );
+        // Empty env counts as unset: the file wins.
+        assert_eq!(
+            resolve_microphone("pulseaudio:file", Some("")),
+            Some("pulseaudio:file".to_string())
+        );
+        assert_eq!(
+            resolve_microphone("pulseaudio:file", None),
+            Some("pulseaudio:file".to_string())
+        );
+        // Empty on both sides means the system default.
+        assert_eq!(resolve_microphone("", Some("")), None);
+        assert_eq!(resolve_microphone("", None), None);
+    }
+
+    #[test]
     fn ignores_comments_and_whitespace() {
         let settings = parse(
             "  # leading comment\n  sounds=false  # trailing comment\n\nhotkey = \"a#b\" # keep the hash\n",
@@ -538,6 +604,7 @@ mod tests {
                 notifications: false,
                 mode: Mode::Pauses,
                 hotkey: "say \"hi\" \\ now".to_string(),
+                microphone: "pulseaudio:alsa_input.pci".to_string(),
             },
             Settings {
                 mode: Mode::Live,
@@ -608,6 +675,7 @@ mod tests {
             notifications: true,
             mode: Mode::Whole,
             hotkey: "F8".to_string(),
+            microphone: String::new(),
         };
         save_to(&path, &settings).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();

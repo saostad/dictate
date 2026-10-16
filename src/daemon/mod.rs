@@ -946,7 +946,11 @@ impl DaemonApp {
     /// without a voice detector falls back to whole for the recording (logged
     /// + notified, not silent).
     fn start_recording(&mut self, new_state: State, ok_reply: &str) -> String {
-        match crate::mic::Recorder::start() {
+        let mic = crate::config::resolve_microphone(
+            &self.settings.microphone,
+            std::env::var("DICTATE_MICROPHONE").ok().as_deref(),
+        );
+        match crate::mic::Recorder::start(mic.as_deref()) {
             Ok(started) => {
                 match self.current_mode() {
                     crate::config::Mode::Pauses => self.start_pauses_feeder(&started),

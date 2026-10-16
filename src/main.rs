@@ -268,7 +268,16 @@ fn append_live_output(text: &mut String, first: &mut bool, out: &str) {
 
 fn listen() -> anyhow::Result<()> {
     let dir = model::model_dir_checked()?;
-    let recorder = mic::Recorder::start()?;
+    let (settings, problem) = config::load();
+    config::init_effective(&settings);
+    if let Some(problem) = problem {
+        eprintln!("error: {problem} Using defaults.");
+    }
+    let mic = config::resolve_microphone(
+        &settings.microphone,
+        std::env::var("DICTATE_MICROPHONE").ok().as_deref(),
+    );
+    let recorder = mic::Recorder::start(mic.as_deref())?;
     let loader = std::thread::spawn(move || asr::Asr::load(&dir));
     eprintln!("Recording... press Enter to stop.");
     let mut line = String::new();
