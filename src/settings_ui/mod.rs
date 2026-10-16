@@ -30,6 +30,8 @@ pub(crate) const SETTINGS_TITLE: &str = "Dictate Settings";
 /// window managers float the dialog instead of tiling it.
 pub(crate) const FIXED_SIZE: (f64, f64) = (480.0, 640.0);
 /// Wayland app id / X11 class, so users can write window rules.
+/// Linux-only, like the `with_name` call that uses it.
+#[cfg(target_os = "linux")]
 pub(crate) const APP_ID: &str = "dictate";
 
 /// The open Settings window: winit window, glutin GL context and surface, and
@@ -308,9 +310,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_window_title_size_and_app_id() {
+    fn settings_window_title_and_size() {
         assert_eq!(SETTINGS_TITLE, "Dictate Settings");
         assert_eq!(FIXED_SIZE, (480.0, 640.0));
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn settings_window_app_id() {
         assert_eq!(APP_ID, "dictate");
     }
 }
