@@ -26,10 +26,11 @@ pub(crate) mod page;
 
 /// Window title.
 pub(crate) const SETTINGS_TITLE: &str = "Dictate Settings";
-/// Initial inner size in logical pixels.
-pub(crate) const INITIAL_SIZE: (f64, f64) = (480.0, 600.0);
-/// Minimum inner size in logical pixels.
-pub(crate) const MIN_SIZE: (f64, f64) = (420.0, 480.0);
+/// Fixed inner size in logical pixels (min = max, not resizable), so tiling
+/// window managers float the dialog instead of tiling it.
+pub(crate) const FIXED_SIZE: (f64, f64) = (480.0, 640.0);
+/// Wayland app id / X11 class, so users can write window rules.
+pub(crate) const APP_ID: &str = "dictate";
 
 /// The open Settings window: winit window, glutin GL context and surface, and
 /// egui state. Everything lives on the event-loop thread and is dropped on
@@ -57,11 +58,21 @@ impl SettingsWindow {
     pub(crate) fn open(event_loop: &ActiveEventLoop) -> anyhow::Result<Self> {
         let attributes = WindowAttributes::default()
             .with_title(SETTINGS_TITLE)
-            .with_inner_size(LogicalSize::new(INITIAL_SIZE.0, INITIAL_SIZE.1))
-            .with_min_inner_size(LogicalSize::new(MIN_SIZE.0, MIN_SIZE.1));
+            .with_inner_size(LogicalSize::new(FIXED_SIZE.0, FIXED_SIZE.1))
+            .with_min_inner_size(LogicalSize::new(FIXED_SIZE.0, FIXED_SIZE.1))
+            .with_max_inner_size(LogicalSize::new(FIXED_SIZE.0, FIXED_SIZE.1))
+            .with_resizable(false)
+            .with_transparent(false);
+        // One call sets the shared app-id field for both backends (the
+        // Wayland and X11 `with_name` impls write the same field).
+        #[cfg(target_os = "linux")]
+        let attributes = winit::platform::wayland::WindowAttributesExtWayland::with_name(
+            attributes, APP_ID, APP_ID,
+        );
         let template = glutin::config::ConfigTemplateBuilder::new()
             .with_depth_size(0)
-            .with_stencil_size(0);
+            .with_stencil_size(0)
+            .with_alpha_size(0);
         // The picker has no error channel by design (glutin's own examples
         // expect here too): a working GL display always enumerates configs,
         // so an empty pick means a broken driver past successful GL init.
@@ -297,9 +308,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn settings_window_title_and_sizes() {
+    fn settings_window_title_size_and_app_id() {
         assert_eq!(SETTINGS_TITLE, "Dictate Settings");
-        assert_eq!(INITIAL_SIZE, (480.0, 600.0));
-        assert_eq!(MIN_SIZE, (420.0, 480.0));
+        assert_eq!(FIXED_SIZE, (480.0, 640.0));
+        assert_eq!(APP_ID, "dictate");
     }
 }
