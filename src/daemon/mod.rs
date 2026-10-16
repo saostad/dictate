@@ -239,8 +239,8 @@ pub(crate) enum UserEvent {
     /// A background mode switch failed; already logged + notified, so the
     /// event loop only clears the loading state.
     ModeSwitchFailed,
-    /// Open the Settings window (`dictate settings` from the socket; the tray
-    /// menu calls `open_settings` directly).
+    /// Open the Settings window (`dictate settings` from the socket, or the
+    /// tray `Settings…` item — both go through this event on every OS).
     OpenSettings,
     /// Background mode-switch progress changed; repaint the Settings window
     /// if it is open.
@@ -933,7 +933,13 @@ impl DaemonApp {
             Some(crate::tray::TrayAction::Cancel) => {
                 drop(self.handle_command(Command::Cancel));
             }
-            Some(crate::tray::TrayAction::Settings) => self.open_settings(event_loop),
+            Some(crate::tray::TrayAction::Settings) => {
+                // Same event as `dictate settings` (unix socket), so the
+                // variant is constructed on every OS — Windows has no socket.
+                if self.menu_proxy.send_event(UserEvent::OpenSettings).is_err() {
+                    // The event loop is closed; the daemon is shutting down.
+                }
+            }
             Some(crate::tray::TrayAction::Quit) => event_loop.exit(),
         }
         self.refresh_settings();
