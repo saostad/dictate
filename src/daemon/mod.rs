@@ -93,7 +93,6 @@ pub(crate) fn next(state: State, cmd: Command) -> (State, Action, &'static str) 
 }
 
 /// One unit of work for the transcription worker.
-#[derive(Debug)]
 pub(crate) enum Job {
     /// Whole recording at 16 kHz (whole mode): today's exact path.
     Full(Vec<f32>),
@@ -113,6 +112,29 @@ pub(crate) enum Job {
     LiveEnd { stop_time: Instant },
     /// Discard a pauses/Live recording; already-typed text stays.
     Cancel,
+    /// Swap in a freshly loaded TDT model (menu mode switch to whole/pauses);
+    /// drops the Live model, then acks [`UserEvent::ModeSwapped`].
+    SwapTdt(crate::asr::Asr),
+    /// Swap in a freshly loaded Live model (menu mode switch to live); drops
+    /// the TDT model, then acks [`UserEvent::ModeSwapped`].
+    SwapLive(crate::live::Live),
+}
+
+impl std::fmt::Debug for Job {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The models are not `Debug`; variant names are enough for logs.
+        let name = match self {
+            Job::Full(_) => "Full",
+            Job::Segment(_) => "Segment",
+            Job::End { .. } => "End",
+            Job::LiveChunk(_) => "LiveChunk",
+            Job::LiveEnd { .. } => "LiveEnd",
+            Job::Cancel => "Cancel",
+            Job::SwapTdt(_) => "SwapTdt",
+            Job::SwapLive(_) => "SwapLive",
+        };
+        write!(f, "{name}")
+    }
 }
 
 /// Control message for a feeder thread.
@@ -153,6 +175,29 @@ pub(crate) enum UserEvent {
     HotKey(GlobalHotKeyEvent),
     /// A tray menu click.
     Menu(tray_icon::menu::MenuEvent),
+    /// The worker swapped in a pending mode switch's model; the switch can
+    /// complete (save, notify).
+    ModeSwapped,
+    /// A background mode switch failed; already logged + notified, so the
+    /// event loop only clears the loading state.
+    ModeSwitchFailed,
+}
+
+/// A mode switch running on a background thread (the event loop stays
+/// responsive). While one is in flight the tray label reads Loading and start
+/// requests are refused.
+enum ModeSwitch {
+    /// Loading the target mode's model (Live loads always benchmark too).
+    Loading { target: crate::config::Mode },
+}
+
+impl ModeSwitch {
+    /// The mode the switch is heading to.
+    fn target(&self) -> crate::config::Mode {
+        match self {
+            ModeSwitch::Loading { target } => *target,
+        }
+    }
 }
 
 /// Daemon log file, opened when stderr is not a terminal.
@@ -286,6 +331,7 @@ fn run_daemon_inner() -> anyhow::Result<()> {
         .context("Could not start the daemon event loop")?;
     let (to_worker, worker_rx) = mpsc::channel::<Job>();
     let worker_proxy = event_loop.create_proxy();
+    let worker_has_tdt = models.tdt.is_some();
     let worker = std::thread::spawn(move || transcribe_worker(worker_rx, worker_proxy, models));
     #[cfg(unix)]
     {
@@ -301,6 +347,7 @@ fn run_daemon_inner() -> anyhow::Result<()> {
         worker,
         file_settings,
         live_fallback,
+        worker_has_tdt,
         event_loop.create_proxy(),
     );
     setup_hotkey(&event_loop, hotkey, &mut app);
@@ -446,6 +493,10 @@ struct DaemonApp {
     /// Live was requested but failed the startup checks: live recordings run
     /// whole for this session.
     live_fallback: bool,
+    /// The worker holds the TDT model (whole/pauses need no load then).
+    worker_has_tdt: bool,
+    /// A mode switch loading on a background thread, if any.
+    mode_switch: Option<ModeSwitch>,
     tray: Option<crate::tray::Tray>,
     tray_attempted: bool,
     menu_proxy: EventLoopProxy<UserEvent>,
@@ -460,6 +511,7 @@ impl DaemonApp {
         worker: std::thread::JoinHandle<()>,
         settings: crate::config::Settings,
         live_fallback: bool,
+        worker_has_tdt: bool,
         menu_proxy: EventLoopProxy<UserEvent>,
     ) -> Self {
         Self {
@@ -476,6 +528,8 @@ impl DaemonApp {
             worker_gone_notified: false,
             settings,
             live_fallback,
+            worker_has_tdt,
+            mode_switch: None,
             tray: None,
             tray_attempted: false,
             menu_proxy,
@@ -507,7 +561,17 @@ impl DaemonApp {
                     "Restart \"dictate daemon\".",
                 );
             }
+            // A dead worker can't ack a pending swap; don't stay Loading.
+            if self.mode_switch.take().is_some() {
+                self.sync_mode_checks();
+                self.sync_tray();
+            }
             return "err transcription worker stopped; restart \"dictate daemon\"".to_string();
+        }
+        // A switch only starts from Idle, so every start here is a fresh
+        // recording the worker has no model for yet.
+        if self.mode_switch.is_some() && matches!(cmd, Command::Start | Command::Toggle) {
+            return self.model_loading_refused();
         }
         let (new_state, action, ok_reply) = next(self.state, cmd);
         let reply = self.run_action(action, new_state, ok_reply);
@@ -567,10 +631,8 @@ impl DaemonApp {
     /// (no tray: no-op).
     fn sync_tray(&self) {
         if let Some(tray) = &self.tray
-            && let Err(err) = tray.sync_state(
-                self.state,
-                self.settings.mode == crate::config::Mode::Pauses,
-            )
+            && let Err(err) =
+                tray.sync_state(self.state, self.settings.mode, self.mode_switch.is_some())
         {
             dlog!("error: {err:#}");
         }
@@ -592,7 +654,7 @@ impl DaemonApp {
             }
             Some(crate::tray::TrayAction::Sounds) => self.flip_sounds(),
             Some(crate::tray::TrayAction::Notifications) => self.flip_notifications(),
-            Some(crate::tray::TrayAction::Streaming) => self.flip_streaming(),
+            Some(crate::tray::TrayAction::Mode(target)) => self.switch_mode(target),
             Some(crate::tray::TrayAction::Shortcut(display)) => self.switch_hotkey(&display),
             Some(crate::tray::TrayAction::HowTo) => self.open_how_to(),
             Some(crate::tray::TrayAction::OpenConfig) => self.open_settings_file(),
@@ -628,30 +690,96 @@ impl DaemonApp {
         self.sync_tray();
     }
 
-    /// Flip the `Type while speaking` check between whole and pauses, update
-    /// the effective mode, save. Live shows unchecked; clicking it goes to
-    /// pauses (the Mode submenu lands next round).
-    fn flip_streaming(&mut self) {
-        let new = if self.settings.mode == crate::config::Mode::Pauses {
-            crate::config::Mode::Whole
-        } else {
-            crate::config::Mode::Pauses
-        };
-        self.settings.mode = new;
-        crate::config::refresh_mode(new);
-        let checked = new == crate::config::Mode::Pauses;
-        if let Some(tray) = &self.tray {
-            tray.set_streaming_checked(checked);
+    /// Switch the dictation mode from the tray Mode submenu. Whole and pauses
+    /// share the TDT model, so switching between them with it loaded is
+    /// instant; anything else loads the needed model on a background thread
+    /// (Live always benchmarks too) and completes on `ModeSwapped`. Refused
+    /// while recording or transcribing, and while a switch is already running.
+    fn switch_mode(&mut self, target: crate::config::Mode) {
+        if self.state != State::Idle {
+            dlog!(
+                "Mode switch to {} refused: finish the current dictation first",
+                target.as_str()
+            );
+            crate::notify::show(
+                crate::notify::Kind::Info,
+                "dictate",
+                "Finish the current dictation first",
+            );
+            self.sync_mode_checks();
+            return;
         }
-        self.report_save_error(crate::config::save(&self.settings));
-        Self::confirm_settings_change(&crate::tray::SettingsChange::Streaming(checked), false);
+        if self.mode_switch.is_some() {
+            dlog!("Mode switch to {} refused: model loading", target.as_str());
+            crate::notify::show(crate::notify::Kind::Info, "dictate", "Model loading…");
+            self.sync_mode_checks();
+            return;
+        }
+        if target == self.settings.mode {
+            self.sync_mode_checks();
+            return;
+        }
+        if target != crate::config::Mode::Live && self.worker_has_tdt {
+            self.complete_mode_switch(target);
+            return;
+        }
+        self.mode_switch = Some(ModeSwitch::Loading { target });
         self.sync_tray();
+        let previous = self.settings.mode;
+        let to_worker = self.to_worker.clone();
+        let proxy = self.menu_proxy.clone();
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                run_mode_switch_loader(target, previous, &to_worker, &proxy);
+            }));
+            if outcome.is_err() {
+                let message = "the model loader thread panicked";
+                dlog!("error: {message}");
+                crate::notify::show(
+                    crate::notify::Kind::Error,
+                    "dictate: could not switch mode",
+                    message,
+                );
+                send_switch_failed(&proxy);
+            }
+        });
+    }
+
+    /// Finish a mode switch once the worker holds the new model: update the
+    /// settings, save, and confirm. The previous mode is untouched on every
+    /// failure path, so reaching here means the switch landed.
+    fn complete_mode_switch(&mut self, target: crate::config::Mode) {
+        self.settings.mode = target;
+        crate::config::refresh_mode(target);
+        self.worker_has_tdt = target != crate::config::Mode::Live;
+        self.live_fallback = false;
+        self.mode_switch = None;
+        self.report_save_error(crate::config::save(&self.settings));
+        Self::confirm_settings_change(&crate::tray::SettingsChange::Mode(target), true);
+        self.sync_mode_checks();
+        self.sync_tray();
+    }
+
+    /// Check exactly the current file mode in the Mode submenu.
+    fn sync_mode_checks(&self) {
+        if let Some(tray) = &self.tray {
+            tray.sync_mode_checks(self.settings.mode);
+        }
+    }
+
+    /// Log + notify a start request refused while a mode switch loads, and
+    /// build its `err` reply.
+    fn model_loading_refused(&self) -> String {
+        let message = "The speech model is still loading.";
+        dlog!("error: {message}");
+        crate::notify::show(crate::notify::Kind::Error, "dictate", message);
+        "err model loading".to_string()
     }
 
     /// Log a settings change and confirm it with an Info notification, so a
     /// menu that closes on click still gives visible feedback. `force`
-    /// bypasses the notification switch: only the "Notifications: off"
-    /// toggle uses it.
+    /// bypasses the notification switch: the "Notifications: off" toggle and
+    /// mode switches (`Mode: <name>`, always shown) use it.
     fn confirm_settings_change(change: &crate::tray::SettingsChange, force: bool) {
         dlog!("{}", change.log_line());
         let body = change.notification_body();
@@ -1058,9 +1186,138 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
                 self.tap_armed = false;
                 self.sync_tray();
             }
+            UserEvent::ModeSwapped => {
+                // One switch at a time; a stale ack with nothing pending is
+                // ignored.
+                if let Some(target) = self.mode_switch.as_ref().map(ModeSwitch::target) {
+                    self.complete_mode_switch(target);
+                }
+            }
+            UserEvent::ModeSwitchFailed => {
+                if self.mode_switch.take().is_some() {
+                    self.sync_mode_checks();
+                    self.sync_tray();
+                }
+            }
             UserEvent::HotKey(event) => self.handle_hotkey(event),
             UserEvent::Menu(event) => self.handle_menu(event, event_loop),
         }
+    }
+}
+
+/// Background model load for a menu mode switch: loads the target's model
+/// (Live always benchmarks too) and hands it to the transcription worker for
+/// the swap. Exactly one terminal outcome: a `Job::Swap*` sent to the worker
+/// (which acks `UserEvent::ModeSwapped`), or a `UserEvent::ModeSwitchFailed`
+/// after logging + notifying the specific failure. The previous mode is kept
+/// on every failure; nothing is saved.
+fn run_mode_switch_loader(
+    target: crate::config::Mode,
+    previous: crate::config::Mode,
+    to_worker: &mpsc::Sender<Job>,
+    proxy: &EventLoopProxy<UserEvent>,
+) {
+    let swap = match load_switch_model(target, previous) {
+        Ok(swap) => swap,
+        Err(()) => {
+            send_switch_failed(proxy);
+            return;
+        }
+    };
+    if to_worker.send(swap).is_err() {
+        // The worker is gone; `handle_command` reports that itself. Fail the
+        // switch so the next command's report isn't stuck behind Loading.
+        switch_load_failed(anyhow::anyhow!("the transcription worker stopped"));
+        send_switch_failed(proxy);
+    }
+    // Else the worker acks `ModeSwapped` once the swap lands.
+}
+
+/// Load the target's model for a mode switch, as the swap job to send. Live
+/// always runs the speed gate; failures are already logged + notified.
+fn load_switch_model(
+    target: crate::config::Mode,
+    previous: crate::config::Mode,
+) -> Result<Job, ()> {
+    match target {
+        crate::config::Mode::Live => load_live_for_switch(previous).map(Job::SwapLive),
+        crate::config::Mode::Whole | crate::config::Mode::Pauses => {
+            load_tdt_for_switch().map(Job::SwapTdt)
+        }
+    }
+}
+
+/// Load the TDT model for a switch to whole/pauses mode. Failures are logged
+/// + notified with the real error (a missing model names `dictate download`).
+fn load_tdt_for_switch() -> Result<crate::asr::Asr, ()> {
+    let loaded = crate::model::model_dir_checked().and_then(|dir| crate::asr::Asr::load(&dir));
+    match loaded {
+        Ok(asr) => Ok(asr),
+        Err(err) => {
+            switch_load_failed(err);
+            Err(())
+        }
+    }
+}
+
+/// Load the Live model for a switch to live mode and run the speed gate. Too
+/// slow: the too-slow notification, staying on the previous mode.
+fn load_live_for_switch(previous: crate::config::Mode) -> Result<crate::live::Live, ()> {
+    let loaded = (|| -> anyhow::Result<crate::live::Live> {
+        let dir = crate::model::live_model_dir_checked()?;
+        let env = crate::asr::shared_environment()?;
+        let threads = crate::asr::intra_threads();
+        crate::live::Live::load(&dir, &env, threads)
+    })();
+    let mut live = match loaded {
+        Ok(live) => live,
+        Err(err) => {
+            switch_load_failed(err);
+            return Err(());
+        }
+    };
+    let median = check_live_speed(&mut live);
+    if crate::live::is_fast_enough(median) {
+        return Ok(live);
+    }
+    let body = format!(
+        "Needs under 392 ms per 560 ms of audio, took {} ms. Staying on {}.",
+        median.as_millis(),
+        previous.display_name()
+    );
+    dlog!("error: dictate: this computer is too slow for Live mode: {body}");
+    crate::notify::show(
+        crate::notify::Kind::Error,
+        "dictate: this computer is too slow for Live mode",
+        &body,
+    );
+    Err(())
+}
+
+/// Log + notify a mode-switch load failure with the real error. The previous
+/// mode is kept and nothing is saved.
+fn switch_load_failed(err: anyhow::Error) {
+    let message = format!("{err:#}");
+    dlog!("error: dictate: could not switch mode: {message}");
+    crate::notify::show(
+        crate::notify::Kind::Error,
+        "dictate: could not switch mode",
+        &message,
+    );
+}
+
+/// Benchmark the Live model for the speed gate, logging the check first.
+/// Shared by the startup check and menu switches.
+fn check_live_speed(live: &mut crate::live::Live) -> std::time::Duration {
+    dlog!("checking Live speed…");
+    live.benchmark()
+}
+
+/// Tell the event loop a background mode switch failed (already logged +
+/// notified). A closed event loop means the daemon is shutting down.
+fn send_switch_failed(proxy: &EventLoopProxy<UserEvent>) {
+    if proxy.send_event(UserEvent::ModeSwitchFailed).is_err() {
+        // The event loop is closed; the daemon is shutting down.
     }
 }
 
@@ -1810,6 +2067,20 @@ fn transcribe_worker(
                     live_model.reset();
                 }
                 if worker_done(&proxy) {
+                    break;
+                }
+            }
+            Job::SwapTdt(model) => {
+                models.tdt = Some(model);
+                models.live = None;
+                if proxy.send_event(UserEvent::ModeSwapped).is_err() {
+                    break;
+                }
+            }
+            Job::SwapLive(model) => {
+                models.live = Some(model);
+                models.tdt = None;
+                if proxy.send_event(UserEvent::ModeSwapped).is_err() {
                     break;
                 }
             }

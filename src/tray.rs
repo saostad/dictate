@@ -2,9 +2,10 @@
 //!
 //! The icon is a filled circle, grey when idle, red while recording, amber
 //! while transcribing. The menu shows the live state, starts/stops/cancels
-//! dictation, toggles sound cues and notifications (saved to the settings
-//! file), switches the global shortcut, opens the settings file, and quits.
-//! Menu clicks arrive as `UserEvent::Menu` via a winit proxy, like hotkeys.
+//! dictation, toggles sound cues and notifications, switches the dictation
+//! mode (all saved to the settings file), switches the global shortcut, opens
+//! the settings file, and quits. Menu clicks arrive as `UserEvent::Menu` via a
+//! winit proxy, like hotkeys.
 
 use anyhow::Context;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
@@ -35,6 +36,17 @@ pub(crate) const README_USE_IT_URL: &str = "https://github.com/saostad/dictate#u
 
 /// Stable tray identity (SNI id and title), so bars can pin the icon.
 pub(crate) const TRAY_ID: &str = "dictate";
+
+/// Modes offered in the Mode submenu, in order, with their radio labels.
+pub(crate) const MODE_OPTIONS: [(Mode, &str); 3] = [
+    (Mode::Whole, "Whole recording (most accurate)"),
+    (Mode::Pauses, "Type at pauses"),
+    (Mode::Live, "Live — text as you speak (fast computers)"),
+];
+
+/// Text of the disabled status label while a mode switch loads in the
+/// background.
+pub(crate) const LOADING_TEXT: &str = "dictate — Loading…";
 
 /// Pixels, width and height of the tray icon for `state`: a filled circle in
 /// the state color on a transparent background.
@@ -79,15 +91,10 @@ pub(crate) fn toggle_text(state: State) -> &'static str {
     }
 }
 
-/// Tooltip text for `state`: the status plus the typing mode when streaming
-/// is on, so hovering the icon shows the current mode.
-pub(crate) fn tooltip_text(state: State, streaming: bool) -> String {
-    let base = status_text(state);
-    if streaming {
-        format!("{base} (type while speaking)")
-    } else {
-        base.to_string()
-    }
+/// Tooltip text for `state` and `mode`: the status plus the mode name, so
+/// hovering the icon shows the current mode.
+pub(crate) fn tooltip_text(state: State, mode: Mode) -> String {
+    format!("{} ({})", status_text(state), mode.display_name())
 }
 
 /// A settings change made from the tray menu: a checkbox toggle or a
@@ -96,7 +103,7 @@ pub(crate) fn tooltip_text(state: State, streaming: bool) -> String {
 pub(crate) enum SettingsChange {
     Sounds(bool),
     Notifications(bool),
-    Streaming(bool),
+    Mode(Mode),
     Shortcut(String),
 }
 
@@ -108,9 +115,7 @@ impl SettingsChange {
             SettingsChange::Notifications(on) => {
                 format!("Notifications: {}", on_off(*on))
             }
-            SettingsChange::Streaming(on) => {
-                format!("Type while speaking: {}", on_off(*on))
-            }
+            SettingsChange::Mode(mode) => format!("Mode: {}", mode.display_name()),
             SettingsChange::Shortcut(display) => format!("Shortcut: {display}"),
         }
     }
@@ -120,14 +125,7 @@ impl SettingsChange {
         match self {
             SettingsChange::Sounds(on) => format!("settings: sounds = {on}"),
             SettingsChange::Notifications(on) => format!("settings: notifications = {on}"),
-            SettingsChange::Streaming(on) => format!(
-                "settings: mode = {}",
-                if *on {
-                    Mode::Pauses.as_str()
-                } else {
-                    Mode::Whole.as_str()
-                }
-            ),
+            SettingsChange::Mode(mode) => format!("settings: mode = {}", mode.as_str()),
             SettingsChange::Shortcut(display) => format!("settings: hotkey = {display}"),
         }
     }
@@ -145,7 +143,7 @@ pub(crate) enum TrayAction {
     Cancel,
     Sounds,
     Notifications,
-    Streaming,
+    Mode(Mode),
     Shortcut(String),
     HowTo,
     OpenConfig,
@@ -170,7 +168,7 @@ pub(crate) struct Tray {
     cancel: MenuItem,
     sounds: CheckMenuItem,
     notifications: CheckMenuItem,
-    streaming: CheckMenuItem,
+    modes: Vec<(Mode, CheckMenuItem)>,
     shortcut: ShortcutMenu,
     open_config: MenuItem,
     quit: MenuItem,
@@ -206,15 +204,21 @@ pub(crate) fn build_tray(
         settings.notifications,
         None,
     );
-    // The checkbox tracks pauses mode (on = pauses, off = whole); live shows
-    // unchecked until the Mode submenu lands.
-    let streaming = CheckMenuItem::with_id(
-        "dictate-streaming",
-        "Type while speaking",
-        true,
-        settings.mode == Mode::Pauses,
-        None,
-    );
+    let mode_submenu = Submenu::with_id("dictate-mode", "Mode", true);
+    let mut modes = Vec::with_capacity(MODE_OPTIONS.len());
+    for (mode, label) in MODE_OPTIONS {
+        let item = CheckMenuItem::with_id(
+            format!("dictate-mode-{}", mode.as_str()),
+            label,
+            true,
+            settings.mode == mode,
+            None,
+        );
+        mode_submenu
+            .append(&item)
+            .context("Could not build the tray menu")?;
+        modes.push((mode, item));
+    }
     let submenu = Submenu::with_id("dictate-shortcut", "Shortcut", true);
     let shortcut = if crate::hotkey::wayland_session() {
         let note = MenuItem::with_id("dictate-shortcut-note", WAYLAND_SHORTCUT_NOTE, false, None);
@@ -254,7 +258,7 @@ pub(crate) fn build_tray(
         .context("Could not build the tray menu")?;
     menu.append(&notifications)
         .context("Could not build the tray menu")?;
-    menu.append(&streaming)
+    menu.append(&mode_submenu)
         .context("Could not build the tray menu")?;
     menu.append(&submenu)
         .context("Could not build the tray menu")?;
@@ -271,7 +275,7 @@ pub(crate) fn build_tray(
         .with_id(TRAY_ID)
         .with_title(TRAY_ID)
         .with_menu(Box::new(menu))
-        .with_tooltip(tooltip_text(state, settings.mode == Mode::Pauses))
+        .with_tooltip(tooltip_text(state, settings.mode))
         .with_icon(icon)
         .build()
         .map_err(|err| anyhow::anyhow!("Could not create tray icon: {err}"))?;
@@ -290,7 +294,7 @@ pub(crate) fn build_tray(
         cancel,
         sounds,
         notifications,
-        streaming,
+        modes,
         shortcut,
         open_config,
         quit,
@@ -299,8 +303,9 @@ pub(crate) fn build_tray(
 
 impl Tray {
     /// Refresh the icon, tooltip, label and item states after a state or
-    /// settings change.
-    pub(crate) fn sync_state(&self, state: State, streaming: bool) -> anyhow::Result<()> {
+    /// settings change. While a mode switch loads in the background, the label
+    /// reads Loading instead of the state.
+    pub(crate) fn sync_state(&self, state: State, mode: Mode, loading: bool) -> anyhow::Result<()> {
         let (rgba, width, height) = icon_rgba(state);
         let icon = Icon::from_rgba(rgba, width, height)
             .map_err(|err| anyhow::anyhow!("Internal error: tray icon pixels rejected: {err}"))?;
@@ -308,9 +313,13 @@ impl Tray {
             .set_icon(Some(icon))
             .map_err(|err| anyhow::anyhow!("Could not update the tray icon: {err}"))?;
         self.icon
-            .set_tooltip(Some(tooltip_text(state, streaming)))
+            .set_tooltip(Some(tooltip_text(state, mode)))
             .map_err(|err| anyhow::anyhow!("Could not update the tray tooltip: {err}"))?;
-        self.status.set_text(status_text(state));
+        self.status.set_text(if loading {
+            LOADING_TEXT
+        } else {
+            status_text(state)
+        });
         self.toggle.set_text(toggle_text(state));
         self.toggle.set_enabled(state != State::Transcribing);
         self.cancel.set_enabled(state == State::Recording);
@@ -331,8 +340,8 @@ impl Tray {
         if *id == *self.notifications.id() {
             return Some(TrayAction::Notifications);
         }
-        if *id == *self.streaming.id() {
-            return Some(TrayAction::Streaming);
+        if let Some((mode, _)) = self.modes.iter().find(|(_, item)| *id == *item.id()) {
+            return Some(TrayAction::Mode(*mode));
         }
         if *id == *self.open_config.id() {
             return Some(TrayAction::OpenConfig);
@@ -365,9 +374,11 @@ impl Tray {
         self.notifications.set_checked(checked);
     }
 
-    /// Set the `Type while speaking` check explicitly.
-    pub(crate) fn set_streaming_checked(&self, checked: bool) {
-        self.streaming.set_checked(checked);
+    /// Check exactly the current mode in the Mode submenu (radio behavior).
+    pub(crate) fn sync_mode_checks(&self, current: Mode) {
+        for (mode, item) in &self.modes {
+            item.set_checked(*mode == current);
+        }
     }
 
     /// Check exactly the current shortcut (radio behavior).
@@ -470,20 +481,40 @@ mod tests {
     }
 
     #[test]
-    fn tooltip_shows_state_and_streaming_mode() {
-        assert_eq!(tooltip_text(State::Idle, false), "dictate — Idle");
+    fn tooltip_shows_state_and_mode_name() {
         assert_eq!(
-            tooltip_text(State::Idle, true),
-            "dictate — Idle (type while speaking)"
+            tooltip_text(State::Idle, Mode::Whole),
+            "dictate — Idle (Whole)"
         );
         assert_eq!(
-            tooltip_text(State::Recording, true),
-            "dictate — Recording… (type while speaking)"
+            tooltip_text(State::Idle, Mode::Pauses),
+            "dictate — Idle (Pauses)"
         );
         assert_eq!(
-            tooltip_text(State::Transcribing, false),
-            "dictate — Transcribing…"
+            tooltip_text(State::Recording, Mode::Live),
+            "dictate — Recording… (Live)"
         );
+        assert_eq!(
+            tooltip_text(State::Transcribing, Mode::Whole),
+            "dictate — Transcribing… (Whole)"
+        );
+    }
+
+    #[test]
+    fn mode_menu_lists_every_mode_once_with_its_label() {
+        let modes: Vec<Mode> = MODE_OPTIONS.iter().map(|(mode, _)| *mode).collect();
+        assert_eq!(modes, vec![Mode::Whole, Mode::Pauses, Mode::Live]);
+        assert_eq!(MODE_OPTIONS[0].1, "Whole recording (most accurate)");
+        assert_eq!(MODE_OPTIONS[1].1, "Type at pauses");
+        assert_eq!(
+            MODE_OPTIONS[2].1,
+            "Live — text as you speak (fast computers)"
+        );
+    }
+
+    #[test]
+    fn loading_label_text() {
+        assert_eq!(LOADING_TEXT, "dictate — Loading…");
     }
 
     #[test]
@@ -510,14 +541,19 @@ mod tests {
                 "settings: notifications = false",
             ),
             (
-                SettingsChange::Streaming(true),
-                "Type while speaking: on",
+                SettingsChange::Mode(Mode::Whole),
+                "Mode: Whole",
+                "settings: mode = whole",
+            ),
+            (
+                SettingsChange::Mode(Mode::Pauses),
+                "Mode: Pauses",
                 "settings: mode = pauses",
             ),
             (
-                SettingsChange::Streaming(false),
-                "Type while speaking: off",
-                "settings: mode = whole",
+                SettingsChange::Mode(Mode::Live),
+                "Mode: Live",
+                "settings: mode = live",
             ),
             (
                 SettingsChange::Shortcut("Ctrl+Alt+D".to_string()),

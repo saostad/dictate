@@ -39,6 +39,16 @@ impl Mode {
         }
     }
 
+    /// Short display name for the tray tooltip and the `Mode: <name>`
+    /// notification.
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            Mode::Whole => "Whole",
+            Mode::Pauses => "Pauses",
+            Mode::Live => "Live",
+        }
+    }
+
     /// Parse one mode value; `None` for anything else.
     pub(crate) fn parse(value: &str) -> Option<Self> {
         match value {
@@ -493,6 +503,13 @@ mod tests {
         assert_eq!(resolve_mode(Mode::Whole, None, Some("0")), Mode::Whole);
         assert_eq!(resolve_mode(Mode::Live, None, Some("0")), Mode::Whole);
         assert_eq!(resolve_mode(Mode::Live, None, Some("")), Mode::Pauses);
+    }
+
+    #[test]
+    fn mode_display_names() {
+        assert_eq!(Mode::Whole.display_name(), "Whole");
+        assert_eq!(Mode::Pauses.display_name(), "Pauses");
+        assert_eq!(Mode::Live.display_name(), "Live");
     }
 
     #[test]

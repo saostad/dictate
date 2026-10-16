@@ -132,9 +132,10 @@ Shortcuts.
 
 `dictate daemon` shows a tray icon: grey when idle, red while recording,
 amber while transcribing. Its menu shows the live state, starts/stops/cancels
-dictation, toggles sound cues, notifications and type-while-speaking (saved to
-the settings file), switches the global shortcut (on Wayland it explains the
-compositor keybinds instead), opens the settings file, and quits the daemon.
+dictation, toggles sound cues and notifications, switches the dictation mode
+(saved to the settings file), switches the global shortcut (on Wayland it
+explains the compositor keybinds instead), opens the settings file, and quits
+the daemon.
 Without a tray host the daemon logs `dictate: no tray icon` once and keeps
 running headless.
 
@@ -146,9 +147,9 @@ running headless.
 | Pauses | `mode = "pauses"` | types each pause segment while speaking | high: 1.5 s of left context per piece | most text is already typed at stop |
 | Live | `mode = "live"` | types while speaking, chunk by chunk | good: true streaming model | fastest: text appears as you talk |
 
-Set the mode in the settings file or with `DICTATE_MODE=live`. The tray
-menu's "Type while speaking" checkbox toggles pauses mode for now (a Mode
-submenu is coming).
+Set the mode in the settings file, with `DICTATE_MODE=live`, or from the
+tray menu's Mode submenu (it switches live, loading the needed model on a
+background thread; picking Live downloads its model first when missing).
 
 Pauses mode finds pauses with the Silero voice detector, which
 `dictate download` fetches (2.3 MB). Cancel can't un-type pieces already

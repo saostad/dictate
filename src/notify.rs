@@ -56,8 +56,10 @@ pub(crate) fn show(kind: Kind, summary: &str, body: &str) {
 }
 
 /// Show a desktop notification even when notifications are disabled. Only
-/// for the "Notifications: off" toggle itself: the confirmation of that
-/// action. Returns immediately; failures warn once per process.
+/// for user-action confirmations the menu can't show otherwise: the
+/// "Notifications: off" toggle itself (the confirmation of that action) and
+/// mode switches (`Mode: <name>`). Returns immediately; failures warn once per
+/// process.
 pub(crate) fn show_forced(kind: Kind, summary: &str, body: &str) {
     let owned = (summary.to_owned(), body.to_owned());
     std::thread::spawn(move || {
