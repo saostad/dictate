@@ -17,12 +17,28 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1, zwp_virtual_keyboard_v1,
 };
 
-/// First xkb keycode used in our keymaps.
-const FIRST_KEYCODE: u32 = 9;
-/// Last usable xkb keycode (xkb maximum is 255).
-const LAST_KEYCODE: u32 = 255;
-/// Unique characters per keymap upload.
-const KEYMAP_CAPACITY: usize = (LAST_KEYCODE - FIRST_KEYCODE + 1) as usize;
+/// xkb keycode for `' '` (evdev 57 KEY_SPACE).
+const SPACE_KEYCODE: u32 = 65;
+/// xkb keycode for `'\n'` (evdev 28 KEY_ENTER).
+const ENTER_KEYCODE: u32 = 36;
+/// xkb keycode for `'\t'` (evdev 15 KEY_TAB).
+const TAB_KEYCODE: u32 = 23;
+/// Pool of xkb keycodes for every other character: ordinary character keys
+/// only (evdev 2-13, 16-27, 30-41, 43-53, i.e. the main alphanumeric and
+/// punctuation block). Text must never land on ESC, BACKSPACE, TAB, ENTER,
+/// modifiers, CAPSLOCK, F-keys, navigation, keypad or media keys: apps that
+/// interpret keys by their physical evdev code would misread them (e.g. a
+/// leading space on evdev 1 reads as Escape and gets dropped).
+const POOL_KEYCODES: [u32; 47] = [
+    10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, // evdev 2-13
+    24, 25, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35, // evdev 16-27
+    38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, // evdev 30-41
+    51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, // evdev 43-53
+];
+/// Unique characters per keymap upload. The fixed-code characters (space, tab,
+/// newline) don't consume pool codes, so counting every unique char against
+/// the pool size is conservative and always safe.
+const KEYMAP_CAPACITY: usize = POOL_KEYCODES.len();
 /// xkb keycode = evdev keycode + 8; the `key` request takes evdev codes.
 const EVDEV_OFFSET: u32 = 8;
 
@@ -259,11 +275,14 @@ fn split_batches(text: &str) -> Vec<&str> {
     batches
 }
 
-/// Build an xkb keymap string mapping keycodes [`FIRST_KEYCODE`].. to the
-/// unique characters of `batch` (first-seen order), plus the char→keycode
-/// map. Keysyms are `U{:04X}` (`Return`/`Tab` for newline/tab), so no
-/// modifiers are needed. Callers must keep batches within [`KEYMAP_CAPACITY`]
-/// unique characters (see [`split_batches`]).
+/// Build an xkb keymap string mapping the unique characters of `batch` to
+/// physical-safe keycodes (first-seen order within the pool), plus the
+/// char→keycode map. `' '`/`\n`/`\t` get the real KEY_SPACE/KEY_ENTER/KEY_TAB
+/// codes; every other char gets a code from [`POOL_KEYCODES`]. Keysyms are the
+/// xkb names for space/Return/Tab and `U{:04X}` otherwise, so no modifiers are
+/// needed. Callers must keep batches within [`KEYMAP_CAPACITY`] unique
+/// characters (see [`split_batches`]); a char past the end of the pool is left
+/// out and fails loudly in `type_text`, which names it.
 fn build_keymap(batch: &str) -> (String, HashMap<char, u32>) {
     let mut chars: Vec<char> = Vec::new();
     for ch in batch.chars() {
@@ -271,18 +290,32 @@ fn build_keymap(batch: &str) -> (String, HashMap<char, u32>) {
             chars.push(ch);
         }
     }
+    let mut pairs: Vec<(char, u32)> = Vec::with_capacity(chars.len());
+    let mut pool = POOL_KEYCODES.iter();
+    for ch in chars {
+        let code = match ch {
+            ' ' => SPACE_KEYCODE,
+            '\n' => ENTER_KEYCODE,
+            '\t' => TAB_KEYCODE,
+            _ => {
+                let Some(code) = pool.next() else {
+                    continue;
+                };
+                *code
+            }
+        };
+        pairs.push((ch, code));
+    }
     let mut keymap = String::from(
         "xkb_keymap {\n    xkb_keycodes \"dictate\" {\n        minimum = 8;\n        maximum = 255;\n",
     );
-    let mut keycodes = HashMap::with_capacity(chars.len());
-    for (index, ch) in chars.iter().enumerate() {
-        let code = FIRST_KEYCODE + index as u32;
+    let mut keycodes = HashMap::with_capacity(pairs.len());
+    for (ch, code) in &pairs {
         keymap.push_str(&format!("        <K{code}> = {code};\n"));
-        keycodes.insert(*ch, code);
+        keycodes.insert(*ch, *code);
     }
     keymap.push_str("    };\n    xkb_types \"dictate\" {\n        include \"complete\"\n    };\n    xkb_compat \"dictate\" {\n        include \"complete\"\n    };\n    xkb_symbols \"dictate\" {\n");
-    for (index, ch) in chars.iter().enumerate() {
-        let code = FIRST_KEYCODE + index as u32;
+    for (ch, code) in &pairs {
         let keysym = keysym_name(*ch);
         keymap.push_str(&format!("        key <K{code}> {{ [ {keysym} ] }};\n"));
     }
@@ -290,9 +323,11 @@ fn build_keymap(batch: &str) -> (String, HashMap<char, u32>) {
     (keymap, keycodes)
 }
 
-/// xkb keysym name for one character: `U{:04X}` (`Return`/`Tab` for `\n`/`\t`).
+/// xkb keysym name for one character: `space`/`Return`/`Tab` for `' '`/`\n`/`\t`,
+/// `U{:04X}` otherwise.
 fn keysym_name(ch: char) -> String {
     match ch {
+        ' ' => "space".to_string(),
         '\n' => "Return".to_string(),
         '\t' => "Tab".to_string(),
         _ => format!("U{:04X}", ch as u32),
@@ -307,16 +342,16 @@ mod tests {
     fn keymap_assigns_keycodes_in_first_seen_order() {
         let (keymap, codes) = build_keymap("bbaac");
         assert_eq!(codes.len(), 3);
-        assert_eq!(codes[&'b'], 9);
-        assert_eq!(codes[&'a'], 10);
-        assert_eq!(codes[&'c'], 11);
-        assert!(keymap.contains("<K9> = 9;"), "missing keycode:\n{keymap}");
+        assert_eq!(codes[&'b'], 10);
+        assert_eq!(codes[&'a'], 11);
+        assert_eq!(codes[&'c'], 12);
+        assert!(keymap.contains("<K10> = 10;"), "missing keycode:\n{keymap}");
         assert!(
-            keymap.contains("key <K9> { [ U0062 ] };"),
+            keymap.contains("key <K10> { [ U0062 ] };"),
             "missing key:\n{keymap}"
         );
         assert!(
-            keymap.contains("key <K10> { [ U0061 ] };"),
+            keymap.contains("key <K11> { [ U0061 ] };"),
             "missing key:\n{keymap}"
         );
     }
@@ -324,26 +359,71 @@ mod tests {
     #[test]
     fn keymap_names_newline_tab_and_non_ascii() {
         let (keymap, codes) = build_keymap("a\n\té—");
-        assert_eq!(codes[&'\n'], 10);
-        assert_eq!(codes[&'\t'], 11);
-        assert_eq!(codes[&'é'], 12);
-        assert_eq!(codes[&'—'], 13);
+        assert_eq!(codes[&'a'], 10);
+        assert_eq!(codes[&'\n'], 36);
+        assert_eq!(codes[&'\t'], 23);
+        assert_eq!(codes[&'é'], 11);
+        assert_eq!(codes[&'—'], 12);
         assert!(
-            keymap.contains("key <K10> { [ Return ] };"),
+            keymap.contains("key <K36> { [ Return ] };"),
             "missing Return:\n{keymap}"
         );
         assert!(
-            keymap.contains("key <K11> { [ Tab ] };"),
+            keymap.contains("key <K23> { [ Tab ] };"),
             "missing Tab:\n{keymap}"
         );
         assert!(
-            keymap.contains("key <K12> { [ U00E9 ] };"),
+            keymap.contains("key <K11> { [ U00E9 ] };"),
             "missing é:\n{keymap}"
         );
         assert!(
-            keymap.contains("key <K13> { [ U2014 ] };"),
+            keymap.contains("key <K12> { [ U2014 ] };"),
             "missing —:\n{keymap}"
         );
+    }
+
+    #[test]
+    fn space_uses_key_space_even_when_first() {
+        let (keymap, codes) = build_keymap(" abc");
+        assert_eq!(codes[&' '], 65);
+        assert_eq!(codes[&'a'], 10);
+        assert!(
+            keymap.contains("key <K65> { [ space ] };"),
+            "missing space key:\n{keymap}"
+        );
+    }
+
+    #[test]
+    fn pool_uses_only_ordinary_character_keys() {
+        // Forbidden physical keys: ESC, BACKSPACE, TAB, ENTER, modifiers,
+        // CAPSLOCK, F-keys, navigation/arrows, keypad, media (evdev codes).
+        const FORBIDDEN_EVDEV: &[u32] = &[
+            1, 14, 15, 28, // ESC, BACKSPACE, TAB, ENTER
+            29, 42, 54, 56, 97, 100, 125, 126, 127, // modifiers
+            58,  // CAPSLOCK
+            59, 60, 61, 62, 63, 64, 65, 66, 67, 68, 87, 88, // F1-F12
+            102, 103, 104, 105, 106, 107, 108, 109, 110, 111, // nav/arrows
+            55, 69, 70, 71, 72, 73, 74, 75, 76, 77, 78, 79, 80, 81, 82, 83, 96, 98, // keypad
+            113, 114, 115, 116, // media/power
+        ];
+        for code in POOL_KEYCODES {
+            let evdev = code - EVDEV_OFFSET;
+            assert!(
+                !FORBIDDEN_EVDEV.contains(&evdev),
+                "pool keycode {code} is forbidden evdev {evdev}"
+            );
+            assert!(
+                (2..=13).contains(&evdev)
+                    || (16..=27).contains(&evdev)
+                    || (30..=41).contains(&evdev)
+                    || (43..=53).contains(&evdev),
+                "pool keycode {code} is outside the character block (evdev {evdev})"
+            );
+        }
+        // The fixed codes are the one exception: each matches its own key.
+        assert_eq!(SPACE_KEYCODE - EVDEV_OFFSET, 57); // KEY_SPACE
+        assert_eq!(ENTER_KEYCODE - EVDEV_OFFSET, 28); // KEY_ENTER
+        assert_eq!(TAB_KEYCODE - EVDEV_OFFSET, 15); // KEY_TAB
     }
 
     #[test]
@@ -364,18 +444,32 @@ mod tests {
 
     #[test]
     fn batches_split_beyond_capacity_on_char_boundaries() {
-        // 300 unique chars (private-use range) → 247 + 53, chars in order.
+        // 300 unique chars (private-use range) → 6×47 + 18, chars in order.
         let text: String = (0..300)
             .map(|i| char::from_u32(0xE000 + i).unwrap())
             .collect();
         let batches = split_batches(&text);
-        assert_eq!(batches.len(), 2);
+        assert_eq!(batches.len(), 7);
         assert_eq!(batches.concat(), text);
-        assert_eq!(batches[0].chars().count(), 247);
-        assert_eq!(batches[1].chars().count(), 53);
+        for batch in &batches[..6] {
+            assert_eq!(batch.chars().count(), 47);
+        }
+        assert_eq!(batches[6].chars().count(), 18);
         // Repeated chars don't consume capacity.
         assert_eq!(split_batches(&"ab".repeat(1000)).len(), 1);
         assert!(split_batches("").is_empty());
+    }
+
+    #[test]
+    fn sixty_unique_chars_split_into_two_batches() {
+        let text: String = (0..60)
+            .map(|i| char::from_u32(0xE100 + i).unwrap())
+            .collect();
+        let batches = split_batches(&text);
+        assert_eq!(batches.len(), 2);
+        assert_eq!(batches.concat(), text);
+        assert_eq!(batches[0].chars().count(), 47);
+        assert_eq!(batches[1].chars().count(), 13);
     }
 
     #[test]
@@ -386,8 +480,26 @@ mod tests {
     }
 
     #[test]
-    fn capacity_fits_the_xkb_keycode_range() {
-        assert_eq!(KEYMAP_CAPACITY, 247);
-        assert_eq!(FIRST_KEYCODE + KEYMAP_CAPACITY as u32 - 1, LAST_KEYCODE);
+    fn keymap_capacity_matches_the_pool() {
+        assert_eq!(KEYMAP_CAPACITY, 47);
+        assert_eq!(POOL_KEYCODES.len(), KEYMAP_CAPACITY);
+        let mut seen = std::collections::HashSet::new();
+        for code in POOL_KEYCODES {
+            assert!(
+                (9..=255).contains(&code),
+                "pool code {code} out of xkb range"
+            );
+            assert!(seen.insert(code), "pool code {code} duplicated");
+        }
+        for fixed in [SPACE_KEYCODE, ENTER_KEYCODE, TAB_KEYCODE] {
+            assert!(
+                (9..=255).contains(&fixed),
+                "fixed code {fixed} out of xkb range"
+            );
+            assert!(
+                !POOL_KEYCODES.contains(&fixed),
+                "fixed code {fixed} collides with the pool"
+            );
+        }
     }
 }
