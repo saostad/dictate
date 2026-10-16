@@ -22,6 +22,8 @@ use winit::event_loop::ActiveEventLoop;
 use winit::raw_window_handle::HasWindowHandle;
 use winit::window::{Window, WindowAttributes, WindowId};
 
+pub(crate) mod page;
+
 /// Window title.
 pub(crate) const SETTINGS_TITLE: &str = "Dictate Settings";
 /// Initial inner size in logical pixels.
@@ -218,12 +220,23 @@ impl SettingsWindow {
     ) -> anyhow::Result<Duration> {
         let raw_input = self.egui_winit.take_egui_input(&self.window);
         let egui::FullOutput {
-            platform_output,
+            mut platform_output,
             mut textures_delta,
             shapes,
             pixels_per_point,
             viewport_output,
         } = self.egui_ctx.run_ui(raw_input, run_ui);
+        // Open clicked links through the daemon's opener (with error
+        // reporting) instead of egui-winit's silent one.
+        let mut urls = Vec::new();
+        platform_output.commands.retain(|command| {
+            if let egui::OutputCommand::OpenUrl(open) = command {
+                urls.push(open.url.clone());
+                false
+            } else {
+                true
+            }
+        });
         let mut repaint_delay = Duration::MAX;
         for (_, output) in viewport_output {
             repaint_delay = repaint_delay.min(output.repaint_delay);
@@ -246,6 +259,13 @@ impl SettingsWindow {
             event_loop,
             platform_output,
         );
+        for url in urls {
+            if let Err(err) = crate::tray::open_target(&url) {
+                let message = format!("{err:#}");
+                crate::daemon::log_line(format_args!("error: {message}"));
+                crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
+            }
+        }
         let clipped = self.egui_ctx.tessellate(shapes, pixels_per_point);
         let (width, height): (u32, u32) = self.window.inner_size().into();
         let clear = self.egui_ctx.global_style().visuals.panel_fill;
@@ -270,14 +290,6 @@ impl Drop for SettingsWindow {
         // itself is destroyed with the remaining fields right after.
         self.painter.destroy();
     }
-}
-
-/// Temporary page until the real settings page lands.
-pub(crate) fn placeholder(ui: &mut egui::Ui) {
-    egui::CentralPanel::default().show(ui, |ui| {
-        ui.heading("Dictate Settings");
-        ui.label("Settings are moving here.");
-    });
 }
 
 #[cfg(test)]

@@ -29,7 +29,7 @@ pub(crate) mod socket;
 
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::Context;
@@ -216,6 +216,47 @@ pub(crate) enum UserEvent {
     /// Open the Settings window (`dictate settings` from the socket; the tray
     /// menu calls `open_settings` directly).
     OpenSettings,
+    /// Background mode-switch progress changed; repaint the Settings window
+    /// if it is open.
+    SettingsRefresh,
+}
+
+/// Progress of a background mode switch, shared between the loader thread and
+/// the Settings page (which shows it inline; the tray label shows Loading).
+#[derive(Debug, Clone, Default)]
+pub(crate) struct SwitchProgress {
+    /// Live-model download progress, 0–100.
+    pub percent: u64,
+    /// The Live speed check is running now.
+    pub checking_speed: bool,
+    /// The last Live speed-check outcome this session, if one ran.
+    pub last_check: Option<LiveSpeedCheck>,
+}
+
+/// One Live speed-check outcome: measured ms per 560 ms chunk, and whether
+/// the machine is fast enough for Live mode.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LiveSpeedCheck {
+    pub ms: u64,
+    pub fast: bool,
+}
+
+impl LiveSpeedCheck {
+    /// Build from a benchmark median: measured ms plus the speed-gate verdict.
+    pub(crate) fn new(median: Duration) -> Self {
+        Self {
+            ms: median.as_millis().min(u128::from(u64::MAX)) as u64,
+            fast: crate::live::is_fast_enough(median),
+        }
+    }
+}
+
+/// Lock the shared switch progress. A poisoned lock yields its value: a
+/// panicked loader thread already failed the switch loudly.
+fn lock_progress(progress: &Mutex<SwitchProgress>) -> MutexGuard<'_, SwitchProgress> {
+    progress
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// A mode switch running on a background thread (the event loop stays
@@ -390,7 +431,8 @@ fn run_daemon_inner() -> anyhow::Result<()> {
             .map_err(|message| anyhow::anyhow!("{message}"))?,
     };
     let load_start = Instant::now();
-    let (models, live_fallback) = load_daemon_models(dictation_mode())?;
+    let switch_progress = Arc::new(Mutex::new(SwitchProgress::default()));
+    let (models, live_fallback) = load_daemon_models(dictation_mode(), &switch_progress)?;
     #[cfg(unix)]
     let socket_file = {
         let path = socket::socket_path()?;
@@ -441,6 +483,7 @@ fn run_daemon_inner() -> anyhow::Result<()> {
         file_settings,
         live_fallback,
         worker_has_tdt,
+        switch_progress,
         event_loop.create_proxy(),
     );
     setup_hotkey(&event_loop, hotkey, &mut app);
@@ -463,8 +506,11 @@ struct WorkerModels {
 /// Load the model the startup mode needs. Live mode checks the model files
 /// and the speed gate first; either failure logs + notifies and falls back to
 /// whole mode for this session. The caller prints Ready once the socket is
-/// bound too.
-fn load_daemon_models(mode: crate::config::Mode) -> anyhow::Result<(WorkerModels, bool)> {
+/// bound too. A startup speed check records its outcome for the Settings page.
+fn load_daemon_models(
+    mode: crate::config::Mode,
+    progress: &Mutex<SwitchProgress>,
+) -> anyhow::Result<(WorkerModels, bool)> {
     if mode != crate::config::Mode::Live {
         return load_tdt_models(false);
     }
@@ -482,7 +528,7 @@ fn load_daemon_models(mode: crate::config::Mode) -> anyhow::Result<(WorkerModels
     let env = crate::asr::shared_environment()?;
     let threads = crate::asr::intra_threads();
     let mut live = crate::live::Live::load(&dir, &env, threads)?;
-    let median = check_live_speed(&mut live);
+    let median = check_live_speed(&mut live, progress);
     if !crate::live::is_fast_enough(median) {
         let body = format!(
             "Needs under 392 ms per 560 ms of audio, took {} ms. Using Whole recording.",
@@ -595,6 +641,17 @@ struct DaemonApp {
     mics: Vec<crate::mic::Mic>,
     /// Display name of the microphone the current (or last) recording uses.
     active_mic: Option<String>,
+    /// Progress of a background mode switch, shared with the loader thread
+    /// and shown inline in the Settings page.
+    switch_progress: Arc<Mutex<SwitchProgress>>,
+    /// Last shortcut-switch error, shown inline in the Settings page
+    /// (cleared on success and when the window opens).
+    last_shortcut_error: Option<String>,
+    /// Cached start-at-login state for the Settings page (queried when the
+    /// window opens and after each toggle, never per frame).
+    autostart_cache: Option<bool>,
+    /// Last start-at-login error, shown inline in the Settings page.
+    autostart_error: Option<String>,
     menu_proxy: EventLoopProxy<UserEvent>,
     /// Held so the registration stays alive; dropping it would unregister.
     /// Never read, hence the underscore.
@@ -608,6 +665,7 @@ impl DaemonApp {
         settings: crate::config::Settings,
         live_fallback: bool,
         worker_has_tdt: bool,
+        switch_progress: Arc<Mutex<SwitchProgress>>,
         menu_proxy: EventLoopProxy<UserEvent>,
     ) -> Self {
         Self {
@@ -632,6 +690,10 @@ impl DaemonApp {
             mic_session: crate::mic::MicSession::new(),
             mics: Vec::new(),
             active_mic: None,
+            switch_progress,
+            last_shortcut_error: None,
+            autostart_cache: None,
+            autostart_error: None,
             menu_proxy,
             _hotkey_manager: None,
         }
@@ -679,6 +741,7 @@ impl DaemonApp {
             self.tap_armed = false;
         }
         self.sync_tray();
+        self.refresh_settings();
         reply
     }
 
@@ -848,6 +911,7 @@ impl DaemonApp {
             Some(crate::tray::TrayAction::Settings) => self.open_settings(event_loop),
             Some(crate::tray::TrayAction::Quit) => event_loop.exit(),
         }
+        self.refresh_settings();
     }
 
     /// Flip the `Sound cues` check, update the effective switch, save.
@@ -928,9 +992,17 @@ impl DaemonApp {
         let previous = self.settings.mode;
         let to_worker = self.to_worker.clone();
         let proxy = self.menu_proxy.clone();
+        let progress = Arc::clone(&self.switch_progress);
         std::thread::spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_mode_switch_loader(target, previous, download_first, &to_worker, &proxy);
+                run_mode_switch_loader(
+                    target,
+                    previous,
+                    download_first,
+                    &to_worker,
+                    &proxy,
+                    &progress,
+                );
             }));
             if outcome.is_err() {
                 let message = "the model loader thread panicked";
@@ -1007,6 +1079,7 @@ impl DaemonApp {
     /// and save. Failures notify and keep the old shortcut checked.
     fn switch_hotkey(&mut self, display: &str) {
         if display == self.hotkey_display {
+            self.last_shortcut_error = None;
             self.sync_shortcut_checks();
             return;
         }
@@ -1046,6 +1119,7 @@ impl DaemonApp {
         self.hotkey_display = display.to_string();
         self.press_started = None;
         self.tap_armed = false;
+        self.last_shortcut_error = None;
         self.settings.hotkey = display.to_string();
         self.report_save_error(crate::config::save(&self.settings));
         self.sync_shortcut_checks();
@@ -1057,8 +1131,10 @@ impl DaemonApp {
         self.sync_tray();
     }
 
-    /// Notify a failed shortcut switch and re-check the current shortcut.
-    fn shortcut_failed(&self, display: &str, err: &str) {
+    /// Record a failed shortcut switch for the Settings page's inline error,
+    /// notify it, and re-check the current shortcut.
+    fn shortcut_failed(&mut self, display: &str, err: &str) {
+        self.last_shortcut_error = Some(err.to_string());
         crate::notify::show(
             crate::notify::Kind::Error,
             &format!("dictate: could not use shortcut {display}"),
@@ -1114,6 +1190,21 @@ impl DaemonApp {
             window.focus();
             return;
         }
+        // Fresh per-open page state: stale errors go, and start-at-login is
+        // queried once (never per frame).
+        self.last_shortcut_error = None;
+        match crate::autostart::status() {
+            Ok(status) => {
+                self.autostart_cache = Some(status.enabled);
+                self.autostart_error = None;
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                dlog!("error: {message}");
+                self.autostart_cache = None;
+                self.autostart_error = Some(message);
+            }
+        }
         match crate::settings_ui::SettingsWindow::open(event_loop) {
             Ok(window) => {
                 // Focus the new window too: on macOS the app is Accessory and
@@ -1135,17 +1226,43 @@ impl DaemonApp {
     }
 
     /// Paint one Settings frame. The window is taken out while egui runs so
-    /// the page can read daemon state; a frame failure drops it (already out),
-    /// and the daemon keeps running.
+    /// the page can read daemon state; the page's intents apply after the
+    /// frame through the tray's code paths. A frame failure drops the window
+    /// (already out), and the daemon keeps running.
     fn redraw_settings(&mut self, event_loop: &ActiveEventLoop) {
         let Some(mut window) = self.settings_window.take() else {
             return;
         };
-        match window.redraw(event_loop, crate::settings_ui::placeholder) {
+        let progress = lock_progress(&self.switch_progress).clone();
+        let view = crate::settings_ui::page::PageView {
+            settings: &self.settings,
+            mics: &self.mics,
+            active_mic: self.active_mic.as_deref(),
+            switch_target: self.mode_switch.as_ref().map(ModeSwitch::target),
+            downloading: matches!(self.mode_switch, Some(ModeSwitch::Downloading)),
+            download_percent: progress.percent,
+            checking_speed: progress.checking_speed,
+            last_speed_check: progress.last_check,
+            hotkey_display: &self.hotkey_display,
+            wayland: crate::hotkey::wayland_session(),
+            autostart_on: self.autostart_cache,
+            autostart_error: self.autostart_error.as_deref(),
+            shortcut_error: self.last_shortcut_error.as_deref(),
+            version: env!("CARGO_PKG_VERSION"),
+        };
+        let mut actions = Vec::new();
+        let outcome = window.redraw(event_loop, |ui| {
+            actions = crate::settings_ui::page::show_page(ui, &view);
+        });
+        match outcome {
             Ok(delay) => {
-                if delay.is_zero() {
-                    // egui wants another frame immediately (an animation or a
-                    // follow-up layout): repaint without leaving Wait.
+                let changed = !actions.is_empty();
+                for action in actions {
+                    self.apply_page_action(action);
+                }
+                if changed || delay.is_zero() {
+                    // Changed settings repaint at once; an animation or a
+                    // follow-up layout repaints without leaving Wait.
                     window.request_redraw();
                 } else if delay != Duration::MAX {
                     // A delayed repaint (a tooltip or blink): sleep until then.
@@ -1163,6 +1280,79 @@ impl DaemonApp {
                 );
                 event_loop.set_control_flow(ControlFlow::Wait);
             }
+        }
+    }
+
+    /// Repaint the Settings window if it is open (daemon state changed under
+    /// it). Closed: no-op.
+    fn refresh_settings(&self) {
+        if let Some(window) = &self.settings_window {
+            window.request_redraw();
+        }
+    }
+
+    /// Apply one Settings-page intent through the same code path the tray menu
+    /// uses for the same change.
+    fn apply_page_action(&mut self, action: crate::settings_ui::page::PageAction) {
+        use crate::settings_ui::page::PageAction;
+        match action {
+            PageAction::SelectMic(id) => self.switch_microphone(&id),
+            PageAction::RefreshMics => self.refresh_microphones(),
+            PageAction::SelectMode(mode) => self.switch_mode(mode),
+            PageAction::SelectShortcut(display) => self.switch_hotkey(&display),
+            PageAction::ToggleSounds => self.flip_sounds(),
+            PageAction::ToggleNotifications => self.flip_notifications(),
+            PageAction::SetAutostart(on) => self.apply_autostart(on),
+            PageAction::OpenLog => self.open_daemon_log(),
+            PageAction::OpenReleases => self.open_releases(),
+        }
+    }
+
+    /// Turn start-at-login on or off from the Settings page, caching the
+    /// outcome for the checkbox and the inline error.
+    fn apply_autostart(&mut self, on: bool) {
+        let outcome = if on {
+            crate::autostart::enable()
+        } else {
+            crate::autostart::disable()
+        }
+        .and_then(|()| crate::autostart::status());
+        match outcome {
+            Ok(status) => {
+                self.autostart_cache = Some(status.enabled);
+                self.autostart_error = None;
+                dlog!(
+                    "Start at login: {}",
+                    if status.enabled { "on" } else { "off" }
+                );
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                dlog!("error: {message}");
+                self.autostart_error = Some(message);
+                // Show the truth, whatever the toggle achieved.
+                self.autostart_cache = crate::autostart::status().ok().map(|status| status.enabled);
+            }
+        }
+    }
+
+    /// Open the daemon log file in the default app.
+    fn open_daemon_log(&self) {
+        let result =
+            daemon_log_path().and_then(|path| crate::tray::open_target(&path.to_string_lossy()));
+        if let Err(err) = result {
+            let message = format!("{err:#}");
+            dlog!("error: {message}");
+            crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
+        }
+    }
+
+    /// Open the GitHub releases page in the default browser.
+    fn open_releases(&self) {
+        if let Err(err) = crate::tray::open_target(crate::settings_ui::page::RELEASES_URL) {
+            let message = format!("{err:#}");
+            dlog!("error: {message}");
+            crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
         }
     }
 
@@ -1502,6 +1692,7 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
                 self.state = State::Idle;
                 self.tap_armed = false;
                 self.sync_tray();
+                self.refresh_settings();
             }
             UserEvent::ModeSwapped => {
                 // One switch at a time; a stale ack with nothing pending is
@@ -1509,16 +1700,19 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
                 if let Some(target) = self.mode_switch.as_ref().map(ModeSwitch::target) {
                     self.complete_mode_switch(target);
                 }
+                self.refresh_settings();
             }
             UserEvent::ModeSwitchFailed => {
                 if self.mode_switch.take().is_some() {
                     self.sync_mode_checks();
                     self.sync_tray();
                 }
+                self.refresh_settings();
             }
             UserEvent::HotKey(event) => self.handle_hotkey(event),
             UserEvent::Menu(event) => self.handle_menu(event, event_loop),
             UserEvent::OpenSettings => self.open_settings(event_loop),
+            UserEvent::SettingsRefresh => self.refresh_settings(),
         }
     }
 }
@@ -1552,11 +1746,12 @@ fn run_mode_switch_loader(
     download_first: bool,
     to_worker: &mpsc::Sender<Job>,
     proxy: &EventLoopProxy<UserEvent>,
+    progress: &Mutex<SwitchProgress>,
 ) {
-    if download_first && download_live_for_switch(proxy).is_err() {
+    if download_first && download_live_for_switch(proxy, progress).is_err() {
         return;
     }
-    let swap = match load_switch_model(target, previous) {
+    let swap = match load_switch_model(target, previous, proxy, progress) {
         Ok(swap) => swap,
         Err(()) => {
             send_switch_failed(proxy);
@@ -1576,22 +1771,35 @@ fn run_mode_switch_loader(
 /// milestone replaces the previous one). Milestones already passed by
 /// present files don't notify: only this download's progress does. A failure
 /// is logged + notified with the real error and fails the switch.
-fn download_live_for_switch(proxy: &EventLoopProxy<UserEvent>) -> Result<(), ()> {
+fn download_live_for_switch(
+    proxy: &EventLoopProxy<UserEvent>,
+    progress: &Mutex<SwitchProgress>,
+) -> Result<(), ()> {
+    lock_progress(progress).percent = 0;
     let mut sent: Option<usize> = None;
     let result = crate::model::download_live_files_with_progress(|downloaded, total| {
         let percent = downloaded * 100 / total.max(1);
+        lock_progress(progress).percent = percent.min(100);
         let reached = milestones_reached(percent);
         // Seed from the first report, so bytes already on disk (present
         // files count up front) don't fire stale milestones.
         let sent = sent.get_or_insert(reached);
+        let before = *sent;
         while *sent < reached {
             let milestone = DOWNLOAD_MILESTONES[*sent];
             *sent += 1;
             crate::notify::show_progress(&live_download_body(milestone));
         }
+        if *sent != before {
+            send_settings_refresh(proxy);
+        }
     });
     match result {
-        Ok(()) => Ok(()),
+        Ok(()) => {
+            lock_progress(progress).percent = 100;
+            send_settings_refresh(proxy);
+            Ok(())
+        }
         Err(err) => {
             let message = format!("{err:#}");
             dlog!("error: dictate: Live download failed: {message}");
@@ -1611,9 +1819,13 @@ fn download_live_for_switch(proxy: &EventLoopProxy<UserEvent>) -> Result<(), ()>
 fn load_switch_model(
     target: crate::config::Mode,
     previous: crate::config::Mode,
+    proxy: &EventLoopProxy<UserEvent>,
+    progress: &Mutex<SwitchProgress>,
 ) -> Result<Job, ()> {
     match target {
-        crate::config::Mode::Live => load_live_for_switch(previous).map(Job::SwapLive),
+        crate::config::Mode::Live => {
+            load_live_for_switch(previous, proxy, progress).map(Job::SwapLive)
+        }
         crate::config::Mode::Whole | crate::config::Mode::Pauses => {
             load_tdt_for_switch().map(Job::SwapTdt)
         }
@@ -1635,7 +1847,11 @@ fn load_tdt_for_switch() -> Result<crate::asr::Asr, ()> {
 
 /// Load the Live model for a switch to live mode and run the speed gate. Too
 /// slow: the too-slow notification, staying on the previous mode.
-fn load_live_for_switch(previous: crate::config::Mode) -> Result<crate::live::Live, ()> {
+fn load_live_for_switch(
+    previous: crate::config::Mode,
+    proxy: &EventLoopProxy<UserEvent>,
+    progress: &Mutex<SwitchProgress>,
+) -> Result<crate::live::Live, ()> {
     let loaded = (|| -> anyhow::Result<crate::live::Live> {
         let dir = crate::model::live_model_dir_checked()?;
         let env = crate::asr::shared_environment()?;
@@ -1649,7 +1865,11 @@ fn load_live_for_switch(previous: crate::config::Mode) -> Result<crate::live::Li
             return Err(());
         }
     };
-    let median = check_live_speed(&mut live);
+    lock_progress(progress).checking_speed = true;
+    send_settings_refresh(proxy);
+    let median = check_live_speed(&mut live, progress);
+    lock_progress(progress).checking_speed = false;
+    send_settings_refresh(proxy);
     if crate::live::is_fast_enough(median) {
         return Ok(live);
     }
@@ -1679,17 +1899,31 @@ fn switch_load_failed(err: anyhow::Error) {
     );
 }
 
-/// Benchmark the Live model for the speed gate, logging the check first.
-/// Shared by the startup check and menu switches.
-fn check_live_speed(live: &mut crate::live::Live) -> std::time::Duration {
+/// Benchmark the Live model for the speed gate, logging the check first and
+/// recording the outcome for the Settings page. Shared by the startup check
+/// and menu switches.
+fn check_live_speed(
+    live: &mut crate::live::Live,
+    progress: &Mutex<SwitchProgress>,
+) -> std::time::Duration {
     dlog!("checking Live speed…");
-    live.benchmark()
+    let median = live.benchmark();
+    lock_progress(progress).last_check = Some(LiveSpeedCheck::new(median));
+    median
 }
 
 /// Tell the event loop a background mode switch failed (already logged +
 /// notified). A closed event loop means the daemon is shutting down.
 fn send_switch_failed(proxy: &EventLoopProxy<UserEvent>) {
     if proxy.send_event(UserEvent::ModeSwitchFailed).is_err() {
+        // The event loop is closed; the daemon is shutting down.
+    }
+}
+
+/// Tell the event loop to repaint the Settings window (background progress
+/// changed; a closed window ignores it). A closed loop means shutdown.
+fn send_settings_refresh(proxy: &EventLoopProxy<UserEvent>) {
+    if proxy.send_event(UserEvent::SettingsRefresh).is_err() {
         // The event loop is closed; the daemon is shutting down.
     }
 }
@@ -2735,6 +2969,27 @@ mod tests {
         assert_eq!(milestones_reached(75), 3);
         assert_eq!(milestones_reached(100), 3);
         assert_eq!(DOWNLOAD_MILESTONES, [25, 50, 75]);
+    }
+
+    #[test]
+    fn speed_check_records_ms_and_verdict() {
+        assert_eq!(
+            LiveSpeedCheck::new(Duration::from_millis(120)),
+            LiveSpeedCheck {
+                ms: 120,
+                fast: true
+            }
+        );
+        assert_eq!(
+            LiveSpeedCheck::new(Duration::from_millis(905)),
+            LiveSpeedCheck {
+                ms: 905,
+                fast: false
+            }
+        );
+        // The gate is 392 ms per 560 ms chunk, inclusive.
+        assert!(LiveSpeedCheck::new(Duration::from_millis(392)).fast);
+        assert!(!LiveSpeedCheck::new(Duration::from_millis(393)).fast);
     }
 
     #[test]
