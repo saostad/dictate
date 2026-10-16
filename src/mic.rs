@@ -1,3 +1,4 @@
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
@@ -6,6 +7,119 @@ use cpal::{FromSample, Sample, SampleFormat, SizedSample};
 
 /// 16 kHz mono samples below this count are too short to transcribe (0.3 s).
 pub(crate) const MIN_RECORDING_SAMPLES: usize = 4800;
+
+/// Log one microphone line: stderr, plus the daemon log file when active
+/// (the same two sinks `dlog!` writes to).
+fn mlog(message: &str) {
+    eprintln!("{message}");
+    crate::daemon::mirror_to_log(message);
+}
+
+/// The audio host to record from and list microphones on. On Linux this is
+/// PulseAudio when it connects (PipeWire serves the pulse protocol, with
+/// user-meaningful device names); when the connect fails, ALSA with a
+/// one-time log + notification. Other OSes use the default host.
+#[cfg(target_os = "linux")]
+pub(crate) fn audio_host() -> cpal::Host {
+    if cpal::available_hosts().contains(&cpal::HostId::PulseAudio) {
+        match cpal::host_from_id(cpal::HostId::PulseAudio) {
+            Ok(host) => return host,
+            Err(err) => warn_alsa_fallback(&err),
+        }
+    }
+    // PulseAudio is absent or unreachable: ALSA directly (`default_host()`
+    // would retry the failed PulseAudio connect first).
+    cpal::host_from_id(cpal::HostId::Alsa).unwrap_or_else(|_| cpal::default_host())
+}
+
+/// The audio host to record from and list microphones on (the default host
+/// outside Linux; only Linux has the PulseAudio/ALSA choice).
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn audio_host() -> cpal::Host {
+    cpal::default_host()
+}
+
+/// Set once the ALSA fallback has been reported.
+#[cfg(target_os = "linux")]
+static ALSA_FALLBACK_WARNED: AtomicBool = AtomicBool::new(false);
+
+/// Log + notify the PulseAudio→ALSA fallback, once per process.
+#[cfg(target_os = "linux")]
+fn warn_alsa_fallback(err: &cpal::Error) {
+    if ALSA_FALLBACK_WARNED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let body = format!(
+        "Could not connect to PipeWire/PulseAudio ({err}). Microphone names may be technical."
+    );
+    mlog(&format!("error: dictate: using ALSA audio: {body}"));
+    crate::notify::show(
+        crate::notify::Kind::Error,
+        "dictate: using ALSA audio",
+        &body,
+    );
+}
+
+/// One microphone: its stable device id (`"host:device"`, as shown by
+/// `dictate mics`), its display name, and whether it is the system default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Mic {
+    pub id: String,
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// List the microphones on [`audio_host`]: input devices only, monitors and
+/// `alsa:null` hidden, duplicate names numbered. See [`microphone_list`].
+pub(crate) fn list_microphones() -> anyhow::Result<Vec<Mic>> {
+    let host = audio_host();
+    let default_id = host
+        .default_input_device()
+        .and_then(|device| device.id().ok())
+        .map(|id| id.to_string());
+    let devices = host
+        .input_devices()
+        .context("Could not list the microphones")?;
+    let mut entries = Vec::new();
+    for device in devices {
+        let (Ok(id), Ok(description)) = (device.id(), device.description()) else {
+            continue;
+        };
+        entries.push((id.to_string(), description.name().to_string()));
+    }
+    Ok(microphone_list(entries, default_id.as_deref()))
+}
+
+/// Build the microphone list from `(id, name)` entries: hide monitors (a
+/// pulse id ending in `.monitor` or a name starting with `Monitor of `) and
+/// `alsa:null`, mark the default by id, and number duplicate names (`Name`,
+/// `Name (2)`, `Name (3)`). Pure, so the rules are unit-testable.
+pub(crate) fn microphone_list(
+    entries: Vec<(String, String)>,
+    default_id: Option<&str>,
+) -> Vec<Mic> {
+    let mut counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    let mut mics = Vec::with_capacity(entries.len());
+    for (id, name) in entries {
+        if id == "alsa:null" || id.ends_with(".monitor") || name.starts_with("Monitor of ") {
+            continue;
+        }
+        let seen = counts.entry(name.clone()).or_insert(0);
+        *seen += 1;
+        let display = if *seen == 1 {
+            name
+        } else {
+            format!("{name} ({seen})")
+        };
+        let is_default = default_id == Some(id.as_str());
+        mics.push(Mic {
+            id,
+            name: display,
+            is_default,
+        });
+    }
+    mics
+}
 
 /// True when `samples_16k` holds less than 0.3 s of 16 kHz mono audio.
 pub(crate) fn recording_too_short(samples_16k: &[f32]) -> bool {
@@ -34,7 +148,7 @@ pub(crate) struct Recorder {
 impl Recorder {
     /// Start recording from the default input device.
     pub(crate) fn start() -> anyhow::Result<Self> {
-        let host = cpal::default_host();
+        let host = audio_host();
         let device = host.default_input_device().ok_or_else(|| {
             anyhow::anyhow!(
                 "No microphone found: the system has no default input device. Check your sound settings."
@@ -214,5 +328,68 @@ mod tests {
         assert!(recording_too_short(&[]));
         assert!(recording_too_short(&vec![0.0; MIN_RECORDING_SAMPLES - 1]));
         assert!(!recording_too_short(&vec![0.0; MIN_RECORDING_SAMPLES]));
+    }
+
+    fn entry(id: &str, name: &str) -> (String, String) {
+        (id.to_string(), name.to_string())
+    }
+
+    #[test]
+    fn microphone_list_marks_default_and_keeps_order() {
+        let mics = microphone_list(
+            vec![
+                entry("pulseaudio:alsa_input.usb", "USB Microphone"),
+                entry("pulseaudio:alsa_input.pci", "Built-in Audio Analog Stereo"),
+            ],
+            Some("pulseaudio:alsa_input.pci"),
+        );
+        assert_eq!(
+            mics,
+            vec![
+                Mic {
+                    id: "pulseaudio:alsa_input.usb".to_string(),
+                    name: "USB Microphone".to_string(),
+                    is_default: false,
+                },
+                Mic {
+                    id: "pulseaudio:alsa_input.pci".to_string(),
+                    name: "Built-in Audio Analog Stereo".to_string(),
+                    is_default: true,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn microphone_list_hides_monitors_and_null() {
+        let mics = microphone_list(
+            vec![
+                entry("pulseaudio:alsa_output.pci.monitor", "Monitor of Built-in Audio"),
+                entry("pulseaudio:other.monitor", "Something else"),
+                entry("pulseaudio:alsa_input.pci", "Monitor of Weird Name"),
+                entry("alsa:null", "null"),
+                entry("pulseaudio:alsa_input.pci", "Built-in Audio Analog Stereo"),
+            ],
+            None,
+        );
+        assert_eq!(mics.len(), 1);
+        assert_eq!(mics[0].name, "Built-in Audio Analog Stereo");
+    }
+
+    #[test]
+    fn microphone_list_numbers_duplicate_names() {
+        let mics = microphone_list(
+            vec![
+                entry("pulseaudio:one", "USB Microphone"),
+                entry("pulseaudio:two", "USB Microphone"),
+                entry("pulseaudio:three", "USB Microphone"),
+            ],
+            None,
+        );
+        let names: Vec<&str> = mics.iter().map(|mic| mic.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["USB Microphone", "USB Microphone (2)", "USB Microphone (3)"]
+        );
     }
 }

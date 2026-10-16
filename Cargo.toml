@@ -32,6 +32,7 @@ bundled-ort = ["parakeet-rs/ort-defaults"]
 system-ort = ["parakeet-rs/load-dynamic"]
 
 [target.'cfg(target_os = "linux")'.dependencies]
+cpal = { version = "0.18.2", features = ["pulseaudio"] }
 wayland-client = "0.31.15"
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 tempfile = "3.27.0"
