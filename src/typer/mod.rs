@@ -16,7 +16,9 @@ pub(crate) struct Typer {
 }
 
 impl Typer {
-    pub(crate) fn new() -> anyhow::Result<Self> {
+    /// `prompt` lets macOS show its Accessibility permission dialog when the
+    /// permission is missing; retries pass false so it isn't shown repeatedly.
+    pub(crate) fn new(prompt: bool) -> anyhow::Result<Self> {
         #[cfg(target_os = "linux")]
         if crate::hotkey::wayland_session() {
             return Ok(Self {
@@ -24,7 +26,11 @@ impl Typer {
                 enigo: None,
             });
         }
-        let enigo = Enigo::new(&Settings::default())
+        let settings = Settings {
+            open_prompt_to_get_permissions: prompt,
+            ..Settings::default()
+        };
+        let enigo = Enigo::new(&settings)
             .map_err(|err| anyhow::anyhow!("Could not set up keyboard input simulation: {err}"))?;
         Ok(Self {
             #[cfg(target_os = "linux")]

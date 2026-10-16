@@ -336,7 +336,14 @@ fn run_daemon_inner() -> anyhow::Result<()> {
         "model loaded in {} ms. Ready: run \"dictate toggle\" to start/stop recording.",
         load_start.elapsed().as_millis()
     );
-    let event_loop = EventLoop::<UserEvent>::with_user_event()
+    let mut builder = EventLoop::<UserEvent>::with_user_event();
+    // Menu bar app: tray icon only, no Dock icon or app menu.
+    #[cfg(target_os = "macos")]
+    {
+        use winit::platform::macos::{ActivationPolicy, EventLoopBuilderExtMacOS};
+        builder.with_activation_policy(ActivationPolicy::Accessory);
+    }
+    let event_loop = builder
         .build()
         .context("Could not start the daemon event loop")?;
     let (to_worker, worker_rx) = mpsc::channel::<Job>();
@@ -1844,7 +1851,7 @@ fn transcribe_worker(
     proxy: EventLoopProxy<UserEvent>,
     mut models: WorkerModels,
 ) {
-    let mut typer = crate::typer::Typer::new();
+    let mut typer = crate::typer::Typer::new(true);
     if let Err(err) = &typer {
         dlog!("error: {err:#}");
     }
@@ -1870,6 +1877,11 @@ fn transcribe_worker(
                 Err(_) => break,
             }
         };
+        // Retry a typer that failed at startup (e.g. macOS Accessibility
+        // granted while the daemon runs), so no restart is needed.
+        if typer.is_err() {
+            typer = crate::typer::Typer::new(false);
+        }
         match job {
             Job::Full(samples) => {
                 match ensure_tdt(&mut models) {

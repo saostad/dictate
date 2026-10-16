@@ -38,6 +38,10 @@ fn main() -> anyhow::Result<()> {
 fn run() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
     let Some(command) = args.next() else {
+        // Opened as Dictate.app (Finder, Spotlight, login item): run the daemon.
+        if launched_as_macos_app() {
+            return run_daemon();
+        }
         eprintln!("{}", usage());
         std::process::exit(2);
     };
@@ -310,6 +314,47 @@ fn run_client(cmd: &str) -> anyhow::Result<()> {
     anyhow::bail!("\"dictate {cmd}\" is not supported on this OS yet.")
 }
 
+/// Whether this binary is the main executable of a macOS app bundle
+/// (`Dictate.app/Contents/MacOS/dictate`).
+fn launched_as_macos_app() -> bool {
+    cfg!(target_os = "macos")
+        && std::env::current_exe().is_ok_and(|exe| is_app_bundle_executable(&exe))
+}
+
+fn is_app_bundle_executable(exe: &Path) -> bool {
+    let Some(macos_dir) = exe.parent() else {
+        return false;
+    };
+    let Some(contents) = macos_dir.parent() else {
+        return false;
+    };
+    macos_dir.file_name().is_some_and(|name| name == "MacOS")
+        && contents.file_name().is_some_and(|name| name == "Contents")
+        && contents
+            .parent()
+            .and_then(Path::extension)
+            .is_some_and(|ext| ext == "app")
+}
+
 fn usage() -> &'static str {
     "Usage: dictate <command> [args]\n\nCommands:\n  download [--live]      Download the speech model (about 660 MB; --live also fetches the Live model, about 900 MB)\n  transcribe [--live] <file.wav>  Transcribe a WAV file and print the text\n  listen                 Record from the microphone and print the text\n  daemon                 Run the dictation daemon (keeps the model loaded)\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  help                   Show this help"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_app_bundle_executable;
+    use std::path::Path;
+
+    #[test]
+    fn detects_app_bundle_executable() {
+        assert!(is_app_bundle_executable(Path::new(
+            "/Applications/Dictate.app/Contents/MacOS/dictate"
+        )));
+        assert!(!is_app_bundle_executable(Path::new(
+            "/Users/me/.local/bin/dictate"
+        )));
+        assert!(!is_app_bundle_executable(Path::new(
+            "/opt/Dictate/Contents/MacOS/dictate"
+        )));
+    }
 }
