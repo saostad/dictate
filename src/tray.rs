@@ -2,10 +2,10 @@
 //!
 //! The icon is a filled circle, grey when idle, red while recording, amber
 //! while transcribing. The menu shows the live state, starts/stops/cancels
-//! dictation, toggles sound cues and notifications, switches the dictation
-//! mode (all saved to the settings file), switches the global shortcut, opens
-//! the settings file, and quits. Menu clicks arrive as `UserEvent::Menu` via a
-//! winit proxy, like hotkeys.
+//! dictation, toggles sound cues and notifications, chooses the microphone and
+//! switches the dictation mode (all saved to the settings file), switches the
+//! global shortcut, opens the settings file, and quits. Menu clicks arrive as
+//! `UserEvent::Menu` via a winit proxy, like hotkeys.
 
 use anyhow::Context;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
@@ -13,6 +13,7 @@ use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
 use crate::config::{Mode, Settings};
 use crate::daemon::State;
+use crate::mic::Mic;
 
 /// Icon edge length in pixels.
 pub(crate) const ICON_SIZE: u32 = 32;
@@ -74,12 +75,18 @@ pub(crate) fn icon_rgba(state: State) -> (Vec<u8>, u32, u32) {
     (rgba, ICON_SIZE, ICON_SIZE)
 }
 
-/// Text of the disabled status label for `state`.
-pub(crate) fn status_text(state: State) -> &'static str {
-    match state {
+/// Text of the disabled status label for `state`, with the microphone in
+/// use when known.
+pub(crate) fn status_text(state: State, mic: Option<&str>) -> String {
+    let plain = match state {
         State::Idle => "dictate — Idle",
         State::Recording => "dictate — Recording…",
         State::Transcribing => "dictate — Transcribing…",
+    };
+    match (state, mic) {
+        (State::Idle, Some(mic)) => format!("{plain} · {mic}"),
+        (_, Some(mic)) => format!("{plain} ({mic})"),
+        (_, None) => plain.to_string(),
     }
 }
 
@@ -91,20 +98,31 @@ pub(crate) fn toggle_text(state: State) -> &'static str {
     }
 }
 
-/// Tooltip text for `state` and `mode`: the status plus the mode name, so
-/// hovering the icon shows the current mode.
-pub(crate) fn tooltip_text(state: State, mode: Mode) -> String {
-    format!("{} ({})", status_text(state), mode.display_name())
+/// Tooltip text for `state`, `mode` and the microphone in use: the status
+/// (with the mic) plus the mode name, so hovering the icon shows both.
+pub(crate) fn tooltip_text(state: State, mode: Mode, mic: Option<&str>) -> String {
+    format!("{} ({})", status_text(state, mic), mode.display_name())
 }
 
-/// A settings change made from the tray menu: a checkbox toggle or a
-/// shortcut switch. Pure, so the confirmation text is unit-testable.
+/// Label of the `System default` microphone menu item: with the current
+/// default microphone name when known.
+pub(crate) fn system_default_label(default_name: Option<&str>) -> String {
+    match default_name {
+        Some(name) => format!("System default ({name})"),
+        None => "System default".to_string(),
+    }
+}
+
+/// A settings change made from the tray menu: a checkbox toggle, a mode or
+/// microphone switch, or a shortcut switch. Pure, so the confirmation text
+/// is unit-testable.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum SettingsChange {
     Sounds(bool),
     Notifications(bool),
     Mode(Mode),
     Shortcut(String),
+    Microphone { id: String, name: String },
 }
 
 impl SettingsChange {
@@ -117,6 +135,7 @@ impl SettingsChange {
             }
             SettingsChange::Mode(mode) => format!("Mode: {}", mode.display_name()),
             SettingsChange::Shortcut(display) => format!("Shortcut: {display}"),
+            SettingsChange::Microphone { name, .. } => format!("Microphone: {name}"),
         }
     }
 
@@ -127,6 +146,13 @@ impl SettingsChange {
             SettingsChange::Notifications(on) => format!("settings: notifications = {on}"),
             SettingsChange::Mode(mode) => format!("settings: mode = {}", mode.as_str()),
             SettingsChange::Shortcut(display) => format!("settings: hotkey = {display}"),
+            SettingsChange::Microphone { id, .. } => {
+                if id.is_empty() {
+                    "settings: microphone = (system default)".to_string()
+                } else {
+                    format!("settings: microphone = {id}")
+                }
+            }
         }
     }
 }
@@ -143,6 +169,8 @@ pub(crate) enum TrayAction {
     Cancel,
     Sounds,
     Notifications,
+    Microphone(String),
+    RefreshMics,
     Mode(Mode),
     Shortcut(String),
     HowTo,
@@ -160,6 +188,63 @@ enum ShortcutMenu {
     },
 }
 
+/// The `Microphone` submenu and its current entries: `System default`, one
+/// radio-style item per microphone, a separator, and `Refresh list`. Rebuilt
+/// from a fresh listing whenever the daemon refreshes the microphones.
+struct MicrophoneMenu {
+    submenu: Submenu,
+    default_item: CheckMenuItem,
+    items: Vec<(String, CheckMenuItem)>,
+    separator: PredefinedMenuItem,
+    refresh: MenuItem,
+}
+
+/// Handles of the entries inside the `Microphone` submenu: `System
+/// default`, one item per microphone, the separator, and `Refresh list`.
+type MicrophoneEntries = (
+    CheckMenuItem,
+    Vec<(String, CheckMenuItem)>,
+    PredefinedMenuItem,
+    MenuItem,
+);
+
+/// Append the microphone entries to `submenu`: `System default` (with the
+/// current default name when known), one item per microphone, a separator,
+/// and `Refresh list`. `selected` is the saved microphone id (`""` = system
+/// default). Returns the new handles. The caller adds the context.
+fn append_microphone_items(
+    submenu: &Submenu,
+    mics: &[Mic],
+    selected: &str,
+    default_name: Option<&str>,
+) -> anyhow::Result<MicrophoneEntries> {
+    let default_item = CheckMenuItem::with_id(
+        "dictate-mic-default",
+        system_default_label(default_name),
+        true,
+        selected.is_empty(),
+        None,
+    );
+    submenu.append(&default_item)?;
+    let mut items = Vec::with_capacity(mics.len());
+    for (index, mic) in mics.iter().enumerate() {
+        let item = CheckMenuItem::with_id(
+            format!("dictate-mic-{index}"),
+            mic.name.clone(),
+            true,
+            mic.id == selected,
+            None,
+        );
+        submenu.append(&item)?;
+        items.push((mic.id.clone(), item));
+    }
+    let separator = PredefinedMenuItem::separator();
+    submenu.append(&separator)?;
+    let refresh = MenuItem::with_id("dictate-mic-refresh", "Refresh list", true, None);
+    submenu.append(&refresh)?;
+    Ok((default_item, items, separator, refresh))
+}
+
 /// The tray icon and every menu item the daemon updates or matches.
 pub(crate) struct Tray {
     icon: TrayIcon,
@@ -168,6 +253,7 @@ pub(crate) struct Tray {
     cancel: MenuItem,
     sounds: CheckMenuItem,
     notifications: CheckMenuItem,
+    microphone: MicrophoneMenu,
     modes: Vec<(Mode, CheckMenuItem)>,
     shortcut: ShortcutMenu,
     open_config: MenuItem,
@@ -179,10 +265,11 @@ pub(crate) struct Tray {
 pub(crate) fn build_tray(
     settings: &Settings,
     state: State,
+    mics: &[Mic],
     proxy: winit::event_loop::EventLoopProxy<crate::daemon::UserEvent>,
 ) -> anyhow::Result<Tray> {
     let menu = Menu::new();
-    let status = MenuItem::with_id("dictate-status", status_text(state), false, None);
+    let status = MenuItem::with_id("dictate-status", status_text(state, None), false, None);
     let toggle = MenuItem::with_id(
         "dictate-toggle",
         toggle_text(state),
@@ -204,6 +291,25 @@ pub(crate) fn build_tray(
         settings.notifications,
         None,
     );
+    let microphone_submenu = Submenu::with_id("dictate-microphone", "Microphone", true);
+    let default_name = mics
+        .iter()
+        .find(|mic| mic.is_default)
+        .map(|mic| mic.name.as_str());
+    let (default_item, mic_items, mic_separator, mic_refresh) = append_microphone_items(
+        &microphone_submenu,
+        mics,
+        &settings.microphone,
+        default_name,
+    )
+    .context("Could not build the tray menu")?;
+    let microphone = MicrophoneMenu {
+        submenu: microphone_submenu,
+        default_item,
+        items: mic_items,
+        separator: mic_separator,
+        refresh: mic_refresh,
+    };
     let mode_submenu = Submenu::with_id("dictate-mode", "Mode", true);
     let mut modes = Vec::with_capacity(MODE_OPTIONS.len());
     for (mode, label) in MODE_OPTIONS {
@@ -258,6 +364,8 @@ pub(crate) fn build_tray(
         .context("Could not build the tray menu")?;
     menu.append(&notifications)
         .context("Could not build the tray menu")?;
+    menu.append(&microphone.submenu)
+        .context("Could not build the tray menu")?;
     menu.append(&mode_submenu)
         .context("Could not build the tray menu")?;
     menu.append(&submenu)
@@ -275,7 +383,7 @@ pub(crate) fn build_tray(
         .with_id(TRAY_ID)
         .with_title(TRAY_ID)
         .with_menu(Box::new(menu))
-        .with_tooltip(tooltip_text(state, settings.mode))
+        .with_tooltip(tooltip_text(state, settings.mode, None))
         .with_icon(icon)
         .build()
         .map_err(|err| anyhow::anyhow!("Could not create tray icon: {err}"))?;
@@ -294,6 +402,7 @@ pub(crate) fn build_tray(
         cancel,
         sounds,
         notifications,
+        microphone,
         modes,
         shortcut,
         open_config,
@@ -304,8 +413,15 @@ pub(crate) fn build_tray(
 impl Tray {
     /// Refresh the icon, tooltip, label and item states after a state or
     /// settings change. While a mode switch loads in the background, the label
-    /// reads Loading instead of the state.
-    pub(crate) fn sync_state(&self, state: State, mode: Mode, loading: bool) -> anyhow::Result<()> {
+    /// reads Loading instead of the state. `mic` is the microphone in use,
+    /// shown in the label and tooltip when known.
+    pub(crate) fn sync_state(
+        &self,
+        state: State,
+        mode: Mode,
+        loading: bool,
+        mic: Option<&str>,
+    ) -> anyhow::Result<()> {
         let (rgba, width, height) = icon_rgba(state);
         let icon = Icon::from_rgba(rgba, width, height)
             .map_err(|err| anyhow::anyhow!("Internal error: tray icon pixels rejected: {err}"))?;
@@ -313,16 +429,54 @@ impl Tray {
             .set_icon(Some(icon))
             .map_err(|err| anyhow::anyhow!("Could not update the tray icon: {err}"))?;
         self.icon
-            .set_tooltip(Some(tooltip_text(state, mode)))
+            .set_tooltip(Some(tooltip_text(state, mode, mic)))
             .map_err(|err| anyhow::anyhow!("Could not update the tray tooltip: {err}"))?;
-        self.status.set_text(if loading {
-            LOADING_TEXT
+        if loading {
+            self.status.set_text(LOADING_TEXT);
         } else {
-            status_text(state)
-        });
+            self.status.set_text(status_text(state, mic));
+        }
         self.toggle.set_text(toggle_text(state));
         self.toggle.set_enabled(state != State::Transcribing);
         self.cancel.set_enabled(state == State::Recording);
+        Ok(())
+    }
+
+    /// Rebuild the Microphone submenu from a fresh listing: remove the old
+    /// entries, then append `System default`, one item per microphone, a
+    /// separator, and `Refresh list`. `selected` is the saved microphone id
+    /// (`""` = system default).
+    pub(crate) fn rebuild_microphones(
+        &mut self,
+        mics: &[Mic],
+        selected: &str,
+    ) -> anyhow::Result<()> {
+        let submenu = &self.microphone.submenu;
+        submenu
+            .remove(&self.microphone.default_item)
+            .context("Could not rebuild the microphone menu")?;
+        for (_, item) in &self.microphone.items {
+            submenu
+                .remove(item)
+                .context("Could not rebuild the microphone menu")?;
+        }
+        submenu
+            .remove(&self.microphone.separator)
+            .context("Could not rebuild the microphone menu")?;
+        submenu
+            .remove(&self.microphone.refresh)
+            .context("Could not rebuild the microphone menu")?;
+        let default_name = mics
+            .iter()
+            .find(|mic| mic.is_default)
+            .map(|mic| mic.name.as_str());
+        let (default_item, items, separator, refresh) =
+            append_microphone_items(submenu, mics, selected, default_name)
+                .context("Could not rebuild the microphone menu")?;
+        self.microphone.default_item = default_item;
+        self.microphone.items = items;
+        self.microphone.separator = separator;
+        self.microphone.refresh = refresh;
         Ok(())
     }
 
@@ -339,6 +493,20 @@ impl Tray {
         }
         if *id == *self.notifications.id() {
             return Some(TrayAction::Notifications);
+        }
+        if *id == *self.microphone.default_item.id() {
+            return Some(TrayAction::Microphone(String::new()));
+        }
+        if let Some((mic_id, _)) = self
+            .microphone
+            .items
+            .iter()
+            .find(|(_, item)| *id == *item.id())
+        {
+            return Some(TrayAction::Microphone(mic_id.clone()));
+        }
+        if *id == *self.microphone.refresh.id() {
+            return Some(TrayAction::RefreshMics);
         }
         if let Some((mode, _)) = self.modes.iter().find(|(_, item)| *id == *item.id()) {
             return Some(TrayAction::Mode(*mode));
@@ -378,6 +546,17 @@ impl Tray {
     pub(crate) fn sync_mode_checks(&self, current: Mode) {
         for (mode, item) in &self.modes {
             item.set_checked(*mode == current);
+        }
+    }
+
+    /// Check exactly the selected microphone in the Microphone submenu (radio
+    /// behavior; `""` checks System default).
+    pub(crate) fn sync_microphone_checks(&self, selected: &str) {
+        self.microphone
+            .default_item
+            .set_checked(selected.is_empty());
+        for (id, item) in &self.microphone.items {
+            item.set_checked(id == selected);
         }
     }
 
@@ -462,12 +641,40 @@ mod tests {
 
     #[test]
     fn status_and_toggle_texts() {
-        assert_eq!(status_text(State::Idle), "dictate — Idle");
-        assert_eq!(status_text(State::Recording), "dictate — Recording…");
-        assert_eq!(status_text(State::Transcribing), "dictate — Transcribing…");
+        assert_eq!(status_text(State::Idle, None), "dictate — Idle");
+        assert_eq!(status_text(State::Recording, None), "dictate — Recording…");
+        assert_eq!(
+            status_text(State::Transcribing, None),
+            "dictate — Transcribing…"
+        );
         assert_eq!(toggle_text(State::Idle), "Start dictation");
         assert_eq!(toggle_text(State::Recording), "Stop dictation");
         assert_eq!(toggle_text(State::Transcribing), "Stop dictation");
+    }
+
+    #[test]
+    fn status_text_shows_microphone_in_use() {
+        assert_eq!(
+            status_text(State::Idle, Some("Built-in Audio Analog Stereo")),
+            "dictate — Idle · Built-in Audio Analog Stereo"
+        );
+        assert_eq!(
+            status_text(State::Recording, Some("Built-in Audio Analog Stereo")),
+            "dictate — Recording… (Built-in Audio Analog Stereo)"
+        );
+        assert_eq!(
+            status_text(State::Transcribing, Some("USB Microphone")),
+            "dictate — Transcribing… (USB Microphone)"
+        );
+    }
+
+    #[test]
+    fn system_default_label_includes_default_name() {
+        assert_eq!(
+            system_default_label(Some("Built-in Audio Analog Stereo")),
+            "System default (Built-in Audio Analog Stereo)"
+        );
+        assert_eq!(system_default_label(None), "System default");
     }
 
     #[test]
@@ -483,20 +690,32 @@ mod tests {
     #[test]
     fn tooltip_shows_state_and_mode_name() {
         assert_eq!(
-            tooltip_text(State::Idle, Mode::Whole),
+            tooltip_text(State::Idle, Mode::Whole, None),
             "dictate — Idle (Whole)"
         );
         assert_eq!(
-            tooltip_text(State::Idle, Mode::Pauses),
+            tooltip_text(State::Idle, Mode::Pauses, None),
             "dictate — Idle (Pauses)"
         );
         assert_eq!(
-            tooltip_text(State::Recording, Mode::Live),
+            tooltip_text(State::Recording, Mode::Live, None),
             "dictate — Recording… (Live)"
         );
         assert_eq!(
-            tooltip_text(State::Transcribing, Mode::Whole),
+            tooltip_text(State::Transcribing, Mode::Whole, None),
             "dictate — Transcribing… (Whole)"
+        );
+        assert_eq!(
+            tooltip_text(
+                State::Idle,
+                Mode::Pauses,
+                Some("Built-in Audio Analog Stereo")
+            ),
+            "dictate — Idle · Built-in Audio Analog Stereo (Pauses)"
+        );
+        assert_eq!(
+            tooltip_text(State::Recording, Mode::Live, Some("USB Microphone")),
+            "dictate — Recording… (USB Microphone) (Live)"
         );
     }
 
@@ -559,6 +778,22 @@ mod tests {
                 SettingsChange::Shortcut("Ctrl+Alt+D".to_string()),
                 "Shortcut: Ctrl+Alt+D",
                 "settings: hotkey = Ctrl+Alt+D",
+            ),
+            (
+                SettingsChange::Microphone {
+                    id: "pulseaudio:alsa_input.pci".to_string(),
+                    name: "Built-in Audio Analog Stereo".to_string(),
+                },
+                "Microphone: Built-in Audio Analog Stereo",
+                "settings: microphone = pulseaudio:alsa_input.pci",
+            ),
+            (
+                SettingsChange::Microphone {
+                    id: String::new(),
+                    name: "System default (Built-in Audio Analog Stereo)".to_string(),
+                },
+                "Microphone: System default (Built-in Audio Analog Stereo)",
+                "settings: microphone = (system default)",
             ),
         ];
         for (change, body, log) in cases {

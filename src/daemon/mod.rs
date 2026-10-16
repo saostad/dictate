@@ -92,6 +92,26 @@ pub(crate) fn next(state: State, cmd: Command) -> (State, Action, &'static str) 
     }
 }
 
+/// Display name of the default microphone in a listing, if any. Pure, for
+/// the tray labels and tests.
+fn default_mic_name(mics: &[crate::mic::Mic]) -> Option<String> {
+    mics.iter()
+        .find(|mic| mic.is_default)
+        .map(|mic| mic.name.clone())
+}
+
+/// Display name of the selected microphone: the selection when it is listed,
+/// else the default (what the next recording will use). Pure, for the tray
+/// labels and tests.
+fn selected_mic_name(selected: &str, mics: &[crate::mic::Mic]) -> Option<String> {
+    if !selected.is_empty()
+        && let Some(mic) = mics.iter().find(|mic| mic.id == selected)
+    {
+        return Some(mic.name.clone());
+    }
+    default_mic_name(mics)
+}
+
 /// One unit of work for the transcription worker.
 pub(crate) enum Job {
     /// Whole recording at 16 kHz (whole mode): today's exact path.
@@ -508,6 +528,11 @@ struct DaemonApp {
     mode_switch: Option<ModeSwitch>,
     tray: Option<crate::tray::Tray>,
     tray_attempted: bool,
+    /// Cached microphone listing for the tray submenu and labels, refreshed
+    /// at startup, on `Refresh list`, and when a recording starts.
+    mics: Vec<crate::mic::Mic>,
+    /// Display name of the microphone the current (or last) recording uses.
+    active_mic: Option<String>,
     menu_proxy: EventLoopProxy<UserEvent>,
     /// Held so the registration stays alive; dropping it would unregister.
     /// Never read, hence the underscore.
@@ -541,6 +566,8 @@ impl DaemonApp {
             mode_switch: None,
             tray: None,
             tray_attempted: false,
+            mics: Vec::new(),
+            active_mic: None,
             menu_proxy,
             _hotkey_manager: None,
         }
@@ -636,14 +663,91 @@ impl DaemonApp {
         }
     }
 
+    /// Microphone name for the tray label and tooltip: the recording's mic
+    /// while busy, else the selected mic (or the default when nothing is
+    /// selected or the selection is gone).
+    fn tray_mic(&self) -> Option<String> {
+        match self.state {
+            State::Recording | State::Transcribing => self.active_mic.clone(),
+            State::Idle => selected_mic_name(&self.settings.microphone, &self.mics),
+        }
+    }
+
     /// Refresh the tray icon and menu after a state or settings change
     /// (no tray: no-op).
     fn sync_tray(&self) {
         if let Some(tray) = &self.tray
-            && let Err(err) =
-                tray.sync_state(self.state, self.settings.mode, self.mode_switch.is_some())
+            && let Err(err) = tray.sync_state(
+                self.state,
+                self.settings.mode,
+                self.mode_switch.is_some(),
+                self.tray_mic().as_deref(),
+            )
         {
             dlog!("error: {err:#}");
+        }
+    }
+
+    /// Re-list the microphones into the cache and rebuild the tray submenu.
+    /// A listing failure is logged and keeps the old entries.
+    fn refresh_microphones(&mut self) {
+        match crate::mic::list_microphones() {
+            Ok(mics) => {
+                self.mics = mics;
+                if let Some(tray) = self.tray.as_mut()
+                    && let Err(err) =
+                        tray.rebuild_microphones(&self.mics, &self.settings.microphone)
+                {
+                    dlog!("error: {err:#}");
+                }
+            }
+            Err(err) => dlog!("error: {err:#}"),
+        }
+        self.sync_tray();
+    }
+
+    /// Switch the selected microphone from the tray menu: save + confirm.
+    /// Refused while recording (the recorder already holds its device).
+    fn switch_microphone(&mut self, id: &str) {
+        if self.state == State::Recording {
+            dlog!("Microphone switch refused: finish the current dictation first");
+            crate::notify::show(
+                crate::notify::Kind::Info,
+                "dictate",
+                "Finish the current dictation first",
+            );
+            return;
+        }
+        if id == self.settings.microphone {
+            self.sync_microphone_checks();
+            return;
+        }
+        let name = if id.is_empty() {
+            crate::tray::system_default_label(default_mic_name(&self.mics).as_deref())
+        } else {
+            self.mics
+                .iter()
+                .find(|mic| mic.id == id)
+                .map(|mic| mic.name.clone())
+                .unwrap_or_else(|| id.to_string())
+        };
+        self.settings.microphone = id.to_string();
+        self.report_save_error(crate::config::save(&self.settings));
+        self.sync_microphone_checks();
+        Self::confirm_settings_change(
+            &crate::tray::SettingsChange::Microphone {
+                id: id.to_string(),
+                name,
+            },
+            true,
+        );
+        self.sync_tray();
+    }
+
+    /// Check exactly the selected microphone in the tray menu.
+    fn sync_microphone_checks(&self) {
+        if let Some(tray) = &self.tray {
+            tray.sync_microphone_checks(&self.settings.microphone);
         }
     }
 
@@ -663,6 +767,8 @@ impl DaemonApp {
             }
             Some(crate::tray::TrayAction::Sounds) => self.flip_sounds(),
             Some(crate::tray::TrayAction::Notifications) => self.flip_notifications(),
+            Some(crate::tray::TrayAction::Microphone(id)) => self.switch_microphone(&id),
+            Some(crate::tray::TrayAction::RefreshMics) => self.refresh_microphones(),
             Some(crate::tray::TrayAction::Mode(target)) => self.switch_mode(target),
             Some(crate::tray::TrayAction::Shortcut(display)) => self.switch_hotkey(&display),
             Some(crate::tray::TrayAction::HowTo) => self.open_how_to(),
@@ -946,12 +1052,14 @@ impl DaemonApp {
     /// without a voice detector falls back to whole for the recording (logged
     /// + notified, not silent).
     fn start_recording(&mut self, new_state: State, ok_reply: &str) -> String {
+        self.refresh_microphones();
         let mic = crate::config::resolve_microphone(
             &self.settings.microphone,
             std::env::var("DICTATE_MICROPHONE").ok().as_deref(),
         );
         match crate::mic::Recorder::start(mic.as_deref()) {
             Ok(started) => {
+                self.active_mic = Some(started.mic_name().to_string());
                 match self.current_mode() {
                     crate::config::Mode::Pauses => self.start_pauses_feeder(&started),
                     crate::config::Mode::Live => self.start_live_feeder(&started),
@@ -1174,8 +1282,17 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
         // started; without a tray host the daemon keeps running headless.
         if !self.tray_attempted {
             self.tray_attempted = true;
-            match crate::tray::build_tray(&self.settings, self.state, self.menu_proxy.clone()) {
-                Ok(tray) => self.tray = Some(tray),
+            self.refresh_microphones();
+            match crate::tray::build_tray(
+                &self.settings,
+                self.state,
+                &self.mics,
+                self.menu_proxy.clone(),
+            ) {
+                Ok(tray) => {
+                    self.tray = Some(tray);
+                    self.sync_tray();
+                }
                 Err(err) => {
                     dlog!("error: {err:#}");
                     crate::notify::show(
@@ -2352,6 +2469,50 @@ mod tests {
         for (state, cmd, expected) in cases {
             assert_eq!(next(state, cmd), expected, "next({state:?}, {cmd:?})");
         }
+    }
+
+    fn test_mics() -> Vec<crate::mic::Mic> {
+        vec![
+            crate::mic::Mic {
+                id: "pulseaudio:alsa_input.usb".to_string(),
+                name: "USB Microphone".to_string(),
+                is_default: false,
+            },
+            crate::mic::Mic {
+                id: "pulseaudio:alsa_input.pci".to_string(),
+                name: "Built-in Audio Analog Stereo".to_string(),
+                is_default: true,
+            },
+        ]
+    }
+
+    #[test]
+    fn default_mic_name_finds_default() {
+        assert_eq!(
+            default_mic_name(&test_mics()),
+            Some("Built-in Audio Analog Stereo".to_string())
+        );
+        assert_eq!(default_mic_name(&[]), None);
+    }
+
+    #[test]
+    fn selected_mic_name_prefers_selection_then_default() {
+        let mics = test_mics();
+        assert_eq!(
+            selected_mic_name("pulseaudio:alsa_input.usb", &mics),
+            Some("USB Microphone".to_string())
+        );
+        // Nothing selected: the default.
+        assert_eq!(
+            selected_mic_name("", &mics),
+            Some("Built-in Audio Analog Stereo".to_string())
+        );
+        // A selection that is gone: the default (what records next).
+        assert_eq!(
+            selected_mic_name("pulseaudio:gone", &mics),
+            Some("Built-in Audio Analog Stereo".to_string())
+        );
+        assert_eq!(selected_mic_name("", &[]), None);
     }
 
     #[test]
