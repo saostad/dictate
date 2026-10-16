@@ -124,9 +124,9 @@ struct FeederSession {
     thread: Option<std::thread::JoinHandle<Option<crate::vad::Vad>>>,
 }
 
-/// Effective streaming switch (settings file + `DICTATE_STREAMING`).
-fn streaming_enabled() -> bool {
-    crate::config::streaming_on()
+/// Effective dictation mode (settings file + `DICTATE_MODE`).
+fn dictation_mode() -> crate::config::Mode {
+    crate::config::mode()
 }
 
 /// Events handled on the daemon's event-loop thread.
@@ -463,7 +463,10 @@ impl DaemonApp {
     /// (no tray: no-op).
     fn sync_tray(&self) {
         if let Some(tray) = &self.tray
-            && let Err(err) = tray.sync_state(self.state, self.settings.streaming)
+            && let Err(err) = tray.sync_state(
+                self.state,
+                self.settings.mode == crate::config::Mode::Pauses,
+            )
         {
             dlog!("error: {err:#}");
         }
@@ -521,16 +524,23 @@ impl DaemonApp {
         self.sync_tray();
     }
 
-    /// Flip the `Type while speaking` check, update the effective switch, save.
+    /// Flip the `Type while speaking` check between whole and pauses, update
+    /// the effective mode, save. Live shows unchecked; clicking it goes to
+    /// pauses (the Mode submenu lands next round).
     fn flip_streaming(&mut self) {
-        let new = !self.settings.streaming;
-        self.settings.streaming = new;
-        crate::config::refresh_streaming(new);
+        let new = if self.settings.mode == crate::config::Mode::Pauses {
+            crate::config::Mode::Whole
+        } else {
+            crate::config::Mode::Pauses
+        };
+        self.settings.mode = new;
+        crate::config::refresh_mode(new);
+        let checked = new == crate::config::Mode::Pauses;
         if let Some(tray) = &self.tray {
-            tray.set_streaming_checked(new);
+            tray.set_streaming_checked(checked);
         }
         self.report_save_error(crate::config::save(&self.settings));
-        Self::confirm_settings_change(&crate::tray::SettingsChange::Streaming(new), false);
+        Self::confirm_settings_change(&crate::tray::SettingsChange::Streaming(checked), false);
         self.sync_tray();
     }
 
@@ -679,13 +689,14 @@ impl DaemonApp {
         }
     }
 
-    /// Start the mic, and the feeder thread when streaming is on and a
+    /// Start the mic, and the feeder thread when pauses mode is on and a
     /// voice detector is available. Otherwise the recording runs in
     /// whole-recording mode (the fallback is logged + notified, not silent).
+    /// Live mode arrives with the live engine; until then it records whole.
     fn start_recording(&mut self, new_state: State, ok_reply: &str) -> String {
         match crate::mic::Recorder::start() {
             Ok(started) => {
-                if streaming_enabled() {
+                if dictation_mode() == crate::config::Mode::Pauses {
                     match self.take_streaming_vad() {
                         Some(mut vad) => {
                             vad.reset();

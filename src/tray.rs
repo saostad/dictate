@@ -10,7 +10,7 @@ use anyhow::Context;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-use crate::config::Settings;
+use crate::config::{Mode, Settings};
 use crate::daemon::State;
 
 /// Icon edge length in pixels.
@@ -120,7 +120,14 @@ impl SettingsChange {
         match self {
             SettingsChange::Sounds(on) => format!("settings: sounds = {on}"),
             SettingsChange::Notifications(on) => format!("settings: notifications = {on}"),
-            SettingsChange::Streaming(on) => format!("settings: streaming = {on}"),
+            SettingsChange::Streaming(on) => format!(
+                "settings: mode = {}",
+                if *on {
+                    Mode::Pauses.as_str()
+                } else {
+                    Mode::Whole.as_str()
+                }
+            ),
             SettingsChange::Shortcut(display) => format!("settings: hotkey = {display}"),
         }
     }
@@ -199,11 +206,13 @@ pub(crate) fn build_tray(
         settings.notifications,
         None,
     );
+    // The checkbox tracks pauses mode (on = pauses, off = whole); live shows
+    // unchecked until the Mode submenu lands.
     let streaming = CheckMenuItem::with_id(
         "dictate-streaming",
         "Type while speaking",
         true,
-        settings.streaming,
+        settings.mode == Mode::Pauses,
         None,
     );
     let submenu = Submenu::with_id("dictate-shortcut", "Shortcut", true);
@@ -262,7 +271,7 @@ pub(crate) fn build_tray(
         .with_id(TRAY_ID)
         .with_title(TRAY_ID)
         .with_menu(Box::new(menu))
-        .with_tooltip(tooltip_text(state, settings.streaming))
+        .with_tooltip(tooltip_text(state, settings.mode == Mode::Pauses))
         .with_icon(icon)
         .build()
         .map_err(|err| anyhow::anyhow!("Could not create tray icon: {err}"))?;
@@ -503,12 +512,12 @@ mod tests {
             (
                 SettingsChange::Streaming(true),
                 "Type while speaking: on",
-                "settings: streaming = true",
+                "settings: mode = pauses",
             ),
             (
                 SettingsChange::Streaming(false),
                 "Type while speaking: off",
-                "settings: streaming = false",
+                "settings: mode = whole",
             ),
             (
                 SettingsChange::Shortcut("Ctrl+Alt+D".to_string()),
