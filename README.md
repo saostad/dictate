@@ -159,11 +159,23 @@ Shortcuts.
 `dictate daemon` shows a tray icon: grey when idle, red while recording,
 amber while transcribing. Its menu shows the live state, starts/stops/cancels
 dictation, toggles sound cues and notifications, switches the dictation mode
-(saved to the settings file), switches the global shortcut (on Wayland it
+(saved automatically), switches the global shortcut (on Wayland it
 explains the compositor keybinds instead), opens the settings file, and quits
 the daemon.
 Without a tray host the daemon logs `dictate: no tray icon` once and keeps
 running headless.
+
+## Start at login
+
+```sh
+dictate autostart on      # start dictate when you log in
+dictate autostart status  # show whether it is on
+dictate autostart off     # turn it off
+```
+
+If you move the dictate binary, the daemon updates the login entry itself
+on its next start. (The Settings window, coming in a later version, will
+have a checkbox for this too.)
 
 ## Modes
 
@@ -173,9 +185,9 @@ running headless.
 | Pauses | `mode = "pauses"` | types each pause segment while speaking | high: 1.5 s of left context per piece | most text is already typed at stop |
 | Live | `mode = "live"` | types while speaking, chunk by chunk | good: true streaming model | fastest: text appears as you talk |
 
-Set the mode in the settings file, with `DICTATE_MODE=live`, or from the
-tray menu's Mode submenu (it switches live, loading the needed model on a
-background thread; picking Live downloads its model first when missing).
+Set the mode from the tray menu's Mode submenu (it switches live, loading
+the needed model on a background thread; picking Live downloads its model
+first when missing), or with `DICTATE_MODE=live`.
 
 Pauses mode finds pauses with the Silero voice detector, which
 `dictate download` fetches (2.3 MB). Cancel can't un-type pieces already
@@ -194,32 +206,18 @@ logs and notifies (`dictate: this computer is too slow for Live mode`) and
 uses whole mode for that session. Without the model it does the same
 (`dictate: Live model missing`).
 
-## Settings file
+## Advanced: where settings are stored
 
-Settings live in `config.toml` in the platform config directory:
-
-| OS | Path |
-|---|---|
-| Linux | `~/.config/dictate/config.toml` |
-| macOS | `~/Library/Application Support/dictate/config.toml` |
-| Windows | `%APPDATA%\dictate\config\config.toml` |
-
-All keys are optional; a missing file means defaults:
-
-```toml
-sounds = true                 # short tone when recording starts/stops
-notifications = true          # desktop notifications for errors
-mode = "whole"                # dictation mode: "whole", "pauses" or "live"
-hotkey = "Ctrl+Shift+Space"   # global shortcut: tap to toggle, hold to talk
-microphone = ""               # microphone: "" = system default, or a device id (see "dictate mics")
-```
+The tray menu manages settings for you (sound cues, notifications, mode,
+microphone, shortcut). They live in `config.toml` in the platform config
+directory (`~/.config/dictate/config.toml` on Linux,
+`~/Library/Application Support/dictate/config.toml` on macOS,
+`%APPDATA%\dictate\config\config.toml` on Windows).
 
 The environment wins: `DICTATE_SOUNDS=0`, `DICTATE_NOTIFY=0`,
 `DICTATE_MODE=...`, `DICTATE_HOTKEY=...` and `DICTATE_MICROPHONE=...` override
-the file. The old `streaming` key and `DICTATE_STREAMING` still work (they map
-to whole/pauses).
-The tray menu edits the file for you; `Open settings file` creates it with
-defaults when missing.
+the file. The old `DICTATE_STREAMING` variable still works (it maps to
+whole/pauses).
 
 ## Global hotkey
 
