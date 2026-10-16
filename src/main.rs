@@ -20,6 +20,7 @@ mod mic;
 mod model;
 mod notify;
 mod segment;
+mod settings_ui;
 mod tray;
 mod typer;
 mod vad;
@@ -94,7 +95,7 @@ fn run() -> anyhow::Result<()> {
             }
             run_daemon(background)
         }
-        "toggle" | "start" | "stop" | "cancel" | "status" => run_client(&command),
+        "toggle" | "start" | "stop" | "cancel" | "status" | "settings" => run_client(&command),
         "transcribe" => {
             let Some(first) = args.next() else {
                 eprintln!("Usage: dictate transcribe [--live] <file.wav>");
@@ -436,7 +437,7 @@ pub(crate) fn is_app_bundle_executable(exe: &Path) -> bool {
 
 fn usage() -> &'static str {
     "Usage: dictate <command> [args]\n\nCommands:\n  download [--live]      Download the speech model (about 660 MB; --live also fetches the Live model, about 900 MB)\n  transcribe [--live] <file.wav>  Transcribe a WAV file and print the text\n  listen                 Record from the microphone and print the text\n  mics                   List the microphones and the selected one\n  daemon [--background]  Run the dictation daemon (keeps the model loaded)
-  autostart on|off|status  Turn start-at-login on or off, or show the setting\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  help                   Show this help"
+  autostart on|off|status  Turn start-at-login on or off, or show the setting\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  settings               Open the Settings window via the daemon\n  help                   Show this help"
 }
 
 #[cfg(test)]

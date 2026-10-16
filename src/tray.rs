@@ -175,6 +175,7 @@ pub(crate) enum TrayAction {
     Shortcut(String),
     HowTo,
     OpenConfig,
+    Settings,
     Quit,
 }
 
@@ -257,6 +258,7 @@ pub(crate) struct Tray {
     modes: Vec<(Mode, CheckMenuItem)>,
     shortcut: ShortcutMenu,
     open_config: MenuItem,
+    settings: MenuItem,
     quit: MenuItem,
 }
 
@@ -351,6 +353,7 @@ pub(crate) fn build_tray(
         ShortcutMenu::Hotkeys { options }
     };
     let open_config = MenuItem::with_id("dictate-open-config", "Open settings file", true, None);
+    let settings_item = MenuItem::with_id("dictate-settings", "Settings…", true, None);
     let quit = MenuItem::with_id("dictate-quit", "Quit dictate", true, None);
     menu.append(&status)
         .context("Could not build the tray menu")?;
@@ -371,6 +374,8 @@ pub(crate) fn build_tray(
     menu.append(&submenu)
         .context("Could not build the tray menu")?;
     menu.append(&open_config)
+        .context("Could not build the tray menu")?;
+    menu.append(&settings_item)
         .context("Could not build the tray menu")?;
     menu.append(&PredefinedMenuItem::separator())
         .context("Could not build the tray menu")?;
@@ -409,6 +414,7 @@ pub(crate) fn build_tray(
         modes,
         shortcut,
         open_config,
+        settings: settings_item,
         quit,
     })
 }
@@ -516,6 +522,9 @@ impl Tray {
         }
         if *id == *self.open_config.id() {
             return Some(TrayAction::OpenConfig);
+        }
+        if *id == *self.settings.id() {
+            return Some(TrayAction::Settings);
         }
         if *id == *self.quit.id() {
             return Some(TrayAction::Quit);

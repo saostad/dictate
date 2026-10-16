@@ -30,13 +30,13 @@ pub(crate) mod socket;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::mpsc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use global_hotkey::hotkey::HotKey;
 use global_hotkey::{GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState};
 use winit::application::ApplicationHandler;
-use winit::event::WindowEvent;
+use winit::event::{StartCause, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
 use winit::window::WindowId;
 
@@ -213,6 +213,9 @@ pub(crate) enum UserEvent {
     /// A background mode switch failed; already logged + notified, so the
     /// event loop only clears the loading state.
     ModeSwitchFailed,
+    /// Open the Settings window (`dictate settings` from the socket; the tray
+    /// menu calls `open_settings` directly).
+    OpenSettings,
 }
 
 /// A mode switch running on a background thread (the event loop stays
@@ -581,6 +584,9 @@ struct DaemonApp {
     mode_switch: Option<ModeSwitch>,
     tray: Option<crate::tray::Tray>,
     tray_attempted: bool,
+    /// The open Settings window, if any. `None` while closed: the window, GL
+    /// context and egui state exist only on demand, at zero cost otherwise.
+    settings_window: Option<crate::settings_ui::SettingsWindow>,
     /// Audio session: one cpal host plus the cached recording device and
     /// config, so `start` doesn't re-connect to the audio server.
     mic_session: crate::mic::MicSession,
@@ -622,6 +628,7 @@ impl DaemonApp {
             mode_switch: None,
             tray: None,
             tray_attempted: false,
+            settings_window: None,
             mic_session: crate::mic::MicSession::new(),
             mics: Vec::new(),
             active_mic: None,
@@ -838,6 +845,7 @@ impl DaemonApp {
             Some(crate::tray::TrayAction::Shortcut(display)) => self.switch_hotkey(&display),
             Some(crate::tray::TrayAction::HowTo) => self.open_how_to(),
             Some(crate::tray::TrayAction::OpenConfig) => self.open_settings_file(),
+            Some(crate::tray::TrayAction::Settings) => self.open_settings(event_loop),
             Some(crate::tray::TrayAction::Quit) => event_loop.exit(),
         }
     }
@@ -1096,6 +1104,65 @@ impl DaemonApp {
             let message = format!("{err:#}");
             dlog!("error: {message}");
             crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
+        }
+    }
+
+    /// Open the Settings window, or focus it when it is already open. A GL
+    /// init failure is logged + notified; the daemon keeps running.
+    fn open_settings(&mut self, event_loop: &ActiveEventLoop) {
+        if let Some(window) = &self.settings_window {
+            window.focus();
+            return;
+        }
+        match crate::settings_ui::SettingsWindow::open(event_loop) {
+            Ok(window) => {
+                // Focus the new window too: on macOS the app is Accessory and
+                // would otherwise stay behind other windows.
+                window.focus();
+                window.request_redraw();
+                self.settings_window = Some(window);
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                dlog!("error: dictate: could not open Settings: {message}");
+                crate::notify::show(
+                    crate::notify::Kind::Error,
+                    "dictate: could not open Settings",
+                    &message,
+                );
+            }
+        }
+    }
+
+    /// Paint one Settings frame. The window is taken out while egui runs so
+    /// the page can read daemon state; a frame failure drops it (already out),
+    /// and the daemon keeps running.
+    fn redraw_settings(&mut self, event_loop: &ActiveEventLoop) {
+        let Some(mut window) = self.settings_window.take() else {
+            return;
+        };
+        match window.redraw(event_loop, crate::settings_ui::placeholder) {
+            Ok(delay) => {
+                if delay.is_zero() {
+                    // egui wants another frame immediately (an animation or a
+                    // follow-up layout): repaint without leaving Wait.
+                    window.request_redraw();
+                } else if delay != Duration::MAX {
+                    // A delayed repaint (a tooltip or blink): sleep until then.
+                    event_loop.set_control_flow(ControlFlow::WaitUntil(Instant::now() + delay));
+                }
+                self.settings_window = Some(window);
+            }
+            Err(err) => {
+                let message = format!("{err:#}");
+                dlog!("error: dictate: Settings window failed: {message}");
+                crate::notify::show(
+                    crate::notify::Kind::Error,
+                    "dictate: Settings window failed",
+                    &message,
+                );
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
         }
     }
 
@@ -1373,13 +1440,53 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
         }
     }
 
+    fn new_events(&mut self, event_loop: &ActiveEventLoop, cause: StartCause) {
+        // An egui delayed repaint came due: repaint once, back on plain Wait
+        // (the frame re-arms a deadline only while egui still asks for one).
+        if matches!(cause, StartCause::ResumeTimeReached { .. })
+            && let Some(window) = &self.settings_window
+        {
+            event_loop.set_control_flow(ControlFlow::Wait);
+            window.request_redraw();
+        }
+    }
+
     fn window_event(
         &mut self,
-        _event_loop: &ActiveEventLoop,
-        _window_id: WindowId,
-        _event: WindowEvent,
+        event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
     ) {
-        // The daemon never creates a window.
+        // The Settings window is the daemon's only window; anything else is
+        // not ours.
+        if self
+            .settings_window
+            .as_ref()
+            .is_none_or(|window| window.window_id() != window_id)
+        {
+            return;
+        }
+        match event {
+            WindowEvent::CloseRequested | WindowEvent::Destroyed => {
+                // Drop everything: window, GL context and egui state.
+                self.settings_window = None;
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
+            WindowEvent::Resized(size) => {
+                if let Some(window) = self.settings_window.as_mut() {
+                    window.resize(size);
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::RedrawRequested => self.redraw_settings(event_loop),
+            _ => {
+                if let Some(window) = self.settings_window.as_mut()
+                    && window.on_window_event(&event)
+                {
+                    window.request_redraw();
+                }
+            }
+        }
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -1411,6 +1518,7 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
             }
             UserEvent::HotKey(event) => self.handle_hotkey(event),
             UserEvent::Menu(event) => self.handle_menu(event, event_loop),
+            UserEvent::OpenSettings => self.open_settings(event_loop),
         }
     }
 }

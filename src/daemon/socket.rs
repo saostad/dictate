@@ -28,6 +28,21 @@ fn parse_command(line: &str) -> Option<Command> {
     }
 }
 
+/// True for the `settings` client line, which opens the Settings window
+/// instead of going through the recording state machine.
+fn is_settings_request(line: &str) -> bool {
+    line.trim() == "settings"
+}
+
+/// Ask the event loop to open the Settings window. Fire and forget, like a
+/// hotkey press: there is no per-request result to wait for.
+fn open_settings_via(proxy: &EventLoopProxy<UserEvent>) -> String {
+    if proxy.send_event(UserEvent::OpenSettings).is_err() {
+        return "err daemon did not answer".to_string();
+    }
+    "ok settings".to_string()
+}
+
 /// The error message of a daemon reply, if it is one (`err <message>`).
 fn reply_error(reply: &str) -> Option<&str> {
     if reply == "err" {
@@ -258,12 +273,16 @@ fn handle_connection_inner(
         // `dictate daemon`. Close it with no reply and no log.
         return Ok(());
     }
-    let reply = match parse_command(&line) {
-        None => {
-            let text = line.trim();
-            format!("err unknown command \"{text}\"")
+    let reply = if is_settings_request(&line) {
+        open_settings_via(proxy)
+    } else {
+        match parse_command(&line) {
+            None => {
+                let text = line.trim();
+                format!("err unknown command \"{text}\"")
+            }
+            Some(cmd) => forward_command(cmd, proxy),
         }
-        Some(cmd) => forward_command(cmd, proxy),
     };
     let mut stream = stream;
     writeln!(stream, "{reply}").context("Could not reply to a daemon client")?;
@@ -316,6 +335,15 @@ mod tests {
         assert_eq!(parse_command("status"), Some(Command::Status));
         assert_eq!(parse_command("bogus"), None);
         assert_eq!(parse_command(""), None);
+    }
+
+    #[test]
+    fn settings_line_opens_the_window() {
+        assert!(is_settings_request("settings\n"));
+        assert!(is_settings_request("settings"));
+        assert!(!is_settings_request("status"));
+        assert!(!is_settings_request(""));
+        assert!(!is_settings_request("settings now"));
     }
 
     #[test]

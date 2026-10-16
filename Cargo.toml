@@ -16,8 +16,13 @@ panic = "abort"
 anyhow = "1.0.104"
 cpal = "0.18.2"
 directories = "6.0.0"
+egui = "0.37.0"
+egui-winit = { version = "0.37.0", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
+egui_glow = { version = "0.37.0", features = ["winit"] }
 enigo = { version = "0.6.1", features = ["wayland", "x11rb"] }
 global-hotkey = "0.8.0"
+glutin = "0.32"
+glutin-winit = "0.5.0"
 hound = "3.5.1"
 notify-rust = "4.18.2"
 parakeet-rs = { version = "0.4.1", default-features = false, features = ["cpu", "api-28"] }
