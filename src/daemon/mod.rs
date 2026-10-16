@@ -124,6 +124,31 @@ fn mic_listing_changed(old: &[crate::mic::Mic], new: &[crate::mic::Mic]) -> bool
         .any(|(before, after)| before.id != after.id || before.is_default != after.is_default)
 }
 
+/// Run `hyprctl binds -j` and format the binds whose arg mentions dictate
+/// (`F8 → start (hold)` lines). Only called on Hyprland.
+fn query_hyprland_binds() -> anyhow::Result<Vec<String>> {
+    let output = std::process::Command::new("hyprctl")
+        .args(["binds", "-j"])
+        .output()
+        .map_err(|err| anyhow::anyhow!("Could not list Hyprland shortcuts: {err}"))?;
+    if !output.status.success() {
+        let detail = String::from_utf8_lossy(&output.stderr);
+        let detail = detail.trim();
+        let detail = if detail.is_empty() {
+            output.status.to_string()
+        } else {
+            detail.to_string()
+        };
+        return Err(anyhow::anyhow!(
+            "Could not list Hyprland shortcuts: {detail}"
+        ));
+    }
+    let stdout = String::from_utf8(output.stdout)
+        .map_err(|err| anyhow::anyhow!("Could not list Hyprland shortcuts: {err}"))?;
+    let binds = crate::settings_ui::page::parse_hyprland_binds(&stdout);
+    Ok(crate::settings_ui::page::format_hyprland_binds(&binds))
+}
+
 /// One unit of work for the transcription worker.
 pub(crate) enum Job {
     /// Whole recording at 16 kHz (whole mode): today's exact path.
@@ -653,6 +678,11 @@ struct DaemonApp {
     autostart_cache: Option<bool>,
     /// Last start-at-login error, shown inline in the Settings page.
     autostart_error: Option<String>,
+    /// Cached `hyprctl binds` lines mentioning dictate, for the Settings
+    /// page (`None` when not on Hyprland, or when the query failed — the
+    /// page shows generic text then). Queried when the window opens and on
+    /// Refresh, never per frame.
+    hyprland_binds: Option<Vec<String>>,
     menu_proxy: EventLoopProxy<UserEvent>,
     /// Held so the registration stays alive; dropping it would unregister.
     /// Never read, hence the underscore.
@@ -695,6 +725,7 @@ impl DaemonApp {
             last_shortcut_error: None,
             autostart_cache: None,
             autostart_error: None,
+            hyprland_binds: None,
             menu_proxy,
             _hotkey_manager: None,
         }
@@ -832,6 +863,23 @@ impl DaemonApp {
             Err(err) => dlog!("error: {err:#}"),
         }
         self.sync_tray();
+    }
+
+    /// Re-query the Hyprland binds mentioning dictate into the cache (the
+    /// Settings page reads it). Only on Hyprland; a query failure is logged
+    /// and clears the cache, so the page falls back to generic text.
+    fn refresh_hyprland_binds(&mut self) {
+        if !crate::hotkey::hyprland_session() {
+            self.hyprland_binds = None;
+            return;
+        }
+        match query_hyprland_binds() {
+            Ok(binds) => self.hyprland_binds = Some(binds),
+            Err(err) => {
+                dlog!("error: {err:#}");
+                self.hyprland_binds = None;
+            }
+        }
     }
 
     /// Switch the selected microphone from the Settings page: save + confirm.
@@ -1122,6 +1170,7 @@ impl DaemonApp {
                 self.autostart_error = Some(message);
             }
         }
+        self.refresh_hyprland_binds();
         match crate::settings_ui::SettingsWindow::open(event_loop) {
             Ok(window) => {
                 // Focus the new window too: on macOS the app is Accessory and
@@ -1160,8 +1209,9 @@ impl DaemonApp {
             download_percent: progress.percent,
             checking_speed: progress.checking_speed,
             last_speed_check: progress.last_check,
-            hotkey_display: &self.hotkey_display,
             wayland: crate::hotkey::wayland_session(),
+            hyprland: crate::hotkey::hyprland_session(),
+            dictate_binds: self.hyprland_binds.as_deref(),
             autostart_on: self.autostart_cache,
             autostart_error: self.autostart_error.as_deref(),
             shortcut_error: self.last_shortcut_error.as_deref(),
@@ -1215,6 +1265,7 @@ impl DaemonApp {
         match action {
             PageAction::SelectMic(id) => self.switch_microphone(&id),
             PageAction::RefreshMics => self.refresh_microphones(),
+            PageAction::RefreshBinds => self.refresh_hyprland_binds(),
             PageAction::SelectMode(mode) => self.switch_mode(mode),
             PageAction::SelectShortcut(display) => self.switch_hotkey(&display),
             PageAction::ToggleSounds => self.flip_sounds(),

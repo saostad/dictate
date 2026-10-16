@@ -74,6 +74,15 @@ pub(crate) fn wayland_session() -> bool {
     std::env::var_os("WAYLAND_DISPLAY").is_some_and(|value| !value.is_empty())
 }
 
+/// True on Hyprland, where the Settings page lists the user's compositor
+/// binds from `hyprctl`. Never true on other systems.
+pub(crate) fn hyprland_session() -> bool {
+    if !cfg!(target_os = "linux") {
+        return false;
+    }
+    std::env::var_os("HYPRLAND_INSTANCE_SIGNATURE").is_some_and(|value| !value.is_empty())
+}
+
 /// Pure tap-vs-hold decision: which daemon command (if any) a hotkey event
 /// triggers. `held_ms` is the press length (only used for releases);
 /// `tap_armed` is true when a short tap started the current recording and the

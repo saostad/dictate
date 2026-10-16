@@ -45,6 +45,7 @@ pub(crate) const MODE_OPTIONS: [(Mode, &str, &str); 3] = [
 pub(crate) enum PageAction {
     SelectMic(String),
     RefreshMics,
+    RefreshBinds,
     SelectMode(Mode),
     SelectShortcut(String),
     ToggleSounds,
@@ -69,8 +70,12 @@ pub(crate) struct PageView<'a> {
     pub checking_speed: bool,
     /// The last Live speed-check outcome this session, if one ran.
     pub last_speed_check: Option<LiveSpeedCheck>,
-    pub hotkey_display: &'a str,
     pub wayland: bool,
+    /// True on Hyprland, where the shortcut section lists compositor binds.
+    pub hyprland: bool,
+    /// Formatted `hyprctl binds` lines mentioning dictate (`None` when not on
+    /// Hyprland, or when the query failed — the page shows generic text then).
+    pub dictate_binds: Option<&'a [String]>,
     /// Cached start-at-login state (`None` when the last query failed).
     pub autostart_on: Option<bool>,
     pub autostart_error: Option<&'a str>,
@@ -110,12 +115,298 @@ pub(crate) fn speed_check_line(check: LiveSpeedCheck) -> String {
     )
 }
 
-/// Wayland shortcut line: the configured shortcut the user binds in their
-/// compositor, when one is known.
-pub(crate) fn wayland_shortcut_line(configured: Option<&str>) -> Option<String> {
-    configured
-        .filter(|keys| !keys.is_empty())
-        .map(|keys| format!("Your shortcut: {keys}"))
+/// One `hyprctl binds` entry whose arg mentions dictate: the formatted
+/// keys (`Super+Alt+D`), the dictate command (`toggle`), and whether it
+/// fires on release.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HyprBind {
+    keys: String,
+    command: String,
+    release: bool,
+}
+
+/// Parse `hyprctl binds -j` output into the binds whose arg mentions
+/// dictate. The JSON is parsed by hand (no new crates for one query);
+/// malformed entries are skipped.
+pub(crate) fn parse_hyprland_binds(json: &str) -> Vec<HyprBind> {
+    split_json_objects(json)
+        .iter()
+        .filter_map(|object| parse_bind_object(object))
+        .collect()
+}
+
+/// Format parsed binds as `F8 → start (hold)` lines. A press bind paired
+/// with a release bind on the same keys is hold-to-talk: the press shows
+/// `(hold)`, the release `(release)`; lone binds show no annotation.
+pub(crate) fn format_hyprland_binds(binds: &[HyprBind]) -> Vec<String> {
+    binds
+        .iter()
+        .map(|bind| {
+            let suffix = if bind.release {
+                " (release)"
+            } else if binds
+                .iter()
+                .any(|other| other.release && other.keys == bind.keys)
+            {
+                " (hold)"
+            } else {
+                ""
+            };
+            format!("{} → {}{suffix}", bind.keys, bind.command)
+        })
+        .collect()
+}
+
+/// Split a top-level JSON array into its `{...}` object spans, ignoring
+/// braces inside strings. Unbalanced input yields the spans found so far.
+fn split_json_objects(array: &str) -> Vec<&str> {
+    let bytes = array.as_bytes();
+    let mut objects = Vec::new();
+    let mut depth = 0usize;
+    let mut start = 0usize;
+    let mut in_string = false;
+    let mut escape = false;
+    for (i, &b) in bytes.iter().enumerate() {
+        if in_string {
+            if escape {
+                escape = false;
+            } else if b == b'\\' {
+                escape = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+        } else if b == b'"' {
+            in_string = true;
+        } else if b == b'{' {
+            if depth == 0 {
+                start = i;
+            }
+            depth += 1;
+        } else if b == b'}' && depth > 0 {
+            depth -= 1;
+            if depth == 0 {
+                objects.push(&array[start..=i]);
+            }
+        }
+    }
+    objects
+}
+
+/// Skip ASCII whitespace.
+fn skip_ws(bytes: &[u8], i: &mut usize) {
+    while bytes.get(*i).is_some_and(|b| b.is_ascii_whitespace()) {
+        *i += 1;
+    }
+}
+
+/// Read a JSON string starting at the opening quote in `bytes[*i]`,
+/// advancing `*i` past the closing quote. Returns the unescaped text, or
+/// `None` when unterminated or invalid.
+fn read_json_string(bytes: &[u8], i: &mut usize) -> Option<String> {
+    if bytes.get(*i) != Some(&b'"') {
+        return None;
+    }
+    *i += 1;
+    let mut out: Vec<u8> = Vec::new();
+    loop {
+        let b = *bytes.get(*i)?;
+        *i += 1;
+        match b {
+            b'"' => return String::from_utf8(out).ok(),
+            b'\\' => {
+                let esc = *bytes.get(*i)?;
+                *i += 1;
+                match esc {
+                    b'"' => out.push(b'"'),
+                    b'\\' => out.push(b'\\'),
+                    b'/' => out.push(b'/'),
+                    b'b' => out.push(0x08),
+                    b'f' => out.push(0x0C),
+                    b'n' => out.push(b'\n'),
+                    b'r' => out.push(b'\r'),
+                    b't' => out.push(b'\t'),
+                    b'u' => {
+                        let hex = std::str::from_utf8(bytes.get(*i..*i + 4)?).ok()?;
+                        *i += 4;
+                        let code = u32::from_str_radix(hex, 16).ok()?;
+                        let ch = char::from_u32(code).unwrap_or('\u{FFFD}');
+                        let mut buf = [0u8; 4];
+                        out.extend_from_slice(ch.encode_utf8(&mut buf).as_bytes());
+                    }
+                    _ => return None,
+                }
+            }
+            _ => out.push(b),
+        }
+    }
+}
+
+/// Read a JSON `true`/`false` literal at `bytes[*i]`.
+fn read_bool(bytes: &[u8], i: &mut usize) -> Option<bool> {
+    if bytes.get(*i..*i + 4) == Some(b"true") {
+        *i += 4;
+        Some(true)
+    } else if bytes.get(*i..*i + 5) == Some(b"false") {
+        *i += 5;
+        Some(false)
+    } else {
+        None
+    }
+}
+
+/// Read a JSON unsigned integer at `bytes[*i]`.
+fn read_u32(bytes: &[u8], i: &mut usize) -> Option<u32> {
+    let start = *i;
+    while bytes.get(*i).is_some_and(|b| b.is_ascii_digit()) {
+        *i += 1;
+    }
+    if *i == start {
+        return None;
+    }
+    std::str::from_utf8(&bytes[start..*i]).ok()?.parse().ok()
+}
+
+/// Skip one JSON value (string, object, array or literal) at `bytes[*i]`.
+fn skip_json_value(bytes: &[u8], i: &mut usize) -> bool {
+    skip_ws(bytes, i);
+    let Some(&b) = bytes.get(*i) else {
+        return false;
+    };
+    match b {
+        b'"' => read_json_string(bytes, i).is_some(),
+        b'{' | b'[' => {
+            let close = if b == b'{' { b'}' } else { b']' };
+            *i += 1;
+            let mut depth = 1;
+            while depth > 0 {
+                let Some(&c) = bytes.get(*i) else {
+                    return false;
+                };
+                *i += 1;
+                if c == b'"' {
+                    *i -= 1;
+                    if read_json_string(bytes, i).is_none() {
+                        return false;
+                    }
+                } else if c == b {
+                    depth += 1;
+                } else if c == close {
+                    depth -= 1;
+                }
+            }
+            true
+        }
+        _ => {
+            while let Some(&c) = bytes.get(*i) {
+                if c == b',' || c == b'}' || c == b']' {
+                    break;
+                }
+                *i += 1;
+            }
+            true
+        }
+    }
+}
+
+/// Parse one `hyprctl binds` entry into a [`HyprBind`]: `None` when a needed
+/// field is missing or malformed, or the arg doesn't mention dictate.
+fn parse_bind_object(object: &str) -> Option<HyprBind> {
+    let bytes = object.as_bytes();
+    let mut i = 0;
+    skip_ws(bytes, &mut i);
+    if bytes.get(i) != Some(&b'{') {
+        return None;
+    }
+    i += 1;
+    let (mut modmask, mut key, mut release, mut arg) = (None, None, None, None);
+    loop {
+        skip_ws(bytes, &mut i);
+        match bytes.get(i) {
+            None => return None,
+            Some(b'}') => break,
+            Some(b',') => {
+                i += 1;
+                continue;
+            }
+            Some(b'"') => {}
+            _ => return None,
+        }
+        let name = read_json_string(bytes, &mut i)?;
+        skip_ws(bytes, &mut i);
+        if bytes.get(i) != Some(&b':') {
+            return None;
+        }
+        i += 1;
+        skip_ws(bytes, &mut i);
+        match name.as_str() {
+            "modmask" => modmask = read_u32(bytes, &mut i),
+            "key" => key = read_json_string(bytes, &mut i),
+            "release" => release = read_bool(bytes, &mut i),
+            "arg" => arg = read_json_string(bytes, &mut i),
+            _ => {
+                if !skip_json_value(bytes, &mut i) {
+                    return None;
+                }
+            }
+        }
+    }
+    let (modmask, key, release, arg): (u32, String, bool, String) =
+        (modmask?, key?, release?, arg?);
+    if !arg.contains("dictate") {
+        return None;
+    }
+    Some(HyprBind {
+        keys: format_keys(modmask, &key),
+        command: command_from_arg(&arg),
+        release,
+    })
+}
+
+/// `Super+Alt+D` from a Hyprland modmask and key name. Only the four common
+/// modifiers are shown; a single lowercase letter is uppercased.
+fn format_keys(modmask: u32, key: &str) -> String {
+    let mut parts: Vec<&str> = Vec::new();
+    if modmask & 64 != 0 {
+        parts.push("Super");
+    }
+    if modmask & 4 != 0 {
+        parts.push("Ctrl");
+    }
+    if modmask & 8 != 0 {
+        parts.push("Alt");
+    }
+    if modmask & 1 != 0 {
+        parts.push("Shift");
+    }
+    let upper;
+    let key = if key.len() == 1 {
+        upper = key.to_ascii_uppercase();
+        upper.as_str()
+    } else {
+        key
+    };
+    if parts.is_empty() {
+        key.to_string()
+    } else {
+        format!("{}+{key}", parts.join("+"))
+    }
+}
+
+/// The dictate command from a bind arg (`dictate toggle` → `toggle`). The
+/// `dictate` token may carry a path; when no command follows it, the whole
+/// arg is shown.
+fn command_from_arg(arg: &str) -> String {
+    let mut tokens = arg.split_whitespace();
+    while let Some(token) = tokens.next() {
+        let name = token.rsplit('/').next().unwrap_or(token);
+        if name == "dictate" {
+            if let Some(command) = tokens.next() {
+                return command.to_string();
+            }
+            break;
+        }
+    }
+    arg.trim().to_string()
 }
 
 /// Render one page frame, collecting the user's intents.
@@ -227,11 +518,7 @@ fn mode_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction
 fn shortcut_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
     heading(ui, "Shortcut");
     if view.wayland {
-        ui.label("Apps can't register global shortcuts on Wayland. Bind this shortcut in your compositor:");
-        if let Some(line) = wayland_shortcut_line(Some(view.hotkey_display)) {
-            ui.label(line);
-        }
-        ui.hyperlink_to("How to set it", crate::tray::README_USE_IT_URL);
+        wayland_shortcut_section(ui, view, actions);
         return;
     }
     egui::ComboBox::from_label("")
@@ -248,6 +535,45 @@ fn shortcut_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAc
         });
     explain(ui, "Tap to toggle dictation, hold to talk.");
     inline_error(ui, view.shortcut_error);
+}
+
+/// Shortcut section on Wayland, where the app can't register its own
+/// hotkey. On Hyprland the cached compositor binds are listed (re-queried
+/// with Refresh); everywhere else the generic explanation is shown. The
+/// configured in-app hotkey is never shown here: it isn't registered.
+fn wayland_shortcut_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
+    if !view.hyprland {
+        generic_wayland_shortcut(ui);
+        return;
+    }
+    match view.dictate_binds {
+        Some(binds) if !binds.is_empty() => {
+            ui.label("Your dictate shortcuts in Hyprland:");
+            for line in binds {
+                ui.label(line);
+            }
+        }
+        Some(_) => {
+            ui.label("No dictate shortcut is bound yet.");
+            ui.hyperlink_to("How to set it", crate::tray::README_USE_IT_URL);
+        }
+        None => generic_wayland_shortcut(ui),
+    }
+    explain(
+        ui,
+        "Queried when the window opens; Refresh re-reads the binds.",
+    );
+    if ui.button("Refresh").clicked() {
+        actions.push(PageAction::RefreshBinds);
+    }
+}
+
+/// Generic Wayland shortcut text (other compositors, or a failed query).
+fn generic_wayland_shortcut(ui: &mut egui::Ui) {
+    ui.label(
+        "Apps can't register global shortcuts on Wayland. Bind \"dictate toggle\" (or start/stop) in your compositor's keyboard settings:",
+    );
+    ui.hyperlink_to("How to set it", crate::tray::README_USE_IT_URL);
 }
 
 fn general_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
@@ -349,20 +675,125 @@ mod tests {
         );
     }
 
+    /// Realistic `hyprctl binds -j` output: a hold-to-talk pair on F8, a
+    /// toggle on Super+Alt+D, and an unrelated bind that must be filtered.
+    const HYPRCTL_BINDS: &str = r#"[
+        {"locked":false,"mouse":false,"release":false,"repeat":false,"modmask":0,"submap":"","key":"F8","keycode":0,"catch_all":false,"description":"","dispatcher":"exec","arg":"dictate start","enabled":true},
+        {"locked":false,"mouse":false,"release":true,"repeat":false,"modmask":0,"submap":"","key":"F8","keycode":0,"catch_all":false,"description":"","dispatcher":"exec","arg":"dictate stop","enabled":true},
+        {"locked":false,"mouse":false,"release":false,"repeat":false,"modmask":72,"submap":"","key":"d","keycode":0,"catch_all":false,"description":"","dispatcher":"exec","arg":"dictate toggle","enabled":true},
+        {"locked":false,"mouse":false,"release":false,"repeat":false,"modmask":64,"submap":"","key":"Return","keycode":0,"catch_all":false,"description":"","dispatcher":"exec","arg":"foot","enabled":true}
+    ]"#;
+
     #[test]
-    fn wayland_shortcut_line_needs_known_keys() {
+    fn parses_hyprland_dictate_binds() {
+        let binds = parse_hyprland_binds(HYPRCTL_BINDS);
         assert_eq!(
-            wayland_shortcut_line(Some("Ctrl+Shift+Space")),
-            Some("Your shortcut: Ctrl+Shift+Space".to_string())
+            binds,
+            vec![
+                HyprBind {
+                    keys: "F8".to_string(),
+                    command: "start".to_string(),
+                    release: false,
+                },
+                HyprBind {
+                    keys: "F8".to_string(),
+                    command: "stop".to_string(),
+                    release: true,
+                },
+                HyprBind {
+                    keys: "Super+Alt+D".to_string(),
+                    command: "toggle".to_string(),
+                    release: false,
+                },
+            ]
         );
-        assert_eq!(wayland_shortcut_line(Some("")), None);
-        assert_eq!(wayland_shortcut_line(None), None);
+    }
+
+    #[test]
+    fn formats_hold_release_and_toggle_lines() {
+        let binds = parse_hyprland_binds(HYPRCTL_BINDS);
+        assert_eq!(
+            format_hyprland_binds(&binds),
+            vec![
+                "F8 → start (hold)".to_string(),
+                "F8 → stop (release)".to_string(),
+                "Super+Alt+D → toggle".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn lone_binds_have_no_annotation() {
+        let binds = vec![
+            HyprBind {
+                keys: "Ctrl+Shift+Space".to_string(),
+                command: "toggle".to_string(),
+                release: false,
+            },
+            HyprBind {
+                keys: "F9".to_string(),
+                command: "cancel".to_string(),
+                release: true,
+            },
+        ];
+        assert_eq!(
+            format_hyprland_binds(&binds),
+            vec![
+                "Ctrl+Shift+Space → toggle".to_string(),
+                "F9 → cancel (release)".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn modmask_names_and_key_case() {
+        assert_eq!(format_keys(0, "F8"), "F8");
+        assert_eq!(format_keys(72, "d"), "Super+Alt+D");
+        assert_eq!(format_keys(5, "Space"), "Ctrl+Shift+Space");
+        assert_eq!(format_keys(64, "Return"), "Super+Return");
+    }
+
+    #[test]
+    fn command_from_arg_handles_paths_and_bare_dictate() {
+        assert_eq!(
+            command_from_arg("/home/u/.local/share/dictate/bin/dictate toggle"),
+            "toggle"
+        );
+        assert_eq!(command_from_arg("dictate start"), "start");
+        assert_eq!(command_from_arg("dictate"), "dictate");
+    }
+
+    #[test]
+    fn malformed_entries_are_skipped() {
+        assert!(parse_hyprland_binds("not json").is_empty());
+        assert!(parse_hyprland_binds("[]").is_empty());
+        // Missing `arg`, and a wrong type for `modmask`: both skipped, the
+        // good entry survives.
+        let json = r#"[
+            {"modmask":0,"key":"F8","release":false,"dispatcher":"exec"},
+            {"modmask":"x","key":"F8","release":false,"arg":"dictate toggle"},
+            {"modmask":0,"key":"F8","release":false,"arg":"dictate toggle"}
+        ]"#;
+        let binds = parse_hyprland_binds(json);
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0].command, "toggle");
+    }
+
+    #[test]
+    fn braces_and_escapes_inside_strings_parse() {
+        let json = r#"[
+            {"modmask":0,"key":"}","release":false,"arg":"notify-send \"dictate {done}\""}
+        ]"#;
+        let binds = parse_hyprland_binds(json);
+        assert_eq!(binds.len(), 1);
+        assert_eq!(binds[0].keys, "}");
+        assert_eq!(binds[0].command, "notify-send \"dictate {done}\"");
     }
 
     #[test]
     fn page_layout_numbers() {
         assert_eq!(PAGE_MARGIN, 16.0);
-        assert!(EXPLAIN_SIZE >= 12.0);
+        assert_eq!(EXPLAIN_SIZE, 12.0);
         assert_eq!(SECTION_GAP, 8.0);
     }
 
