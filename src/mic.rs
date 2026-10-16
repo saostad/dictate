@@ -5,7 +5,7 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::Context;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, Sample, SampleFormat, SizedSample};
+use cpal::{FromSample, I24, Sample, SampleFormat, SizedSample, U24};
 
 /// 16 kHz mono samples below this count are too short to transcribe (0.3 s).
 pub(crate) const MIN_RECORDING_SAMPLES: usize = 4800;
@@ -127,6 +127,32 @@ pub(crate) fn microphone_list(
     mics
 }
 
+/// One supported input config range as plain data, so
+/// [`prefer_f32_config`] is unit-testable without audio hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConfigRange {
+    channels: u16,
+    min_rate: u32,
+    max_rate: u32,
+    format: SampleFormat,
+}
+
+/// Prefer a float input config: the first F32 range, at `default_rate` when
+/// that lies inside the range, else the closest supported rate (the range
+/// edge). `None` when no range offers F32 (the caller then uses the default
+/// config). Ranges with `min_rate > max_rate` are skipped rather than
+/// panicking in `clamp`.
+fn prefer_f32_config(ranges: &[ConfigRange], default_rate: u32) -> Option<cpal::StreamConfig> {
+    let range = ranges
+        .iter()
+        .find(|range| range.format == SampleFormat::F32 && range.min_rate <= range.max_rate)?;
+    Some(cpal::StreamConfig {
+        channels: range.channels,
+        sample_rate: default_rate.clamp(range.min_rate, range.max_rate),
+        buffer_size: cpal::BufferSize::Default,
+    })
+}
+
 /// True when `samples_16k` holds less than 0.3 s of 16 kHz mono audio.
 pub(crate) fn recording_too_short(samples_16k: &[f32]) -> bool {
     samples_16k.len() < MIN_RECORDING_SAMPLES
@@ -231,27 +257,82 @@ impl Recorder {
         };
         let (mic_id, mic_name) = device_label(&device);
         mlog(&format!("recording from: {mic_name} ({mic_id})"));
-        let supported = device
+        let default_supported = device
             .default_input_config()
             .context("Could not get the microphone's default input config")?;
-        let channels = usize::from(supported.channels());
-        let sample_rate = supported.sample_rate();
-        let config = supported.config();
+        // Prefer float samples when the device offers them; otherwise use the
+        // default config (any PCM format it reports is handled below).
+        let (config, format) = match device.supported_input_configs() {
+            Ok(ranges) => {
+                let plain: Vec<ConfigRange> = ranges
+                    .map(|range| ConfigRange {
+                        channels: range.channels(),
+                        min_rate: range.min_sample_rate(),
+                        max_rate: range.max_sample_rate(),
+                        format: range.sample_format(),
+                    })
+                    .collect();
+                match prefer_f32_config(&plain, default_supported.sample_rate()) {
+                    Some(config) => (config, SampleFormat::F32),
+                    None => (
+                        default_supported.config(),
+                        default_supported.sample_format(),
+                    ),
+                }
+            }
+            Err(err) => {
+                mlog(&format!(
+                    "warning: could not list the microphone's supported configs ({err}); using the default config"
+                ));
+                (
+                    default_supported.config(),
+                    default_supported.sample_format(),
+                )
+            }
+        };
+        let channels = usize::from(config.channels);
+        let sample_rate = config.sample_rate;
+        mlog(&format!(
+            "mic format: {format:?} {channels}ch {sample_rate} Hz"
+        ));
         let samples = Arc::new(Mutex::new(Vec::with_capacity((sample_rate as usize) * 60)));
         let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
-        let stream = match supported.sample_format() {
-            SampleFormat::F32 => {
-                build_stream::<f32>(&device, &config, channels, &samples, &stream_error)
-            }
+        let stream = match format {
+            SampleFormat::I8 => build_stream::<i8>(&device, &config, channels, &samples, &stream_error),
             SampleFormat::I16 => {
                 build_stream::<i16>(&device, &config, channels, &samples, &stream_error)
             }
+            SampleFormat::I24 => {
+                build_stream::<I24>(&device, &config, channels, &samples, &stream_error)
+            }
+            SampleFormat::I32 => {
+                build_stream::<i32>(&device, &config, channels, &samples, &stream_error)
+            }
+            SampleFormat::I64 => {
+                build_stream::<i64>(&device, &config, channels, &samples, &stream_error)
+            }
+            SampleFormat::U8 => build_stream::<u8>(&device, &config, channels, &samples, &stream_error),
             SampleFormat::U16 => {
                 build_stream::<u16>(&device, &config, channels, &samples, &stream_error)
             }
+            SampleFormat::U24 => {
+                build_stream::<U24>(&device, &config, channels, &samples, &stream_error)
+            }
+            SampleFormat::U32 => {
+                build_stream::<u32>(&device, &config, channels, &samples, &stream_error)
+            }
+            SampleFormat::U64 => {
+                build_stream::<u64>(&device, &config, channels, &samples, &stream_error)
+            }
+            SampleFormat::F32 => {
+                build_stream::<f32>(&device, &config, channels, &samples, &stream_error)
+            }
+            SampleFormat::F64 => {
+                build_stream::<f64>(&device, &config, channels, &samples, &stream_error)
+            }
             format => {
                 anyhow::bail!(
-                    "Unsupported microphone sample format: {format:?} (only F32, I16 and U16 are supported)"
+                    "Unsupported microphone sample format: {format:?} (only PCM sample formats are supported)"
                 )
             }
         }
@@ -478,6 +559,60 @@ mod tests {
             "pulseaudio:gone"
         );
         assert_eq!(saved_mic_display(&[], "not an id"), "not an id");
+    }
+
+    fn range(channels: u16, min_rate: u32, max_rate: u32, format: SampleFormat) -> ConfigRange {
+        ConfigRange {
+            channels,
+            min_rate,
+            max_rate,
+            format,
+        }
+    }
+
+    #[test]
+    fn prefers_f32_at_default_rate_when_in_range() {
+        let ranges = vec![
+            range(2, 8000, 48_000, SampleFormat::I16),
+            range(2, 8000, 96_000, SampleFormat::F32),
+        ];
+        let config = prefer_f32_config(&ranges, 48_000).unwrap();
+        assert_eq!(config.channels, 2);
+        assert_eq!(config.sample_rate, 48_000);
+    }
+
+    #[test]
+    fn prefers_f32_at_closest_rate_when_default_is_out_of_range() {
+        let ranges = vec![range(1, 8000, 48_000, SampleFormat::F32)];
+        assert_eq!(
+            prefer_f32_config(&ranges, 96_000).unwrap().sample_rate,
+            48_000
+        );
+        assert_eq!(prefer_f32_config(&ranges, 4000).unwrap().sample_rate, 8000);
+    }
+
+    #[test]
+    fn no_f32_range_means_default_config() {
+        let ranges = vec![
+            range(2, 8000, 48_000, SampleFormat::I16),
+            range(2, 8000, 48_000, SampleFormat::I32),
+        ];
+        assert!(prefer_f32_config(&ranges, 48_000).is_none());
+        assert!(prefer_f32_config(&[], 48_000).is_none());
+    }
+
+    #[test]
+    fn first_f32_range_wins_and_degenerate_ranges_are_skipped() {
+        let ranges = vec![
+            range(2, 96_000, 8000, SampleFormat::F32),
+            range(1, 8000, 48_000, SampleFormat::F32),
+            range(2, 8000, 48_000, SampleFormat::F32),
+        ];
+        let config = prefer_f32_config(&ranges, 48_000).unwrap();
+        assert_eq!(config.channels, 1);
+        assert_eq!(config.sample_rate, 48_000);
+        // Only a degenerate F32 range: no pick (and no panic).
+        assert!(prefer_f32_config(&ranges[..1], 48_000).is_none());
     }
 
     #[test]

@@ -333,18 +333,7 @@ fn mics() -> anyhow::Result<()> {
         println!("{line}");
         println!("    {}", mic.id);
     }
-    let example = mics
-        .iter()
-        .find(|mic| mic.is_default)
-        .or(mics.first())
-        .map(|mic| mic.id.as_str())
-        .unwrap_or("<id>");
-    let path = config::config_path()
-        .map(|path| path.display().to_string())
-        .unwrap_or_else(|| "<config file>".to_string());
-    println!(
-        "Choose one in the tray menu (Microphone) or set microphone = \"{example}\" in {path}."
-    );
+    println!("Choose one in the tray menu (Microphone).");
     Ok(())
 }
 

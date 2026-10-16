@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::Context;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, SampleFormat, SizedSample};
+use cpal::{FromSample, I24, SampleFormat, SizedSample, U24};
 
 /// Start cue: 880 Hz.
 pub(crate) const START_FREQ_HZ: f32 = 880.0;
@@ -85,11 +85,20 @@ fn play_blocking(freq_hz: f32) -> anyhow::Result<()> {
         .context("could not get the default output config")?;
     let config = supported.config();
     match supported.sample_format() {
-        SampleFormat::F32 => run::<f32>(&device, &config, freq_hz),
+        SampleFormat::I8 => run::<i8>(&device, &config, freq_hz),
         SampleFormat::I16 => run::<i16>(&device, &config, freq_hz),
+        SampleFormat::I24 => run::<I24>(&device, &config, freq_hz),
+        SampleFormat::I32 => run::<i32>(&device, &config, freq_hz),
+        SampleFormat::I64 => run::<i64>(&device, &config, freq_hz),
+        SampleFormat::U8 => run::<u8>(&device, &config, freq_hz),
         SampleFormat::U16 => run::<u16>(&device, &config, freq_hz),
+        SampleFormat::U24 => run::<U24>(&device, &config, freq_hz),
+        SampleFormat::U32 => run::<u32>(&device, &config, freq_hz),
+        SampleFormat::U64 => run::<u64>(&device, &config, freq_hz),
+        SampleFormat::F32 => run::<f32>(&device, &config, freq_hz),
+        SampleFormat::F64 => run::<f64>(&device, &config, freq_hz),
         format => anyhow::bail!(
-            "unsupported output sample format: {format:?} (only F32, I16 and U16 are supported)"
+            "unsupported output sample format: {format:?} (only PCM sample formats are supported)"
         ),
     }
 }
