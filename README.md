@@ -147,6 +147,11 @@ release. Turn it on with the tray menu's "Type while speaking" checkbox or
 typed. Leave it off to type once at stop, as before. It's faster on long
 dictations: most of the text is already typed when you stop.
 
+Trade-off: each piece is transcribed with only 1.5 s of the audio before it,
+so a word right after a long pause is occasionally misheard (whole-recording
+mode hears everything at once and is the most accurate). Pauses are found by
+the Silero voice detector, which `dictate download` fetches (2.3 MB).
+
 ## Settings file
 
 Settings live in `config.toml` in the platform config directory:
