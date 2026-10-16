@@ -14,6 +14,7 @@ mod config;
 mod cue;
 mod daemon;
 mod hotkey;
+mod live;
 mod mic;
 mod model;
 mod notify;
@@ -41,13 +42,31 @@ fn run() -> anyhow::Result<()> {
         std::process::exit(2);
     };
     match command.as_str() {
-        "download" => model::download(),
+        "download" => {
+            let live = match args.next().as_deref() {
+                None => false,
+                Some("--live") => true,
+                Some(_) => {
+                    eprintln!("Usage: dictate download [--live]");
+                    std::process::exit(2);
+                }
+            };
+            if args.next().is_some() {
+                eprintln!("Usage: dictate download [--live]");
+                std::process::exit(2);
+            }
+            if live {
+                model::download_live()
+            } else {
+                model::download()
+            }
+        }
         "listen" => listen(),
         "daemon" => run_daemon(),
         "toggle" | "start" | "stop" | "cancel" | "status" => run_client(&command),
         "transcribe" => {
             let Some(first) = args.next() else {
-                eprintln!("Usage: dictate transcribe <file.wav>");
+                eprintln!("Usage: dictate transcribe [--live] <file.wav>");
                 std::process::exit(2);
             };
             if first == "--segmented" {
@@ -56,6 +75,12 @@ fn run() -> anyhow::Result<()> {
                     std::process::exit(2);
                 };
                 transcribe_segmented(Path::new(&file))
+            } else if first == "--live" {
+                let Some(file) = args.next() else {
+                    eprintln!("Usage: dictate transcribe [--live] <file.wav>");
+                    std::process::exit(2);
+                };
+                transcribe_live(Path::new(&file))
             } else {
                 transcribe(Path::new(&first))
             }
@@ -173,6 +198,70 @@ fn transcribe_segments(
     Ok(())
 }
 
+/// Transcribe a file with the Live streaming model: the same chunk loop the
+/// daemon runs (8960-sample chunks, padded remainder, 3 zero chunks to flush).
+/// Prints the text to stdout and the average chunk time to stderr.
+fn transcribe_live(path: &Path) -> anyhow::Result<()> {
+    let dir = model::live_model_dir_checked()?;
+    let samples = audio::load_wav_16k_mono(path)?;
+    let env = asr::shared_environment()?;
+    let threads = asr::intra_threads();
+    let start = std::time::Instant::now();
+    let mut live = live::Live::load(&dir, &env, threads)?;
+    eprintln!("model loaded in {} ms", start.elapsed().as_millis());
+    let chunk = live.chunk_samples().max(1);
+    let mut text = String::new();
+    let mut first = true;
+    let mut chunks: usize = 0;
+    let mut total_ms: u128 = 0;
+    for piece in samples.chunks(chunk) {
+        let mut full = piece.to_vec();
+        full.resize(chunk, 0.0);
+        let start = std::time::Instant::now();
+        let out = live.transcribe_chunk(&full)?;
+        total_ms += start.elapsed().as_millis();
+        chunks += 1;
+        append_live_output(&mut text, &mut first, &out);
+    }
+    let zeros = vec![0.0; chunk];
+    for _ in 0..live::FLUSH_CHUNKS {
+        let start = std::time::Instant::now();
+        let out = live.transcribe_chunk(&zeros)?;
+        total_ms += start.elapsed().as_millis();
+        chunks += 1;
+        append_live_output(&mut text, &mut first, &out);
+    }
+    live.reset();
+    let avg_ms = total_ms as f64 / chunks.max(1) as f64;
+    eprintln!(
+        "live: avg {} ms per 560 ms chunk (RTF {:.2})",
+        total_ms / chunks.max(1) as u128,
+        live::rtf(avg_ms)
+    );
+    if asr::is_empty_transcript(&text) {
+        let seconds = samples.len() as f32 / 16_000.0;
+        eprintln!("{}", asr::no_speech_message(seconds));
+        return Ok(());
+    }
+    println!("{text}");
+    Ok(())
+}
+
+/// Append one Live chunk output: empty outputs are skipped, the first
+/// non-empty output of a recording loses its leading space, later outputs are
+/// kept as-is (the model's text carries its own spaces).
+fn append_live_output(text: &mut String, first: &mut bool, out: &str) {
+    if out.is_empty() {
+        return;
+    }
+    if *first {
+        *first = false;
+        text.push_str(out.trim_start());
+    } else {
+        text.push_str(out);
+    }
+}
+
 fn listen() -> anyhow::Result<()> {
     let dir = model::model_dir_checked()?;
     let recorder = mic::Recorder::start()?;
@@ -222,5 +311,5 @@ fn run_client(cmd: &str) -> anyhow::Result<()> {
 }
 
 fn usage() -> &'static str {
-    "Usage: dictate <command> [args]\n\nCommands:\n  download               Download the speech model (about 660 MB)\n  transcribe <file.wav>  Transcribe a WAV file and print the text\n  listen                 Record from the microphone and print the text\n  daemon                 Run the dictation daemon (keeps the model loaded)\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  help                   Show this help"
+    "Usage: dictate <command> [args]\n\nCommands:\n  download [--live]      Download the speech model (about 660 MB; --live also fetches the Live model, about 900 MB)\n  transcribe [--live] <file.wav>  Transcribe a WAV file and print the text\n  listen                 Record from the microphone and print the text\n  daemon                 Run the dictation daemon (keeps the model loaded)\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  help                   Show this help"
 }

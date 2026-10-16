@@ -95,33 +95,45 @@ pub(crate) fn next(state: State, cmd: Command) -> (State, Action, &'static str) 
 /// One unit of work for the transcription worker.
 #[derive(Debug)]
 pub(crate) enum Job {
-    /// Whole recording at 16 kHz (streaming off): today's exact path.
+    /// Whole recording at 16 kHz (whole mode): today's exact path.
     Full(Vec<f32>),
-    /// One pause segment at 16 kHz plus its left context (streaming on).
+    /// One pause segment at 16 kHz plus its left context (pauses mode).
     Segment(crate::segment::Segment),
-    /// End of a streaming recording: whole-recording duration plus the moment
+    /// End of a pauses recording: whole-recording duration plus the moment
     /// Stop was handled, so the worker can log latency after release.
     End {
         total_seconds: f32,
         stop_time: Instant,
     },
-    /// Discard a streaming recording; already-typed text stays.
+    /// 16 kHz audio for the Live engine (live mode, arbitrary length); the
+    /// worker buffers it into model chunks.
+    LiveChunk(Vec<f32>),
+    /// End of a Live recording: the moment Stop was handled, so the worker
+    /// can log latency after release.
+    LiveEnd { stop_time: Instant },
+    /// Discard a pauses/Live recording; already-typed text stays.
     Cancel,
 }
 
-/// Control message for the streaming feeder thread.
+/// Control message for a feeder thread.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FeederCmd {
     Stop,
     Cancel,
 }
 
-/// A running feeder thread (streaming on, while Recording only). The thread
-/// hands the Vad back on exit (`None` when feeder setup consumed it); the
-/// daemon reuses one Vad across recordings.
-struct FeederSession {
-    control_tx: mpsc::Sender<FeederCmd>,
-    thread: Option<std::thread::JoinHandle<Option<crate::vad::Vad>>>,
+/// A running feeder thread (pauses/live mode, while Recording only). The
+/// pauses thread hands the Vad back on exit (`None` when feeder setup
+/// consumed it); the daemon reuses one Vad across recordings.
+enum FeederSession {
+    Pauses {
+        control_tx: mpsc::Sender<FeederCmd>,
+        thread: Option<std::thread::JoinHandle<Option<crate::vad::Vad>>>,
+    },
+    Live {
+        control_tx: mpsc::Sender<FeederCmd>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    },
 }
 
 /// Effective dictation mode (settings file + `DICTATE_MODE`).
@@ -246,7 +258,6 @@ fn run_daemon_inner() -> anyhow::Result<()> {
             &message,
         );
     }
-    let dir = crate::model::model_dir_checked()?;
     // Env wins; an unset or empty DICTATE_HOTKEY falls back to the file.
     let hotkey = match std::env::var("DICTATE_HOTKEY").ok() {
         Some(value) if !value.is_empty() => crate::hotkey::resolve_hotkey(Some(&value))
@@ -254,12 +265,7 @@ fn run_daemon_inner() -> anyhow::Result<()> {
         _ => crate::hotkey::resolve_file_hotkey(&file_settings.hotkey)
             .map_err(|message| anyhow::anyhow!("{message}"))?,
     };
-    let start = Instant::now();
-    let asr = crate::asr::Asr::load(&dir)?;
-    dlog!(
-        "model loaded in {} ms. Ready: run \"dictate toggle\" to start/stop recording.",
-        start.elapsed().as_millis()
-    );
+    let (models, live_fallback) = load_daemon_models(dictation_mode())?;
     #[cfg(unix)]
     let socket_file = {
         let path = socket::socket_path()?;
@@ -280,7 +286,7 @@ fn run_daemon_inner() -> anyhow::Result<()> {
         .context("Could not start the daemon event loop")?;
     let (to_worker, worker_rx) = mpsc::channel::<Job>();
     let worker_proxy = event_loop.create_proxy();
-    let worker = std::thread::spawn(move || transcribe_worker(worker_rx, worker_proxy, asr));
+    let worker = std::thread::spawn(move || transcribe_worker(worker_rx, worker_proxy, models));
     #[cfg(unix)]
     {
         let socket_proxy = event_loop.create_proxy();
@@ -290,7 +296,13 @@ fn run_daemon_inner() -> anyhow::Result<()> {
     dlog!(
         "Socket commands (dictate toggle/start/stop) are not available on Windows yet; use the hotkey."
     );
-    let mut app = DaemonApp::new(to_worker, worker, file_settings, event_loop.create_proxy());
+    let mut app = DaemonApp::new(
+        to_worker,
+        worker,
+        file_settings,
+        live_fallback,
+        event_loop.create_proxy(),
+    );
     setup_hotkey(&event_loop, hotkey, &mut app);
     event_loop
         .run_app(&mut app)
@@ -298,6 +310,82 @@ fn run_daemon_inner() -> anyhow::Result<()> {
     #[cfg(unix)]
     socket::remove_socket_file(&socket_file);
     Ok(())
+}
+
+/// Models owned by the transcription worker. Only the startup mode's model
+/// is loaded; the TDT model loads lazily if the tray later switches from
+/// live to pauses (the only cross-family switch without a restart).
+struct WorkerModels {
+    tdt: Option<crate::asr::Asr>,
+    live: Option<crate::live::Live>,
+}
+
+/// Load the model the startup mode needs. Live mode checks the model files
+/// and the speed gate first; either failure logs + notifies and falls back to
+/// whole mode for this session.
+fn load_daemon_models(mode: crate::config::Mode) -> anyhow::Result<(WorkerModels, bool)> {
+    if mode != crate::config::Mode::Live {
+        return load_tdt_models(false);
+    }
+    if crate::model::live_model_dir_checked().is_err() {
+        let body = "Run \"dictate download --live\" (about 900 MB). Using Whole recording.";
+        dlog!("error: dictate: Live model missing: {body}");
+        crate::notify::show(
+            crate::notify::Kind::Error,
+            "dictate: Live model missing",
+            body,
+        );
+        return load_tdt_models(true);
+    }
+    let dir = crate::model::live_model_dir_checked()?;
+    let env = crate::asr::shared_environment()?;
+    let threads = crate::asr::intra_threads();
+    let start = Instant::now();
+    let mut live = crate::live::Live::load(&dir, &env, threads)?;
+    dlog!(
+        "model loaded in {} ms. Ready: run \"dictate toggle\" to start/stop recording.",
+        start.elapsed().as_millis()
+    );
+    let median = live.benchmark();
+    if !crate::live::is_fast_enough(median) {
+        let body = format!(
+            "Needs under 392 ms per 560 ms of audio, took {} ms. Using Whole recording.",
+            median.as_millis()
+        );
+        dlog!("error: dictate: this computer is too slow for Live mode: {body}");
+        crate::notify::show(
+            crate::notify::Kind::Error,
+            "dictate: this computer is too slow for Live mode",
+            &body,
+        );
+        drop(live);
+        return load_tdt_models(true);
+    }
+    Ok((
+        WorkerModels {
+            tdt: None,
+            live: Some(live),
+        },
+        false,
+    ))
+}
+
+/// Load the TDT model for whole/pauses mode, or as the Live fallback.
+fn load_tdt_models(live_fallback: bool) -> anyhow::Result<(WorkerModels, bool)> {
+    let dir = crate::model::model_dir_checked()?;
+    let start = Instant::now();
+    let asr = crate::asr::Asr::load(&dir)?;
+    dlog!(
+        "model loaded in {} ms. Ready: run \"dictate toggle\" to start/stop recording.",
+        start.elapsed().as_millis()
+    );
+    Ok((
+        WorkerModels {
+            tdt: Some(asr),
+            live: None,
+        },
+        live_fallback,
+    ))
 }
 
 /// Register the global hotkey (except on Wayland) and keep its manager alive
@@ -355,6 +443,9 @@ struct DaemonApp {
     tap_armed: bool,
     worker_gone_notified: bool,
     settings: crate::config::Settings,
+    /// Live was requested but failed the startup checks: live recordings run
+    /// whole for this session.
+    live_fallback: bool,
     tray: Option<crate::tray::Tray>,
     tray_attempted: bool,
     menu_proxy: EventLoopProxy<UserEvent>,
@@ -368,6 +459,7 @@ impl DaemonApp {
         to_worker: mpsc::Sender<Job>,
         worker: std::thread::JoinHandle<()>,
         settings: crate::config::Settings,
+        live_fallback: bool,
         menu_proxy: EventLoopProxy<UserEvent>,
     ) -> Self {
         Self {
@@ -383,10 +475,22 @@ impl DaemonApp {
             tap_armed: false,
             worker_gone_notified: false,
             settings,
+            live_fallback,
             tray: None,
             tray_attempted: false,
             menu_proxy,
             _hotkey_manager: None,
+        }
+    }
+
+    /// Dictation mode for the next recording: live maps to whole when the
+    /// startup checks failed it for this session.
+    fn current_mode(&self) -> crate::config::Mode {
+        let mode = dictation_mode();
+        if mode == crate::config::Mode::Live && self.live_fallback {
+            crate::config::Mode::Whole
+        } else {
+            mode
         }
     }
 
@@ -689,34 +793,16 @@ impl DaemonApp {
         }
     }
 
-    /// Start the mic, and the feeder thread when pauses mode is on and a
-    /// voice detector is available. Otherwise the recording runs in
-    /// whole-recording mode (the fallback is logged + notified, not silent).
-    /// Live mode arrives with the live engine; until then it records whole.
+    /// Start the mic, plus a feeder thread in pauses/live mode. Pauses mode
+    /// without a voice detector falls back to whole for the recording (logged
+    /// + notified, not silent).
     fn start_recording(&mut self, new_state: State, ok_reply: &str) -> String {
         match crate::mic::Recorder::start() {
             Ok(started) => {
-                if dictation_mode() == crate::config::Mode::Pauses {
-                    match self.take_streaming_vad() {
-                        Some(mut vad) => {
-                            vad.reset();
-                            let buffer = started.buffer_handle();
-                            let sample_rate = started.sample_rate();
-                            let (control_tx, control_rx) = mpsc::channel::<FeederCmd>();
-                            let to_worker = self.to_worker.clone();
-                            let thread = std::thread::spawn(move || {
-                                feeder_loop(vad, buffer, sample_rate, control_rx, to_worker)
-                            });
-                            self.feeder = Some(FeederSession {
-                                control_tx,
-                                thread: Some(thread),
-                            });
-                        }
-                        None => {
-                            // No voice detector: whole-recording mode for
-                            // this recording (already logged + notified).
-                        }
-                    }
+                match self.current_mode() {
+                    crate::config::Mode::Pauses => self.start_pauses_feeder(&started),
+                    crate::config::Mode::Live => self.start_live_feeder(&started),
+                    crate::config::Mode::Whole => {}
                 }
                 self.recorder = Some(started);
                 self.state = new_state;
@@ -733,6 +819,41 @@ impl DaemonApp {
                 format!("err {err:#}")
             }
         }
+    }
+
+    /// Spawn the pauses feeder (VAD segmentation) for a recording. Without a
+    /// voice detector this recording runs whole (already logged + notified).
+    fn start_pauses_feeder(&mut self, started: &crate::mic::Recorder) {
+        let Some(mut vad) = self.take_streaming_vad() else {
+            return;
+        };
+        vad.reset();
+        let buffer = started.buffer_handle();
+        let sample_rate = started.sample_rate();
+        let (control_tx, control_rx) = mpsc::channel::<FeederCmd>();
+        let to_worker = self.to_worker.clone();
+        let thread = std::thread::spawn(move || {
+            feeder_loop(vad, buffer, sample_rate, control_rx, to_worker)
+        });
+        self.feeder = Some(FeederSession::Pauses {
+            control_tx,
+            thread: Some(thread),
+        });
+    }
+
+    /// Spawn the live feeder (16 kHz audio, no VAD) for a recording.
+    fn start_live_feeder(&mut self, started: &crate::mic::Recorder) {
+        let buffer = started.buffer_handle();
+        let sample_rate = started.sample_rate();
+        let (control_tx, control_rx) = mpsc::channel::<FeederCmd>();
+        let to_worker = self.to_worker.clone();
+        let thread = std::thread::spawn(move || {
+            live_feeder_loop(buffer, sample_rate, control_rx, to_worker)
+        });
+        self.feeder = Some(FeederSession::Live {
+            control_tx,
+            thread: Some(thread),
+        });
     }
 
     /// A voice detector for a streaming recording, reusing the daemon's Vad
@@ -768,9 +889,9 @@ impl DaemonApp {
         }
     }
 
-    /// Stop the mic. Streaming on: the feeder sends the tail plus `End` and
-    /// the state stays Transcribing until the worker is done. Streaming off:
-    /// today's exact path (one `Full` job at stop).
+    /// Stop the mic. With a feeder (pauses/live): it sends the tail plus
+    /// `End`/`LiveEnd` and the state stays Transcribing until the worker is
+    /// done. Whole mode: today's exact path (one `Full` job at stop).
     fn stop_recording(&mut self, new_state: State, ok_reply: &str) -> String {
         if self.feeder.is_some() {
             return self.stop_streaming(new_state, ok_reply);
@@ -805,7 +926,7 @@ impl DaemonApp {
         }
     }
 
-    /// Stop a streaming recording via the feeder thread.
+    /// Stop a pauses/live recording via the feeder thread.
     fn stop_streaming(&mut self, new_state: State, ok_reply: &str) -> String {
         // A mic failure discards the recording instead of finishing it.
         if let Some(recorder) = &self.recorder
@@ -839,21 +960,42 @@ impl DaemonApp {
     }
 
     /// Signal the feeder thread (`Stop`/`Cancel`) and wait for it to exit,
-    /// taking the Vad back for the next recording. No feeder: no-op. A dead
-    /// feeder unblocks the worker with `Cancel`.
+    /// taking the Vad back for the next pauses recording. No feeder: no-op.
+    /// A dead feeder unblocks the worker with `Cancel`.
     fn finish_feeder(&mut self, cmd: FeederCmd) {
-        let Some(mut session) = self.feeder.take() else {
+        let Some(session) = self.feeder.take() else {
             return;
         };
-        let signalled = session.control_tx.send(cmd).is_ok();
-        if let Some(thread) = session.thread.take() {
-            match thread.join() {
-                Ok(vad) => self.vad = vad,
-                Err(_) => dlog!("error: the streaming feeder thread panicked"),
+        match session {
+            FeederSession::Pauses {
+                control_tx,
+                mut thread,
+            } => {
+                let signalled = control_tx.send(cmd).is_ok();
+                if let Some(handle) = thread.take() {
+                    match handle.join() {
+                        Ok(vad) => self.vad = vad,
+                        Err(_) => dlog!("error: the streaming feeder thread panicked"),
+                    }
+                }
+                if !signalled && self.to_worker.send(Job::Cancel).is_err() {
+                    // The worker is gone; `handle_command` reports that itself.
+                }
             }
-        }
-        if !signalled && self.to_worker.send(Job::Cancel).is_err() {
-            // The worker is gone; `handle_command` reports that itself.
+            FeederSession::Live {
+                control_tx,
+                mut thread,
+            } => {
+                let signalled = control_tx.send(cmd).is_ok();
+                if let Some(handle) = thread.take()
+                    && handle.join().is_err()
+                {
+                    dlog!("error: the live feeder thread panicked");
+                }
+                if !signalled && self.to_worker.send(Job::Cancel).is_err() {
+                    // The worker is gone; `handle_command` reports that itself.
+                }
+            }
         }
     }
 
@@ -1043,6 +1185,112 @@ fn feeder_loop(
     Some(feeder.into_scorer())
 }
 
+/// Live feeder thread: while Recording, wake every 100 ms, drain new
+/// device-rate samples, resample to 16 kHz (stateful, so the stream is
+/// continuous) and send the audio to the worker, which buffers it into model
+/// chunks. On `Stop` the tail plus `LiveEnd` go out; on `Cancel` a single
+/// `Cancel` goes out. Only the `Arc` buffer crosses threads; the `Recorder`
+/// stays on the event-loop thread.
+fn live_feeder_loop(
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+    sample_rate: u32,
+    control_rx: mpsc::Receiver<FeederCmd>,
+    to_worker: mpsc::Sender<Job>,
+) {
+    let mut resampler = if sample_rate == crate::audio::TARGET_SAMPLE_RATE {
+        None
+    } else {
+        match crate::audio::StreamResampler::new(sample_rate) {
+            Ok(resampler) => Some(resampler),
+            Err(err) => {
+                feeder_failed(&to_worker, err);
+                return;
+            }
+        }
+    };
+    loop {
+        match control_rx.recv_timeout(std::time::Duration::from_millis(100)) {
+            Ok(FeederCmd::Stop) => {
+                let new = crate::mic::take_buffer(&buffer);
+                let tail = match push_live_audio(&mut resampler, &new) {
+                    Ok(tail) => tail,
+                    Err(err) => {
+                        feeder_failed(&to_worker, err);
+                        break;
+                    }
+                };
+                send_live_chunk(&to_worker, tail);
+                if let Some(resampler) = resampler.as_mut() {
+                    match resampler.finish() {
+                        Ok(flushed) => send_live_chunk(&to_worker, flushed),
+                        Err(err) => {
+                            feeder_failed(&to_worker, err);
+                            break;
+                        }
+                    }
+                }
+                if to_worker
+                    .send(Job::LiveEnd {
+                        stop_time: Instant::now(),
+                    })
+                    .is_err()
+                {
+                    // The worker is gone; the event loop reports that itself.
+                }
+                break;
+            }
+            Ok(FeederCmd::Cancel) => {
+                if to_worker.send(Job::Cancel).is_err() {
+                    // The worker is gone; the event loop reports that itself.
+                }
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let new = crate::mic::take_buffer(&buffer);
+                if new.is_empty() {
+                    continue;
+                }
+                match push_live_audio(&mut resampler, &new) {
+                    Ok(ready) => send_live_chunk(&to_worker, ready),
+                    Err(err) => {
+                        feeder_failed(&to_worker, err);
+                        break;
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The event loop went away without Stop/Cancel; unblock the
+                // worker rather than leave it Transcribing forever.
+                if to_worker.send(Job::Cancel).is_err() {
+                    // The worker is gone too.
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// Resample device-rate audio to 16 kHz (`None` resampler: already 16 kHz).
+fn push_live_audio(
+    resampler: &mut Option<crate::audio::StreamResampler>,
+    device_samples: &[f32],
+) -> anyhow::Result<Vec<f32>> {
+    match resampler {
+        Some(resampler) => resampler.push(device_samples),
+        None => Ok(device_samples.to_vec()),
+    }
+}
+
+/// Queue 16 kHz audio for Live transcription (empty pieces are skipped).
+fn send_live_chunk(to_worker: &mpsc::Sender<Job>, samples_16k: Vec<f32>) {
+    if samples_16k.is_empty() {
+        return;
+    }
+    if to_worker.send(Job::LiveChunk(samples_16k)).is_err() {
+        // The worker is gone; the event loop reports that itself.
+    }
+}
+
 /// Queue one 16 kHz segment for transcription.
 fn send_segment(to_worker: &mpsc::Sender<Job>, segment: crate::segment::Segment) {
     if segment.audio.is_empty() {
@@ -1197,17 +1445,78 @@ fn feeder_failed(to_worker: &mpsc::Sender<Job>, err: anyhow::Error) {
     }
 }
 
-/// Owns the `Asr`: transcribes queued recordings and signals completion.
+/// Per-recording Live state in the worker.
+#[derive(Default)]
+struct LiveRun {
+    /// Buffered 16 kHz audio awaiting full model chunks.
+    buffer: Vec<f32>,
+    /// Transcribed chunks (successful only).
+    chunks: usize,
+    /// Total chunk transcription time in ms.
+    total_ms: u128,
+    /// Typed characters.
+    typed_chars: usize,
+    /// The next non-empty output is the recording's first (trim its space).
+    first: bool,
+}
+
+impl LiveRun {
+    fn new() -> Self {
+        Self {
+            first: true,
+            ..Self::default()
+        }
+    }
+
+    fn reset(&mut self) {
+        *self = Self::new();
+    }
+}
+
+/// The TDT model, loading it on first need (the tray can switch a live
+/// daemon to pauses without a restart).
+fn ensure_tdt(models: &mut WorkerModels) -> anyhow::Result<&mut crate::asr::Asr> {
+    if models.tdt.is_none() {
+        let dir = crate::model::model_dir_checked()?;
+        let start = Instant::now();
+        let asr = crate::asr::Asr::load(&dir)?;
+        dlog!("model loaded in {} ms", start.elapsed().as_millis());
+        models.tdt = Some(asr);
+    }
+    models
+        .tdt
+        .as_mut()
+        .ok_or_else(|| anyhow::anyhow!("Internal error: speech model missing after load"))
+}
+
+/// Drain newly arrived jobs into the local queue; when a `Cancel` is queued,
+/// discard everything up to and including it and report true.
+fn pop_cancel(queue: &mut std::collections::VecDeque<Job>, rx: &mpsc::Receiver<Job>) -> bool {
+    while let Ok(pending) = rx.try_recv() {
+        queue.push_back(pending);
+    }
+    if let Some(position) = queue.iter().position(|job| matches!(job, Job::Cancel)) {
+        for _ in 0..=position {
+            queue.pop_front();
+        }
+        return true;
+    }
+    false
+}
+
+/// Owns the models: transcribes queued recordings and signals completion.
 /// Never exits while the daemon runs; every failure is logged.
 ///
-/// `Full` is the streaming-off path (today's exact behavior).
-/// `Segment`/`End`/`Cancel` are the streaming path: each segment is typed
-/// as it finishes, at `End` the pending punctuation plus the latency line go
-/// out, and `Cancel` discards queued segments without typing anything more.
+/// `Full` is the whole-mode path (today's exact behavior).
+/// `Segment`/`End` are the pauses path: each segment is typed as it finishes,
+/// and at `End` the pending punctuation plus the latency line go out.
+/// `LiveChunk`/`LiveEnd` are the live path: chunk outputs are typed as they
+/// arrive, and at `LiveEnd` the remainder is padded, the model is flushed and
+/// the summary line goes out. `Cancel` resets both streaming states.
 fn transcribe_worker(
     rx: mpsc::Receiver<Job>,
     proxy: EventLoopProxy<UserEvent>,
-    mut asr: crate::asr::Asr,
+    mut models: WorkerModels,
 ) {
     let mut typer = crate::typer::Typer::new();
     if let Err(err) = &typer {
@@ -1217,14 +1526,16 @@ fn transcribe_worker(
     // here, in order, so a `Cancel` spotted mid-transcription can discard
     // them before anything more is typed.
     let mut queue: std::collections::VecDeque<Job> = std::collections::VecDeque::new();
-    // Per-recording streaming state.
+    // Per-recording pauses state.
     let mut typed_words: Vec<String> = Vec::new();
     let mut pending_punct: Option<char> = None;
     let mut segments: usize = 0;
     let mut failures: usize = 0;
+    // Per-recording live state.
+    let mut live = LiveRun::new();
     let worker_done =
         |proxy: &EventLoopProxy<UserEvent>| proxy.send_event(UserEvent::WorkerDone).is_err();
-    loop {
+    'worker: loop {
         let job = if let Some(job) = queue.pop_front() {
             job
         } else {
@@ -1235,7 +1546,17 @@ fn transcribe_worker(
         };
         match job {
             Job::Full(samples) => {
-                transcribe_full(&samples, &mut asr, typer.as_mut());
+                match ensure_tdt(&mut models) {
+                    Ok(asr) => transcribe_full(&samples, asr, typer.as_mut()),
+                    Err(err) => {
+                        dlog!("error: {err:#}");
+                        crate::notify::show(
+                            crate::notify::Kind::Error,
+                            "dictate: transcription failed",
+                            &format!("{err:#}"),
+                        );
+                    }
+                }
                 if worker_done(&proxy) {
                     break;
                 }
@@ -1245,6 +1566,19 @@ fn transcribe_worker(
                 let seq = segments;
                 let seconds = segment.audio.len() as f32 / 16_000.0;
                 let context_s = segment.context.len() as f32 / 16_000.0;
+                let asr = match ensure_tdt(&mut models) {
+                    Ok(asr) => asr,
+                    Err(err) => {
+                        dlog!("error: {err:#}");
+                        crate::notify::show(
+                            crate::notify::Kind::Error,
+                            "dictate: transcription failed",
+                            &format!("{err:#}"),
+                        );
+                        failures += 1;
+                        continue;
+                    }
+                };
                 let start = Instant::now();
                 let (kept_texts, boundary) =
                     match asr.transcribe_segment_pieces(&segment.context, &segment.audio) {
@@ -1370,11 +1704,111 @@ fn transcribe_worker(
                     break;
                 }
             }
+            Job::LiveChunk(samples) => {
+                let Some(live_model) = models.live.as_mut() else {
+                    dlog!("error: Internal error: live audio arrived without a live model");
+                    continue;
+                };
+                live.buffer.extend_from_slice(&samples);
+                let chunk = live_model.chunk_samples().max(1);
+                while live.buffer.len() >= chunk {
+                    let piece: Vec<f32> = live.buffer.drain(..chunk).collect();
+                    let start = Instant::now();
+                    let out = match live_model.transcribe_chunk(&piece) {
+                        Ok(out) => out,
+                        Err(err) => {
+                            dlog!("error: {err:#}");
+                            crate::notify::show(
+                                crate::notify::Kind::Error,
+                                "dictate: transcription failed",
+                                &format!("{err:#}"),
+                            );
+                            continue;
+                        }
+                    };
+                    live.chunks += 1;
+                    live.total_ms += start.elapsed().as_millis();
+                    if out.is_empty() {
+                        continue;
+                    }
+                    // A `Cancel` that arrived mid-transcription discards this
+                    // output and the rest of the recording.
+                    if pop_cancel(&mut queue, &rx) {
+                        live.reset();
+                        live_model.reset();
+                        if worker_done(&proxy) {
+                            break 'worker;
+                        }
+                        continue 'worker;
+                    }
+                    let to_type = if live.first {
+                        live.first = false;
+                        out.trim_start().to_string()
+                    } else {
+                        out
+                    };
+                    if to_type.is_empty() {
+                        continue;
+                    }
+                    match typer.as_mut() {
+                        Ok(typer) => match typer.type_text(&to_type) {
+                            Ok(()) => live.typed_chars += to_type.chars().count(),
+                            Err(err) => {
+                                live_type_failed(&to_type, err);
+                            }
+                        },
+                        Err(err) => {
+                            live_type_failed(&to_type, anyhow::anyhow!("{err:#}"));
+                        }
+                    }
+                }
+            }
+            Job::LiveEnd { stop_time } => {
+                let Some(live_model) = models.live.as_mut() else {
+                    dlog!("error: Internal error: live recording ended without a live model");
+                    live.reset();
+                    if worker_done(&proxy) {
+                        break;
+                    }
+                    continue;
+                };
+                let chunk = live_model.chunk_samples().max(1);
+                if !live.buffer.is_empty() {
+                    let mut last = std::mem::take(&mut live.buffer);
+                    last.resize(chunk, 0.0);
+                    transcribe_live_piece(live_model, &mut live, typer.as_mut(), &last);
+                }
+                let zeros = vec![0.0; chunk];
+                for _ in 0..crate::live::FLUSH_CHUNKS {
+                    transcribe_live_piece(live_model, &mut live, typer.as_mut(), &zeros);
+                }
+                live_model.reset();
+                let avg = if live.chunks > 0 {
+                    live.total_ms / live.chunks as u128
+                } else {
+                    0
+                };
+                dlog!(
+                    "live: {} chunks, avg {} ms/chunk, typed {} chars, done {} ms after stop",
+                    live.chunks,
+                    avg,
+                    live.typed_chars,
+                    stop_time.elapsed().as_millis()
+                );
+                live.reset();
+                if worker_done(&proxy) {
+                    break;
+                }
+            }
             Job::Cancel => {
                 typed_words.clear();
                 pending_punct = None;
                 segments = 0;
                 failures = 0;
+                live.reset();
+                if let Some(live_model) = models.live.as_mut() {
+                    live_model.reset();
+                }
                 if worker_done(&proxy) {
                     break;
                 }
@@ -1383,7 +1817,62 @@ fn transcribe_worker(
     }
 }
 
-/// Transcribe one whole recording (streaming off): today's exact behavior.
+/// Transcribe one full Live chunk (remainder or flush) and type its output.
+/// Failures are logged + notified; the chunk is skipped.
+fn transcribe_live_piece(
+    live_model: &mut crate::live::Live,
+    run: &mut LiveRun,
+    typer: Result<&mut crate::typer::Typer, &mut anyhow::Error>,
+    piece: &[f32],
+) {
+    let start = Instant::now();
+    let out = match live_model.transcribe_chunk(piece) {
+        Ok(out) => out,
+        Err(err) => {
+            dlog!("error: {err:#}");
+            crate::notify::show(
+                crate::notify::Kind::Error,
+                "dictate: transcription failed",
+                &format!("{err:#}"),
+            );
+            return;
+        }
+    };
+    run.chunks += 1;
+    run.total_ms += start.elapsed().as_millis();
+    if out.is_empty() {
+        return;
+    }
+    let to_type = if run.first {
+        run.first = false;
+        out.trim_start().to_string()
+    } else {
+        out
+    };
+    if to_type.is_empty() {
+        return;
+    }
+    match typer {
+        Ok(typer) => match typer.type_text(&to_type) {
+            Ok(()) => run.typed_chars += to_type.chars().count(),
+            Err(err) => live_type_failed(&to_type, err),
+        },
+        Err(err) => live_type_failed(&to_type, anyhow::anyhow!("{err:#}")),
+    }
+}
+
+/// Log + notify a Live typing failure; the text stays on stderr, never lost.
+fn live_type_failed(to_type: &str, err: anyhow::Error) {
+    dlog!("error: {err:#}");
+    dlog!("Text that was not typed: {to_type}");
+    crate::notify::show(
+        crate::notify::Kind::Error,
+        "dictate: could not type the text",
+        &crate::notify::typing_failure_body(&format!("{err:#}"), to_type),
+    );
+}
+
+/// Transcribe one whole recording (whole mode): today's exact behavior.
 fn transcribe_full(
     samples: &[f32],
     asr: &mut crate::asr::Asr,

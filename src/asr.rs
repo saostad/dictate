@@ -280,7 +280,7 @@ pub(crate) fn thread_count(parallelism: Option<usize>) -> usize {
     parallelism.unwrap_or(4).clamp(1, 16)
 }
 
-fn intra_threads() -> usize {
+pub(crate) fn intra_threads() -> usize {
     thread_count(
         std::thread::available_parallelism()
             .ok()

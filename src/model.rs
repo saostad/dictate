@@ -11,6 +11,16 @@ const MODEL_FILES: &[&str] = &[
     "decoder_joint-model.int8.onnx",
     "vocab.txt",
 ];
+const LIVE_REVISION: &str = "95df6c82aa796a3fc793f87633dcdb017ac12c07";
+const LIVE_BASE_URL: &str =
+    "https://huggingface.co/lokkju/nemotron-speech-streaming-en-0.6b-int8/resolve";
+const LIVE_DIR_NAME: &str = "nemotron-streaming-en-0.6b-int8";
+/// Live model files with their exact pinned sizes in bytes.
+const LIVE_FILES: &[(&str, u64)] = &[
+    ("encoder.onnx", 880_555_453),
+    ("decoder_joint.onnx", 10_962_697),
+    ("tokenizer.model", 251_056),
+];
 const VAD_URL: &str = "https://github.com/snakers4/silero-vad/raw/1e261b036686cd0017d500ee96acd1c4ba572a9d/src/silero_vad/data/silero_vad.onnx";
 const VAD_DIR_NAME: &str = "silero-vad-v6";
 const VAD_FILE_NAME: &str = "silero_vad.onnx";
@@ -71,10 +81,46 @@ pub fn model_dir_checked() -> anyhow::Result<PathBuf> {
 /// Voice-detector dir for a parakeet model dir: the sibling
 /// `silero-vad-v6` under the same models dir.
 fn vad_dir_for(model_dir: &Path) -> PathBuf {
+    sibling_dir_for(model_dir, VAD_DIR_NAME)
+}
+
+/// Live-model dir for a parakeet model dir: the sibling
+/// `nemotron-streaming-en-0.6b-int8` under the same models dir.
+fn live_dir_for(model_dir: &Path) -> PathBuf {
+    sibling_dir_for(model_dir, LIVE_DIR_NAME)
+}
+
+/// A sibling of the parakeet model dir under the same models dir.
+fn sibling_dir_for(model_dir: &Path, name: &str) -> PathBuf {
     match model_dir.parent() {
-        Some(models) => models.join(VAD_DIR_NAME),
-        None => model_dir.join(VAD_DIR_NAME),
+        Some(models) => models.join(name),
+        None => model_dir.join(name),
     }
+}
+
+/// The Live model directory. Creates nothing.
+pub fn live_model_dir() -> anyhow::Result<PathBuf> {
+    Ok(live_dir_for(&model_dir()?))
+}
+
+/// Error unless every Live model file exists in `dir`.
+pub fn check_live_model_dir(dir: &Path) -> anyhow::Result<()> {
+    for (name, _) in LIVE_FILES {
+        if !dir.join(name).is_file() {
+            anyhow::bail!(
+                "Model file {name} is missing in {}. Run \"dictate download --live\" first (about 900 MB).",
+                dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The Live model directory, checked for completeness.
+pub fn live_model_dir_checked() -> anyhow::Result<PathBuf> {
+    let dir = live_model_dir()?;
+    check_live_model_dir(&dir)?;
+    Ok(dir)
 }
 
 /// Path of the voice-detector model. Creates nothing.
@@ -105,6 +151,15 @@ fn check_vad_file(path: &Path) -> anyhow::Result<()> {
 
 /// Download any missing model files into the model directory.
 pub fn download() -> anyhow::Result<()> {
+    download_inner(false)
+}
+
+/// Download the speech model plus the Live streaming model.
+pub fn download_live() -> anyhow::Result<()> {
+    download_inner(true)
+}
+
+fn download_inner(with_live: bool) -> anyhow::Result<()> {
     let dir = model_dir()?;
     fs::create_dir_all(&dir)
         .with_context(|| format!("Could not create model directory {}", dir.display()))?;
@@ -125,7 +180,35 @@ pub fn download() -> anyhow::Result<()> {
             .with_context(|| format!("Downloading {name} from {url} failed"))?;
     }
     download_vad()?;
+    if with_live {
+        download_live_files()?;
+    }
     println!("Model ready in {}", dir.display());
+    Ok(())
+}
+
+/// Download any missing Live model files, verifying their exact pinned sizes.
+/// A wrong-sized file is deleted and re-downloaded, never trusted.
+fn download_live_files() -> anyhow::Result<()> {
+    let dir = live_model_dir()?;
+    fs::create_dir_all(&dir)
+        .with_context(|| format!("Could not create model directory {}", dir.display()))?;
+    for (name, size) in LIVE_FILES {
+        let dest = dir.join(name);
+        let present_len = dest.metadata().map(|metadata| metadata.len()).unwrap_or(0);
+        if dest.is_file() && present_len == *size {
+            println!("{name}: already present");
+            continue;
+        }
+        if dest.is_file() {
+            eprintln!("{name}: wrong size ({present_len} bytes, expected {size}); re-downloading");
+        }
+        let url = format!("{LIVE_BASE_URL}/{LIVE_REVISION}/{name}");
+        download_file(&url, name, &dest)
+            .with_context(|| format!("Downloading {name} from {url} failed"))?;
+        verify_file_size(&dest, name, *size)
+            .with_context(|| format!("Downloading {name} from {url} failed"))?;
+    }
     Ok(())
 }
 
@@ -150,7 +233,7 @@ fn download_vad() -> anyhow::Result<()> {
     }
     download_file(VAD_URL, VAD_FILE_NAME, &dest)
         .with_context(|| format!("Downloading {VAD_FILE_NAME} from {VAD_URL} failed"))?;
-    verify_file_size(&dest, VAD_FILE_SIZE)
+    verify_file_size(&dest, VAD_FILE_NAME, VAD_FILE_SIZE)
         .with_context(|| format!("Downloading {VAD_FILE_NAME} from {VAD_URL} failed"))?;
     Ok(())
 }
@@ -158,7 +241,7 @@ fn download_vad() -> anyhow::Result<()> {
 /// The downloaded file must have exactly `expected` bytes (the integrity
 /// check: exact size stands in for the sha256). A mismatch deletes the file
 /// and errors clearly.
-fn verify_file_size(path: &Path, expected: u64) -> anyhow::Result<()> {
+fn verify_file_size(path: &Path, file_name: &str, expected: u64) -> anyhow::Result<()> {
     let len = fs::metadata(path)
         .with_context(|| format!("Could not read metadata of {}", path.display()))?
         .len();
@@ -172,7 +255,7 @@ fn verify_file_size(path: &Path, expected: u64) -> anyhow::Result<()> {
         );
     }
     anyhow::bail!(
-        "{VAD_FILE_NAME} has wrong size: {len} bytes, expected {expected} bytes (the file was deleted)"
+        "{file_name} has wrong size: {len} bytes, expected {expected} bytes (the file was deleted)"
     );
 }
 
@@ -338,7 +421,7 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(VAD_FILE_NAME);
         fs::write(&path, b"12345").unwrap();
-        verify_file_size(&path, 5).unwrap();
+        verify_file_size(&path, VAD_FILE_NAME, 5).unwrap();
         assert!(path.is_file(), "a good file must be kept");
         cleanup(&dir);
     }
@@ -349,12 +432,47 @@ mod tests {
         fs::create_dir_all(&dir).unwrap();
         let path = dir.join(VAD_FILE_NAME);
         fs::write(&path, b"1234").unwrap();
-        let err = verify_file_size(&path, 5).unwrap_err();
+        let err = verify_file_size(&path, VAD_FILE_NAME, 5).unwrap_err();
         let msg = format!("{err:#}");
         assert!(msg.contains(VAD_FILE_NAME), "unexpected: {msg}");
         assert!(msg.contains('4'), "unexpected: {msg}");
         assert!(msg.contains('5'), "unexpected: {msg}");
         assert!(!path.exists(), "a wrong-sized file must be deleted");
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn live_dir_is_a_sibling_of_the_speech_model_dir() {
+        let model_dir = Path::new("/data/models/parakeet-tdt-0.6b-v2-int8");
+        assert_eq!(
+            live_dir_for(model_dir),
+            PathBuf::from("/data/models/nemotron-streaming-en-0.6b-int8")
+        );
+    }
+
+    #[test]
+    fn missing_live_file_error_suggests_download_live() {
+        let dir = fresh_dir("live-missing");
+        fs::create_dir_all(&dir).unwrap();
+        let err = check_live_model_dir(&dir).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("encoder.onnx"), "unexpected: {msg}");
+        assert!(msg.contains("dictate download --live"), "unexpected: {msg}");
+        assert!(
+            msg.contains(&dir.display().to_string()),
+            "unexpected: {msg}"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn complete_live_dir_passes_check() {
+        let dir = fresh_dir("live-complete");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, _) in LIVE_FILES {
+            fs::write(dir.join(name), b"stub").unwrap();
+        }
+        check_live_model_dir(&dir).unwrap();
         cleanup(&dir);
     }
 
