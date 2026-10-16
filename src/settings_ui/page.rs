@@ -115,19 +115,21 @@ pub(crate) fn speed_check_line(check: LiveSpeedCheck) -> String {
     )
 }
 
-/// One `hyprctl binds` entry whose arg mentions dictate: the formatted
-/// keys (`Super+Alt+D`), the dictate command (`toggle`), and whether it
-/// fires on release.
+/// One `hyprctl binds` entry mentioning dictate: the formatted keys
+/// (`Super+Alt+D`), the display label (the bind description, or the dictate
+/// action parsed from the arg when the description is empty), and whether
+/// it fires on release.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct HyprBind {
     keys: String,
-    command: String,
+    label: String,
     release: bool,
 }
 
-/// Parse `hyprctl binds -j` output into the binds whose arg mentions
-/// dictate. The JSON is parsed by hand (no new crates for one query);
-/// malformed entries are skipped.
+/// Parse `hyprctl binds -j` output into the binds whose arg or description
+/// mentions dictate (case-insensitive, so Lua-defined binds with opaque
+/// numeric args still match via their description). The JSON is parsed by
+/// hand (no new crates for one query); malformed entries are skipped.
 pub(crate) fn parse_hyprland_binds(json: &str) -> Vec<HyprBind> {
     split_json_objects(json)
         .iter()
@@ -135,24 +137,15 @@ pub(crate) fn parse_hyprland_binds(json: &str) -> Vec<HyprBind> {
         .collect()
 }
 
-/// Format parsed binds as `F8 → start (hold)` lines. A press bind paired
-/// with a release bind on the same keys is hold-to-talk: the press shows
-/// `(hold)`, the release `(release)`; lone binds show no annotation.
+/// Format parsed binds as `Super+Alt+D — Toggle dictate` lines: the keys,
+/// an em dash, and the label, with ` (on release)` appended for release
+/// binds.
 pub(crate) fn format_hyprland_binds(binds: &[HyprBind]) -> Vec<String> {
     binds
         .iter()
         .map(|bind| {
-            let suffix = if bind.release {
-                " (release)"
-            } else if binds
-                .iter()
-                .any(|other| other.release && other.keys == bind.keys)
-            {
-                " (hold)"
-            } else {
-                ""
-            };
-            format!("{} → {}{suffix}", bind.keys, bind.command)
+            let suffix = if bind.release { " (on release)" } else { "" };
+            format!("{} — {}{suffix}", bind.keys, bind.label)
         })
         .collect()
 }
@@ -309,7 +302,8 @@ fn skip_json_value(bytes: &[u8], i: &mut usize) -> bool {
 }
 
 /// Parse one `hyprctl binds` entry into a [`HyprBind`]: `None` when a needed
-/// field is missing or malformed, or the arg doesn't mention dictate.
+/// field is missing or malformed, or neither the arg nor the description
+/// mentions dictate.
 fn parse_bind_object(object: &str) -> Option<HyprBind> {
     let bytes = object.as_bytes();
     let mut i = 0;
@@ -318,7 +312,8 @@ fn parse_bind_object(object: &str) -> Option<HyprBind> {
         return None;
     }
     i += 1;
-    let (mut modmask, mut key, mut release, mut arg) = (None, None, None, None);
+    let (mut modmask, mut key, mut release, mut arg, mut description) =
+        (None, None, None, None, None);
     loop {
         skip_ws(bytes, &mut i);
         match bytes.get(i) {
@@ -343,6 +338,7 @@ fn parse_bind_object(object: &str) -> Option<HyprBind> {
             "key" => key = read_json_string(bytes, &mut i),
             "release" => release = read_bool(bytes, &mut i),
             "arg" => arg = read_json_string(bytes, &mut i),
+            "description" => description = read_json_string(bytes, &mut i),
             _ => {
                 if !skip_json_value(bytes, &mut i) {
                     return None;
@@ -350,16 +346,27 @@ fn parse_bind_object(object: &str) -> Option<HyprBind> {
             }
         }
     }
-    let (modmask, key, release, arg): (u32, String, bool, String) =
-        (modmask?, key?, release?, arg?);
-    if !arg.contains("dictate") {
+    let (modmask, key, release): (u32, String, bool) = (modmask?, key?, release?);
+    let arg = arg.unwrap_or_default();
+    let description = description.unwrap_or_default();
+    if !mentions_dictate(&arg) && !mentions_dictate(&description) {
         return None;
     }
+    let label = if description.is_empty() {
+        command_from_arg(&arg)
+    } else {
+        description
+    };
     Some(HyprBind {
         keys: format_keys(modmask, &key),
-        command: command_from_arg(&arg),
+        label,
         release,
     })
+}
+
+/// True when the text mentions dictate, case-insensitively.
+fn mentions_dictate(text: &str) -> bool {
+    text.to_ascii_lowercase().contains("dictate")
 }
 
 /// `Super+Alt+D` from a Hyprland modmask and key name. Only the four common
@@ -393,13 +400,13 @@ fn format_keys(modmask: u32, key: &str) -> String {
 }
 
 /// The dictate command from a bind arg (`dictate toggle` → `toggle`). The
-/// `dictate` token may carry a path; when no command follows it, the whole
-/// arg is shown.
+/// `dictate` token (matched case-insensitively) may carry a path; when no
+/// command follows it, the whole arg is shown.
 fn command_from_arg(arg: &str) -> String {
     let mut tokens = arg.split_whitespace();
     while let Some(token) = tokens.next() {
         let name = token.rsplit('/').next().unwrap_or(token);
-        if name == "dictate" {
+        if name.eq_ignore_ascii_case("dictate") {
             if let Some(command) = tokens.next() {
                 return command.to_string();
             }
@@ -692,17 +699,17 @@ mod tests {
             vec![
                 HyprBind {
                     keys: "F8".to_string(),
-                    command: "start".to_string(),
+                    label: "start".to_string(),
                     release: false,
                 },
                 HyprBind {
                     keys: "F8".to_string(),
-                    command: "stop".to_string(),
+                    label: "stop".to_string(),
                     release: true,
                 },
                 HyprBind {
                     keys: "Super+Alt+D".to_string(),
-                    command: "toggle".to_string(),
+                    label: "toggle".to_string(),
                     release: false,
                 },
             ]
@@ -710,37 +717,59 @@ mod tests {
     }
 
     #[test]
-    fn formats_hold_release_and_toggle_lines() {
+    fn formats_press_and_release_lines() {
         let binds = parse_hyprland_binds(HYPRCTL_BINDS);
         assert_eq!(
             format_hyprland_binds(&binds),
             vec![
-                "F8 → start (hold)".to_string(),
-                "F8 → stop (release)".to_string(),
-                "Super+Alt+D → toggle".to_string(),
+                "F8 — start".to_string(),
+                "F8 — stop (on release)".to_string(),
+                "Super+Alt+D — toggle".to_string(),
+            ]
+        );
+    }
+
+    /// Omarchy defines binds in Lua, so `hyprctl binds -j` reports opaque
+    /// numeric args (`__lua` dispatcher); the description names dictate.
+    const HYPRCTL_LUA_BINDS: &str = r#"[
+        {"locked":false,"mouse":false,"release":false,"repeat":false,"modmask":72,"submap":"","key":"D","keycode":0,"catch_all":false,"description":"Toggle dictate","dispatcher":"__lua","arg":"9","enabled":true},
+        {"locked":false,"mouse":false,"release":false,"repeat":false,"modmask":0,"submap":"","key":"F8","keycode":0,"catch_all":false,"description":"Start dictate (push-to-talk)","dispatcher":"__lua","arg":"25","enabled":true},
+        {"locked":false,"mouse":false,"release":true,"repeat":false,"modmask":0,"submap":"","key":"F8","keycode":0,"catch_all":false,"description":"Stop dictate (push-to-talk)","dispatcher":"__lua","arg":"41","enabled":true}
+    ]"#;
+
+    #[test]
+    fn finds_lua_defined_binds_via_description() {
+        let binds = parse_hyprland_binds(HYPRCTL_LUA_BINDS);
+        assert_eq!(binds.len(), 3);
+        assert_eq!(
+            format_hyprland_binds(&binds),
+            vec![
+                "Super+Alt+D — Toggle dictate".to_string(),
+                "F8 — Start dictate (push-to-talk)".to_string(),
+                "F8 — Stop dictate (push-to-talk) (on release)".to_string(),
             ]
         );
     }
 
     #[test]
-    fn lone_binds_have_no_annotation() {
+    fn only_release_binds_are_annotated() {
         let binds = vec![
             HyprBind {
                 keys: "Ctrl+Shift+Space".to_string(),
-                command: "toggle".to_string(),
+                label: "toggle".to_string(),
                 release: false,
             },
             HyprBind {
                 keys: "F9".to_string(),
-                command: "cancel".to_string(),
+                label: "cancel".to_string(),
                 release: true,
             },
         ];
         assert_eq!(
             format_hyprland_binds(&binds),
             vec![
-                "Ctrl+Shift+Space → toggle".to_string(),
-                "F9 → cancel (release)".to_string(),
+                "Ctrl+Shift+Space — toggle".to_string(),
+                "F9 — cancel (on release)".to_string(),
             ]
         );
     }
@@ -776,7 +805,7 @@ mod tests {
         ]"#;
         let binds = parse_hyprland_binds(json);
         assert_eq!(binds.len(), 1);
-        assert_eq!(binds[0].command, "toggle");
+        assert_eq!(binds[0].label, "toggle");
     }
 
     #[test]
@@ -787,7 +816,19 @@ mod tests {
         let binds = parse_hyprland_binds(json);
         assert_eq!(binds.len(), 1);
         assert_eq!(binds[0].keys, "}");
-        assert_eq!(binds[0].command, "notify-send \"dictate {done}\"");
+        assert_eq!(binds[0].label, "notify-send \"dictate {done}\"");
+    }
+
+    #[test]
+    fn matches_dictate_case_insensitively() {
+        let json = r#"[
+            {"modmask":0,"key":"F8","release":false,"arg":"DICTATE toggle"},
+            {"modmask":0,"key":"F9","release":false,"arg":"9","description":"Toggle Dictate"}
+        ]"#;
+        let binds = parse_hyprland_binds(json);
+        assert_eq!(binds.len(), 2);
+        assert_eq!(binds[0].label, "toggle");
+        assert_eq!(binds[1].label, "Toggle Dictate");
     }
 
     #[test]

@@ -124,8 +124,8 @@ fn mic_listing_changed(old: &[crate::mic::Mic], new: &[crate::mic::Mic]) -> bool
         .any(|(before, after)| before.id != after.id || before.is_default != after.is_default)
 }
 
-/// Run `hyprctl binds -j` and format the binds whose arg mentions dictate
-/// (`F8 → start (hold)` lines). Only called on Hyprland.
+/// Run `hyprctl binds -j` and format the binds mentioning dictate
+/// (`Super+Alt+D — Toggle dictate` lines). Only called on Hyprland.
 fn query_hyprland_binds() -> anyhow::Result<Vec<String>> {
     let output = std::process::Command::new("hyprctl")
         .args(["binds", "-j"])
