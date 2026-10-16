@@ -189,6 +189,8 @@ pub(crate) enum UserEvent {
 enum ModeSwitch {
     /// Loading the target mode's model (Live loads always benchmark too).
     Loading { target: crate::config::Mode },
+    /// Downloading the Live model, then loading it (always targets Live).
+    Downloading,
 }
 
 impl ModeSwitch {
@@ -196,6 +198,7 @@ impl ModeSwitch {
     fn target(&self) -> crate::config::Mode {
         match self {
             ModeSwitch::Loading { target } => *target,
+            ModeSwitch::Downloading => crate::config::Mode::Live,
         }
     }
 }
@@ -693,8 +696,10 @@ impl DaemonApp {
     /// Switch the dictation mode from the tray Mode submenu. Whole and pauses
     /// share the TDT model, so switching between them with it loaded is
     /// instant; anything else loads the needed model on a background thread
-    /// (Live always benchmarks too) and completes on `ModeSwapped`. Refused
-    /// while recording or transcribing, and while a switch is already running.
+    /// (Live always benchmarks too) and completes on `ModeSwapped`. Picking
+    /// Live with its model missing downloads it first, on the same thread.
+    /// Refused while recording or transcribing, and while a switch is already
+    /// running (only one download at a time).
     fn switch_mode(&mut self, target: crate::config::Mode) {
         if self.state != State::Idle {
             dlog!(
@@ -709,9 +714,13 @@ impl DaemonApp {
             self.sync_mode_checks();
             return;
         }
-        if self.mode_switch.is_some() {
-            dlog!("Mode switch to {} refused: model loading", target.as_str());
-            crate::notify::show(crate::notify::Kind::Info, "dictate", "Model loading…");
+        if let Some(switch) = &self.mode_switch {
+            let message = match switch {
+                ModeSwitch::Downloading => "Already downloading",
+                ModeSwitch::Loading { .. } => "Model loading…",
+            };
+            dlog!("Mode switch to {} refused: {message}", target.as_str());
+            crate::notify::show(crate::notify::Kind::Info, "dictate", message);
             self.sync_mode_checks();
             return;
         }
@@ -723,14 +732,20 @@ impl DaemonApp {
             self.complete_mode_switch(target);
             return;
         }
-        self.mode_switch = Some(ModeSwitch::Loading { target });
+        let download_first =
+            target == crate::config::Mode::Live && crate::model::live_model_dir_checked().is_err();
+        self.mode_switch = Some(if download_first {
+            ModeSwitch::Downloading
+        } else {
+            ModeSwitch::Loading { target }
+        });
         self.sync_tray();
         let previous = self.settings.mode;
         let to_worker = self.to_worker.clone();
         let proxy = self.menu_proxy.clone();
         std::thread::spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_mode_switch_loader(target, previous, &to_worker, &proxy);
+                run_mode_switch_loader(target, previous, download_first, &to_worker, &proxy);
             }));
             if outcome.is_err() {
                 let message = "the model loader thread panicked";
@@ -1205,7 +1220,24 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
     }
 }
 
-/// Background model load for a menu mode switch: loads the target's model
+/// Milestone percentages notified during a background Live download.
+const DOWNLOAD_MILESTONES: [u64; 3] = [25, 50, 75];
+
+/// How many of the 25/50/75 milestones `percent` has reached.
+fn milestones_reached(percent: u64) -> usize {
+    DOWNLOAD_MILESTONES
+        .iter()
+        .filter(|milestone| percent >= **milestone)
+        .count()
+}
+
+/// Body of a Live-download progress notification.
+fn live_download_body(percent: u64) -> String {
+    format!("Downloading Live model… {percent}%")
+}
+
+/// Background model load for a menu mode switch: optionally downloads the
+/// Live model first (with progress notifications), loads the target's model
 /// (Live always benchmarks too) and hands it to the transcription worker for
 /// the swap. Exactly one terminal outcome: a `Job::Swap*` sent to the worker
 /// (which acks `UserEvent::ModeSwapped`), or a `UserEvent::ModeSwitchFailed`
@@ -1214,9 +1246,13 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
 fn run_mode_switch_loader(
     target: crate::config::Mode,
     previous: crate::config::Mode,
+    download_first: bool,
     to_worker: &mpsc::Sender<Job>,
     proxy: &EventLoopProxy<UserEvent>,
 ) {
+    if download_first && download_live_for_switch(proxy).is_err() {
+        return;
+    }
     let swap = match load_switch_model(target, previous) {
         Ok(swap) => swap,
         Err(()) => {
@@ -1231,6 +1267,40 @@ fn run_mode_switch_loader(
         send_switch_failed(proxy);
     }
     // Else the worker acks `ModeSwapped` once the swap lands.
+}
+
+/// Download the Live model for a menu switch, notifying at 25/50/75% (each
+/// milestone replaces the previous one). Milestones already passed by
+/// present files don't notify: only this download's progress does. A failure
+/// is logged + notified with the real error and fails the switch.
+fn download_live_for_switch(proxy: &EventLoopProxy<UserEvent>) -> Result<(), ()> {
+    let mut sent: Option<usize> = None;
+    let result = crate::model::download_live_files_with_progress(|downloaded, total| {
+        let percent = downloaded * 100 / total.max(1);
+        let reached = milestones_reached(percent);
+        // Seed from the first report, so bytes already on disk (present
+        // files count up front) don't fire stale milestones.
+        let sent = sent.get_or_insert(reached);
+        while *sent < reached {
+            let milestone = DOWNLOAD_MILESTONES[*sent];
+            *sent += 1;
+            crate::notify::show_progress(&live_download_body(milestone));
+        }
+    });
+    match result {
+        Ok(()) => Ok(()),
+        Err(err) => {
+            let message = format!("{err:#}");
+            dlog!("error: dictate: Live download failed: {message}");
+            crate::notify::show(
+                crate::notify::Kind::Error,
+                "dictate: Live download failed",
+                &message,
+            );
+            send_switch_failed(proxy);
+            Err(())
+        }
+    }
 }
 
 /// Load the target's model for a mode switch, as the swap job to send. Live
@@ -2275,6 +2345,26 @@ mod tests {
             daemon_log_path_for(Path::new("/data")),
             PathBuf::from("/data/daemon.log")
         );
+    }
+
+    #[test]
+    fn download_milestones_fire_at_25_50_75() {
+        assert_eq!(milestones_reached(0), 0);
+        assert_eq!(milestones_reached(24), 0);
+        assert_eq!(milestones_reached(25), 1);
+        assert_eq!(milestones_reached(49), 1);
+        assert_eq!(milestones_reached(50), 2);
+        assert_eq!(milestones_reached(74), 2);
+        assert_eq!(milestones_reached(75), 3);
+        assert_eq!(milestones_reached(100), 3);
+        assert_eq!(DOWNLOAD_MILESTONES, [25, 50, 75]);
+    }
+
+    #[test]
+    fn download_progress_body_names_the_milestone() {
+        assert_eq!(live_download_body(25), "Downloading Live model… 25%");
+        assert_eq!(live_download_body(50), "Downloading Live model… 50%");
+        assert_eq!(live_download_body(75), "Downloading Live model… 75%");
     }
 
     #[test]

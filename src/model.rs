@@ -190,24 +190,41 @@ fn download_inner(with_live: bool) -> anyhow::Result<()> {
 /// Download any missing Live model files, verifying their exact pinned sizes.
 /// A wrong-sized file is deleted and re-downloaded, never trusted.
 fn download_live_files() -> anyhow::Result<()> {
+    download_live_files_with_progress(|_, _| {})
+}
+
+/// Download any missing Live model files, calling
+/// `progress(downloaded, total)` as bytes land across all files (`total` is
+/// the pinned size of every Live file; already-present files count up front).
+/// Used by the tray-menu download for progress notifications.
+pub fn download_live_files_with_progress<F>(mut progress: F) -> anyhow::Result<()>
+where
+    F: FnMut(u64, u64),
+{
     let dir = live_model_dir()?;
     fs::create_dir_all(&dir)
         .with_context(|| format!("Could not create model directory {}", dir.display()))?;
+    let total: u64 = LIVE_FILES.iter().map(|(_, size)| size).sum();
+    let mut completed: u64 = 0;
     for (name, size) in LIVE_FILES {
         let dest = dir.join(name);
         let present_len = dest.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         if dest.is_file() && present_len == *size {
             println!("{name}: already present");
+            completed += size;
             continue;
         }
         if dest.is_file() {
             eprintln!("{name}: wrong size ({present_len} bytes, expected {size}); re-downloading");
         }
         let url = format!("{LIVE_BASE_URL}/{LIVE_REVISION}/{name}");
-        download_file(&url, name, &dest)
+        let mut report = |file_bytes: u64| progress(completed + file_bytes, total);
+        download_file_report(&url, name, &dest, Some(&mut report))
             .with_context(|| format!("Downloading {name} from {url} failed"))?;
         verify_file_size(&dest, name, *size)
             .with_context(|| format!("Downloading {name} from {url} failed"))?;
+        completed += size;
+        progress(completed, total);
     }
     Ok(())
 }
@@ -260,8 +277,19 @@ fn verify_file_size(path: &Path, file_name: &str, expected: u64) -> anyhow::Resu
 }
 
 fn download_file(url: &str, name: &str, dest: &Path) -> anyhow::Result<()> {
+    download_file_report(url, name, dest, None)
+}
+
+/// Download one file like [`download_file`], calling `report` with the file's
+/// downloaded byte count as chunks land (for overall progress).
+fn download_file_report(
+    url: &str,
+    name: &str,
+    dest: &Path,
+    report: Option<&mut dyn FnMut(u64)>,
+) -> anyhow::Result<()> {
     let part = dest.with_file_name(format!("{name}.part"));
-    let result = download_file_inner(url, name, &part, dest);
+    let result = download_file_inner(url, name, &part, dest, report);
     if result.is_err() {
         remove_part(&part);
     }
@@ -279,7 +307,13 @@ fn remove_part(part: &Path) {
     }
 }
 
-fn download_file_inner(url: &str, name: &str, part: &Path, dest: &Path) -> anyhow::Result<()> {
+fn download_file_inner(
+    url: &str,
+    name: &str,
+    part: &Path,
+    dest: &Path,
+    mut report: Option<&mut dyn FnMut(u64)>,
+) -> anyhow::Result<()> {
     let mut response = ureq::get(url).call()?;
     let total = response.body().content_length();
     let mut reader = response.body_mut().as_reader();
@@ -299,6 +333,9 @@ fn download_file_inner(url: &str, name: &str, part: &Path, dest: &Path) -> anyho
         file.write_all(&buf[..n])
             .with_context(|| format!("Could not write partial download {}", part.display()))?;
         downloaded += n as u64;
+        if let Some(report) = report.as_mut() {
+            report(downloaded);
+        }
         match total {
             Some(total) => {
                 let percent = downloaded * 100 / total;

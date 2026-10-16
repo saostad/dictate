@@ -69,6 +69,43 @@ pub(crate) fn show_forced(kind: Kind, summary: &str, body: &str) {
     });
 }
 
+/// Fixed id for the Live-download progress notification: re-showing with
+/// the same id replaces the previous milestone instead of stacking (notify-rust
+/// `Notification::id`, supported on XDG, Windows and non-preview macOS).
+/// Large enough to never collide with server-issued ids.
+const LIVE_DOWNLOAD_ID: u32 = 0xD1C7_A7E5;
+
+/// Show the Live-download progress, replacing the previous milestone.
+/// Blocking: the download thread is already a background thread, and blocking
+/// keeps milestones ordered. Respects the notification switch; failures warn
+/// once per process.
+pub(crate) fn show_progress(body: &str) {
+    if !enabled_now() {
+        return;
+    }
+    if let Err(err) = show_progress_blocking(body) {
+        warn_once(&err);
+    }
+}
+
+/// Show one progress notification on the calling thread.
+fn show_progress_blocking(body: &str) -> anyhow::Result<()> {
+    let mut notification = notify_rust::Notification::new();
+    notification
+        .appname("dictate")
+        .summary("dictate")
+        .body(body)
+        .timeout(notify_rust::Timeout::Milliseconds(6_000))
+        .id(LIVE_DOWNLOAD_ID);
+    #[cfg(all(unix, not(target_os = "macos")))]
+    notification.urgency(notify_rust::Urgency::Normal);
+    notification
+        .show()
+        .map(|_| ())
+        .map_err(|err| anyhow::anyhow!("{err}"))?;
+    Ok(())
+}
+
 /// Show a desktop notification on the calling thread, unless disabled.
 /// For short-lived processes (the client commands) that would exit before a
 /// spawned thread delivers the message. Failures warn once per process.
