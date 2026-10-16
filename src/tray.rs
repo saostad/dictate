@@ -379,9 +379,12 @@ pub(crate) fn build_tray(
     let (rgba, width, height) = icon_rgba(state);
     let icon = Icon::from_rgba(rgba, width, height)
         .map_err(|err| anyhow::anyhow!("Internal error: tray icon pixels rejected: {err}"))?;
-    let icon = TrayIconBuilder::new()
-        .with_id(TRAY_ID)
-        .with_title(TRAY_ID)
+    let builder = TrayIconBuilder::new().with_id(TRAY_ID);
+    // The title renders as text next to the icon in the macOS menu bar (and
+    // is unused on Windows); only Linux/BSD show it as the SNI title.
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let builder = builder.with_title(TRAY_ID);
+    let icon = builder
         .with_menu(Box::new(menu))
         .with_tooltip(tooltip_text(state, settings.mode, None))
         .with_icon(icon)
