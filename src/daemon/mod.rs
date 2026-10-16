@@ -313,6 +313,7 @@ fn run_daemon_inner() -> anyhow::Result<()> {
         _ => crate::hotkey::resolve_file_hotkey(&file_settings.hotkey)
             .map_err(|message| anyhow::anyhow!("{message}"))?,
     };
+    let load_start = Instant::now();
     let (models, live_fallback) = load_daemon_models(dictation_mode())?;
     #[cfg(unix)]
     let socket_file = {
@@ -329,6 +330,12 @@ fn run_daemon_inner() -> anyhow::Result<()> {
     };
     #[cfg(unix)]
     let listener = socket::bind_listener(&socket_file)?;
+    // Ready only once the final model is loaded and the socket is bound, so
+    // the line never precedes a fallback load or a missing socket.
+    dlog!(
+        "model loaded in {} ms. Ready: run \"dictate toggle\" to start/stop recording.",
+        load_start.elapsed().as_millis()
+    );
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
         .context("Could not start the daemon event loop")?;
@@ -372,7 +379,8 @@ struct WorkerModels {
 
 /// Load the model the startup mode needs. Live mode checks the model files
 /// and the speed gate first; either failure logs + notifies and falls back to
-/// whole mode for this session.
+/// whole mode for this session. The caller prints Ready once the socket is
+/// bound too.
 fn load_daemon_models(mode: crate::config::Mode) -> anyhow::Result<(WorkerModels, bool)> {
     if mode != crate::config::Mode::Live {
         return load_tdt_models(false);
@@ -390,13 +398,8 @@ fn load_daemon_models(mode: crate::config::Mode) -> anyhow::Result<(WorkerModels
     let dir = crate::model::live_model_dir_checked()?;
     let env = crate::asr::shared_environment()?;
     let threads = crate::asr::intra_threads();
-    let start = Instant::now();
     let mut live = crate::live::Live::load(&dir, &env, threads)?;
-    dlog!(
-        "model loaded in {} ms. Ready: run \"dictate toggle\" to start/stop recording.",
-        start.elapsed().as_millis()
-    );
-    let median = live.benchmark();
+    let median = check_live_speed(&mut live);
     if !crate::live::is_fast_enough(median) {
         let body = format!(
             "Needs under 392 ms per 560 ms of audio, took {} ms. Using Whole recording.",
@@ -420,15 +423,11 @@ fn load_daemon_models(mode: crate::config::Mode) -> anyhow::Result<(WorkerModels
     ))
 }
 
-/// Load the TDT model for whole/pauses mode, or as the Live fallback.
+/// Load the TDT model for whole/pauses mode, or as the Live fallback. The
+/// caller prints Ready once the socket is bound too.
 fn load_tdt_models(live_fallback: bool) -> anyhow::Result<(WorkerModels, bool)> {
     let dir = crate::model::model_dir_checked()?;
-    let start = Instant::now();
     let asr = crate::asr::Asr::load(&dir)?;
-    dlog!(
-        "model loaded in {} ms. Ready: run \"dictate toggle\" to start/stop recording.",
-        start.elapsed().as_millis()
-    );
     Ok((
         WorkerModels {
             tdt: Some(asr),
