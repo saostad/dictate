@@ -120,20 +120,26 @@ pub(crate) fn show_now(kind: Kind, summary: &str, body: &str) {
     }
 }
 
+/// Notification timeout in milliseconds: errors stay a bit longer than
+/// info. Both use Normal urgency: Critical notifications stay until
+/// dismissed on some desktops and would pile up over the screen.
+fn timeout_ms(kind: Kind) -> u32 {
+    match kind {
+        Kind::Error => 8_000,
+        Kind::Info => 6_000,
+    }
+}
+
 /// Show one notification on the calling thread.
-#[cfg_attr(not(all(unix, not(target_os = "macos"))), allow(unused_variables))]
 fn show_blocking(kind: Kind, summary: &str, body: &str) -> anyhow::Result<()> {
     let mut notification = notify_rust::Notification::new();
     notification
         .appname("dictate")
         .summary(summary)
         .body(body)
-        .timeout(notify_rust::Timeout::Milliseconds(6_000));
+        .timeout(notify_rust::Timeout::Milliseconds(timeout_ms(kind)));
     #[cfg(all(unix, not(target_os = "macos")))]
-    notification.urgency(match kind {
-        Kind::Error => notify_rust::Urgency::Critical,
-        Kind::Info => notify_rust::Urgency::Normal,
-    });
+    notification.urgency(notify_rust::Urgency::Normal);
     notification
         .show()
         .map(|_| ())
@@ -144,6 +150,12 @@ fn show_blocking(kind: Kind, summary: &str, body: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn error_notifications_stay_longer_than_info() {
+        assert_eq!(timeout_ms(Kind::Error), 8_000);
+        assert_eq!(timeout_ms(Kind::Info), 6_000);
+    }
 
     #[test]
     fn typing_failure_body_keeps_error_and_text() {
