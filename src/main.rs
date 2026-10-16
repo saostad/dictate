@@ -360,7 +360,7 @@ fn mics() -> anyhow::Result<()> {
         println!("{line}");
         println!("    {}", mic.id);
     }
-    println!("Choose one in the tray menu (Microphone).");
+    println!("Choose one in the Settings window.");
     Ok(())
 }
 

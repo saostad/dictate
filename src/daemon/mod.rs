@@ -144,11 +144,12 @@ pub(crate) enum Job {
     LiveEnd { stop_time: Instant },
     /// Discard a pauses/Live recording; already-typed text stays.
     Cancel,
-    /// Swap in a freshly loaded TDT model (menu mode switch to whole/pauses);
-    /// drops the Live model, then acks [`UserEvent::ModeSwapped`].
+    /// Swap in a freshly loaded TDT model (a Settings-page switch to
+    /// whole/pauses); drops the Live model, then acks
+    /// [`UserEvent::ModeSwapped`].
     SwapTdt(crate::asr::Asr),
-    /// Swap in a freshly loaded Live model (menu mode switch to live); drops
-    /// the TDT model, then acks [`UserEvent::ModeSwapped`].
+    /// Swap in a freshly loaded Live model (a Settings-page switch to live);
+    /// drops the TDT model, then acks [`UserEvent::ModeSwapped`].
     SwapLive(crate::live::Live),
 }
 
@@ -725,7 +726,6 @@ impl DaemonApp {
             }
             // A dead worker can't ack a pending swap; don't stay Loading.
             if self.mode_switch.take().is_some() {
-                self.sync_mode_checks();
                 self.sync_tray();
             }
             return "err transcription worker stopped; restart \"dictate daemon\"".to_string();
@@ -815,7 +815,7 @@ impl DaemonApp {
         }
     }
 
-    /// Re-list the microphones into the cache and rebuild the tray submenu.
+    /// Re-list the microphones into the cache (the Settings page reads it).
     /// A listing failure is logged and keeps the old entries. When the
     /// listing changed, the cached recording device is dropped so the next
     /// `start` re-resolves (a removed mic falls back, a returned one is
@@ -828,19 +828,13 @@ impl DaemonApp {
                     self.mic_session.invalidate();
                 }
                 self.mics = mics;
-                if let Some(tray) = self.tray.as_mut()
-                    && let Err(err) =
-                        tray.rebuild_microphones(&self.mics, &self.settings.microphone)
-                {
-                    dlog!("error: {err:#}");
-                }
             }
             Err(err) => dlog!("error: {err:#}"),
         }
         self.sync_tray();
     }
 
-    /// Switch the selected microphone from the tray menu: save + confirm.
+    /// Switch the selected microphone from the Settings page: save + confirm.
     /// Refused while recording (the recorder already holds its device).
     fn switch_microphone(&mut self, id: &str) {
         if self.state == State::Recording {
@@ -853,7 +847,6 @@ impl DaemonApp {
             return;
         }
         if id == self.settings.microphone {
-            self.sync_microphone_checks();
             return;
         }
         let name = if id.is_empty() {
@@ -868,7 +861,6 @@ impl DaemonApp {
         self.settings.microphone = id.to_string();
         self.mic_session.invalidate();
         self.report_save_error(crate::config::save(&self.settings));
-        self.sync_microphone_checks();
         Self::confirm_settings_change(
             &crate::tray::SettingsChange::Microphone {
                 id: id.to_string(),
@@ -877,13 +869,6 @@ impl DaemonApp {
             true,
         );
         self.sync_tray();
-    }
-
-    /// Check exactly the selected microphone in the tray menu.
-    fn sync_microphone_checks(&self) {
-        if let Some(tray) = &self.tray {
-            tray.sync_microphone_checks(&self.settings.microphone);
-        }
     }
 
     /// Run one tray menu click.
@@ -900,41 +885,27 @@ impl DaemonApp {
             Some(crate::tray::TrayAction::Cancel) => {
                 drop(self.handle_command(Command::Cancel));
             }
-            Some(crate::tray::TrayAction::Sounds) => self.flip_sounds(),
-            Some(crate::tray::TrayAction::Notifications) => self.flip_notifications(),
-            Some(crate::tray::TrayAction::Microphone(id)) => self.switch_microphone(&id),
-            Some(crate::tray::TrayAction::RefreshMics) => self.refresh_microphones(),
-            Some(crate::tray::TrayAction::Mode(target)) => self.switch_mode(target),
-            Some(crate::tray::TrayAction::Shortcut(display)) => self.switch_hotkey(&display),
-            Some(crate::tray::TrayAction::HowTo) => self.open_how_to(),
-            Some(crate::tray::TrayAction::OpenConfig) => self.open_settings_file(),
             Some(crate::tray::TrayAction::Settings) => self.open_settings(event_loop),
             Some(crate::tray::TrayAction::Quit) => event_loop.exit(),
         }
         self.refresh_settings();
     }
 
-    /// Flip the `Sound cues` check, update the effective switch, save.
+    /// Flip the `Sound cues` setting, update the effective switch, save.
     fn flip_sounds(&mut self) {
         let new = !self.settings.sounds;
         self.settings.sounds = new;
         crate::config::refresh_sounds(new);
-        if let Some(tray) = &self.tray {
-            tray.set_sounds_checked(new);
-        }
         self.report_save_error(crate::config::save(&self.settings));
         Self::confirm_settings_change(&crate::tray::SettingsChange::Sounds(new), false);
         self.sync_tray();
     }
 
-    /// Flip the `Notifications` check, update the effective switch, save.
+    /// Flip the `Notifications` setting, update the effective switch, save.
     fn flip_notifications(&mut self) {
         let new = !self.settings.notifications;
         self.settings.notifications = new;
         crate::config::refresh_notifications(new);
-        if let Some(tray) = &self.tray {
-            tray.set_notifications_checked(new);
-        }
         self.report_save_error(crate::config::save(&self.settings));
         // Turning notifications off is confirmed even though they are now
         // off: the notification is the confirmation of that action.
@@ -942,7 +913,7 @@ impl DaemonApp {
         self.sync_tray();
     }
 
-    /// Switch the dictation mode from the tray Mode submenu. Whole and pauses
+    /// Switch the dictation mode from the Settings page. Whole and pauses
     /// share the TDT model, so switching between them with it loaded is
     /// instant; anything else loads the needed model on a background thread
     /// (Live always benchmarks too) and completes on `ModeSwapped`. Picking
@@ -960,7 +931,6 @@ impl DaemonApp {
                 "dictate",
                 "Finish the current dictation first",
             );
-            self.sync_mode_checks();
             return;
         }
         if let Some(switch) = &self.mode_switch {
@@ -970,11 +940,9 @@ impl DaemonApp {
             };
             dlog!("Mode switch to {} refused: {message}", target.as_str());
             crate::notify::show(crate::notify::Kind::Info, "dictate", message);
-            self.sync_mode_checks();
             return;
         }
         if target == self.settings.mode {
-            self.sync_mode_checks();
             return;
         }
         if target != crate::config::Mode::Live && self.worker_has_tdt {
@@ -1028,15 +996,7 @@ impl DaemonApp {
         self.mode_switch = None;
         self.report_save_error(crate::config::save(&self.settings));
         Self::confirm_settings_change(&crate::tray::SettingsChange::Mode(target), true);
-        self.sync_mode_checks();
         self.sync_tray();
-    }
-
-    /// Check exactly the current file mode in the Mode submenu.
-    fn sync_mode_checks(&self) {
-        if let Some(tray) = &self.tray {
-            tray.sync_mode_checks(self.settings.mode);
-        }
     }
 
     /// Log + notify a start request refused while a mode switch loads, and
@@ -1048,10 +1008,10 @@ impl DaemonApp {
         "err model loading".to_string()
     }
 
-    /// Log a settings change and confirm it with an Info notification, so a
-    /// menu that closes on click still gives visible feedback. `force`
-    /// bypasses the notification switch: the "Notifications: off" toggle and
-    /// mode switches (`Mode: <name>`, always shown) use it.
+    /// Log a settings change and confirm it with an Info notification, so
+    /// every change gives visible feedback. `force` bypasses the notification
+    /// switch: the "Notifications: off" toggle and mode switches
+    /// (`Mode: <name>`, always shown) use it.
     fn confirm_settings_change(change: &crate::tray::SettingsChange, force: bool) {
         dlog!("{}", change.log_line());
         let body = change.notification_body();
@@ -1080,7 +1040,6 @@ impl DaemonApp {
     fn switch_hotkey(&mut self, display: &str) {
         if display == self.hotkey_display {
             self.last_shortcut_error = None;
-            self.sync_shortcut_checks();
             return;
         }
         let new_key = match HotKey::from_str(display) {
@@ -1122,7 +1081,6 @@ impl DaemonApp {
         self.last_shortcut_error = None;
         self.settings.hotkey = display.to_string();
         self.report_save_error(crate::config::save(&self.settings));
-        self.sync_shortcut_checks();
         dlog!("Hotkey: {display} (tap to toggle, hold to talk)");
         Self::confirm_settings_change(
             &crate::tray::SettingsChange::Shortcut(display.to_string()),
@@ -1131,8 +1089,8 @@ impl DaemonApp {
         self.sync_tray();
     }
 
-    /// Record a failed shortcut switch for the Settings page's inline error,
-    /// notify it, and re-check the current shortcut.
+    /// Record a failed shortcut switch for the Settings page's inline error
+    /// and notify it.
     fn shortcut_failed(&mut self, display: &str, err: &str) {
         self.last_shortcut_error = Some(err.to_string());
         crate::notify::show(
@@ -1140,47 +1098,6 @@ impl DaemonApp {
             &format!("dictate: could not use shortcut {display}"),
             err,
         );
-        self.sync_shortcut_checks();
-    }
-
-    /// Check exactly the current shortcut in the tray menu.
-    fn sync_shortcut_checks(&self) {
-        if let Some(tray) = &self.tray {
-            tray.sync_shortcut_checks(&self.hotkey_display);
-        }
-    }
-
-    /// Open the README keybind section in the default browser.
-    fn open_how_to(&self) {
-        if let Err(err) = crate::tray::open_target(crate::tray::README_USE_IT_URL) {
-            let message = format!("{err:#}");
-            dlog!("error: {message}");
-            crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
-        }
-    }
-
-    /// Create the settings file (with the current settings, which are the
-    /// defaults when the file is missing) and open it in the default app.
-    fn open_settings_file(&self) {
-        let Some(path) = crate::config::config_path() else {
-            let message = "Could not find a home directory for this user";
-            dlog!("error: {message}");
-            crate::notify::show(crate::notify::Kind::Error, "dictate", message);
-            return;
-        };
-        if !path.is_file()
-            && let Err(err) = crate::config::save(&self.settings)
-        {
-            let message = format!("Could not create {}: {err:#}", path.display());
-            dlog!("error: {message}");
-            crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
-            return;
-        }
-        if let Err(err) = crate::tray::open_target(&path.to_string_lossy()) {
-            let message = format!("{err:#}");
-            dlog!("error: {message}");
-            crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
-        }
     }
 
     /// Open the Settings window, or focus it when it is already open. A GL
@@ -1227,8 +1144,8 @@ impl DaemonApp {
 
     /// Paint one Settings frame. The window is taken out while egui runs so
     /// the page can read daemon state; the page's intents apply after the
-    /// frame through the tray's code paths. A frame failure drops the window
-    /// (already out), and the daemon keeps running.
+    /// frame through the daemon's settings code paths. A frame failure drops
+    /// the window (already out), and the daemon keeps running.
     fn redraw_settings(&mut self, event_loop: &ActiveEventLoop) {
         let Some(mut window) = self.settings_window.take() else {
             return;
@@ -1291,8 +1208,8 @@ impl DaemonApp {
         }
     }
 
-    /// Apply one Settings-page intent through the same code path the tray menu
-    /// uses for the same change.
+    /// Apply one Settings-page intent through the daemon's settings code
+    /// paths (save, notify, the background model-switch threads).
     fn apply_page_action(&mut self, action: crate::settings_ui::page::PageAction) {
         use crate::settings_ui::page::PageAction;
         match action {
@@ -1609,9 +1526,9 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
             self.tray_attempted = true;
             self.refresh_microphones();
             match crate::tray::build_tray(
-                &self.settings,
                 self.state,
-                &self.mics,
+                self.settings.mode,
+                self.tray_mic().as_deref(),
                 self.menu_proxy.clone(),
             ) {
                 Ok(tray) => {
@@ -1704,7 +1621,6 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
             }
             UserEvent::ModeSwitchFailed => {
                 if self.mode_switch.take().is_some() {
-                    self.sync_mode_checks();
                     self.sync_tray();
                 }
                 self.refresh_settings();
@@ -1733,7 +1649,7 @@ fn live_download_body(percent: u64) -> String {
     format!("Downloading Live model… {percent}%")
 }
 
-/// Background model load for a menu mode switch: optionally downloads the
+/// Background model load for a Settings-page mode switch: optionally downloads the
 /// Live model first (with progress notifications), loads the target's model
 /// (Live always benchmarks too) and hands it to the transcription worker for
 /// the swap. Exactly one terminal outcome: a `Job::Swap*` sent to the worker
@@ -1767,7 +1683,7 @@ fn run_mode_switch_loader(
     // Else the worker acks `ModeSwapped` once the swap lands.
 }
 
-/// Download the Live model for a menu switch, notifying at 25/50/75% (each
+/// Download the Live model for a Settings-page switch, notifying at 25/50/75% (each
 /// milestone replaces the previous one). Milestones already passed by
 /// present files don't notify: only this download's progress does. A failure
 /// is logged + notified with the real error and fails the switch.
@@ -1901,7 +1817,7 @@ fn switch_load_failed(err: anyhow::Error) {
 
 /// Benchmark the Live model for the speed gate, logging the check first and
 /// recording the outcome for the Settings page. Shared by the startup check
-/// and menu switches.
+/// and Settings-page switches.
 fn check_live_speed(
     live: &mut crate::live::Live,
     progress: &Mutex<SwitchProgress>,

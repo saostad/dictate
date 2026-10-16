@@ -122,6 +122,7 @@ with the control commands:
 dictate daemon
 dictate toggle   # start/stop recording
 dictate status   # idle, recording or transcribing
+dictate settings # open the Settings window
 ```
 
 If the daemon isn't running, `toggle`/`start`/`stop`/`cancel` start it
@@ -157,13 +158,25 @@ Shortcuts.
 ## Tray menu
 
 `dictate daemon` shows a tray icon: grey when idle, red while recording,
-amber while transcribing. Its menu shows the live state, starts/stops/cancels
-dictation, toggles sound cues and notifications, switches the dictation mode
-(saved automatically), switches the global shortcut (on Wayland it
-explains the compositor keybinds instead), opens the settings file, and quits
-the daemon.
+amber while transcribing. Its menu shows the live state (with the microphone
+and mode in the tooltip), starts/stops/cancels dictation, opens the Settings
+window, and quits the daemon.
 Without a tray host the daemon logs `dictate: no tray icon` once and keeps
 running headless.
+
+## Settings window
+
+Pick `Settings…` in the tray menu, or run `dictate settings`. One page with
+everything, applied immediately:
+
+- **Microphone**: pick the microphone (or the system default) and see which
+  one the last recording used.
+- **Dictation mode**: Whole recording, Type at pauses, or Live — with the
+  loading, download and speed-check progress inline.
+- **Shortcut**: pick the global hotkey (on Wayland it explains the
+  compositor keybinds instead).
+- **General**: start at login, sound cues, notifications.
+- **About**: version, open the log, check for updates.
 
 ## Start at login
 
@@ -174,8 +187,8 @@ dictate autostart off     # turn it off
 ```
 
 If you move the dictate binary, the daemon updates the login entry itself
-on its next start. (The Settings window, coming in a later version, will
-have a checkbox for this too.)
+on its next start. The Settings window has a checkbox for this too
+(General → Start at login).
 
 ## Modes
 
@@ -185,7 +198,7 @@ have a checkbox for this too.)
 | Pauses | `mode = "pauses"` | types each pause segment while speaking | high: 1.5 s of left context per piece | most text is already typed at stop |
 | Live | `mode = "live"` | types while speaking, chunk by chunk | good: true streaming model | fastest: text appears as you talk |
 
-Set the mode from the tray menu's Mode submenu (it switches live, loading
+Set the mode in the Settings window (it switches live, loading
 the needed model on a background thread; picking Live downloads its model
 first when missing), or with `DICTATE_MODE=live`.
 
@@ -208,8 +221,8 @@ uses whole mode for that session. Without the model it does the same
 
 ## Advanced: where settings are stored
 
-The tray menu manages settings for you (sound cues, notifications, mode,
-microphone, shortcut). They live in `config.toml` in the platform config
+The Settings window manages settings for you (sound cues, notifications,
+mode, microphone, shortcut). They live in `config.toml` in the platform config
 directory (`~/.config/dictate/config.toml` on Linux,
 `~/Library/Application Support/dictate/config.toml` on macOS,
 `%APPDATA%\dictate\config\config.toml` on Windows).
