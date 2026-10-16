@@ -1269,6 +1269,9 @@ impl DaemonApp {
             self.recording_failed("the daemon was recording but its recorder is gone".to_string());
             return "err not recording".to_string();
         };
+        // Let the device deliver its buffered tail before the stream is
+        // dropped (the feeder drains the shared buffer next).
+        recorder.drain();
         drop(recorder);
         self.finish_feeder(FeederCmd::Stop);
         self.state = new_state;

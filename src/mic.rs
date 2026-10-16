@@ -1,12 +1,15 @@
 use std::str::FromStr;
 #[cfg(target_os = "linux")]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use anyhow::Context;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
-use cpal::{FromSample, I24, Sample, SampleFormat, SizedSample, U24};
+use cpal::{
+    BufferSize, FromSample, I24, Sample, SampleFormat, SizedSample, SupportedBufferSize, U24,
+};
 
 /// 16 kHz mono samples below this count are too short to transcribe (0.3 s).
 pub(crate) const MIN_RECORDING_SAMPLES: usize = 4800;
@@ -165,22 +168,58 @@ struct ConfigRange {
     min_rate: u32,
     max_rate: u32,
     format: SampleFormat,
+    buffer_size: SupportedBufferSize,
 }
 
 /// Prefer a float input config: the first F32 range, at `default_rate` when
 /// that lies inside the range, else the closest supported rate (the range
 /// edge). `None` when no range offers F32 (the caller then uses the default
 /// config). Ranges with `min_rate > max_rate` are skipped rather than
-/// panicking in `clamp`.
+/// panicking in `clamp`. The buffer size is ~20 ms, clamped to the range.
 fn prefer_f32_config(ranges: &[ConfigRange], default_rate: u32) -> Option<cpal::StreamConfig> {
     let range = ranges
         .iter()
         .find(|range| range.format == SampleFormat::F32 && range.min_rate <= range.max_rate)?;
+    let sample_rate = default_rate.clamp(range.min_rate, range.max_rate);
     Some(cpal::StreamConfig {
         channels: range.channels,
-        sample_rate: default_rate.clamp(range.min_rate, range.max_rate),
-        buffer_size: cpal::BufferSize::Default,
+        sample_rate,
+        buffer_size: choose_buffer_size(range.buffer_size, sample_rate),
     })
+}
+
+/// About 20 ms of audio frames at `sample_rate` (48 kHz → 960).
+fn wanted_buffer_frames(sample_rate: u32) -> u32 {
+    (sample_rate / 50).max(1)
+}
+
+/// Pick the stream buffer size: ~20 ms of frames clamped into the device's
+/// supported range, or `Default` when the device reports no range (or a
+/// degenerate one). Pure, for tests.
+fn choose_buffer_size(supported: SupportedBufferSize, sample_rate: u32) -> BufferSize {
+    let SupportedBufferSize::Range { min, max } = supported else {
+        return BufferSize::Default;
+    };
+    if min > max {
+        return BufferSize::Default;
+    }
+    BufferSize::Fixed(wanted_buffer_frames(sample_rate).clamp(min, max))
+}
+
+/// The default config with a small fixed buffer when the device reports a
+/// supported range (`Default` otherwise).
+fn default_config_with_buffer(supported: &cpal::SupportedStreamConfig) -> cpal::StreamConfig {
+    let mut config = supported.config();
+    config.buffer_size = choose_buffer_size(*supported.buffer_size(), config.sample_rate);
+    config
+}
+
+/// One-line description of the chosen buffer size for the `mic buffer:` log.
+fn describe_buffer_size(buffer_size: BufferSize) -> String {
+    match buffer_size {
+        BufferSize::Fixed(frames) => format!("fixed {frames} frames (~20 ms)"),
+        BufferSize::Default => "default (the device reports no buffer range)".to_string(),
+    }
 }
 
 /// True when `samples_16k` holds less than 0.3 s of 16 kHz mono audio.
@@ -204,6 +243,8 @@ pub(crate) struct Recorder {
     stream: cpal::Stream,
     samples: Arc<Mutex<Vec<f32>>>,
     stream_error: Arc<Mutex<Option<String>>>,
+    /// Input data callbacks delivered (for the stop drain).
+    callbacks: Arc<AtomicU64>,
     sample_rate: u32,
     mic_name: String,
 }
@@ -318,12 +359,13 @@ fn resolve_mic(
                     min_rate: range.min_sample_rate(),
                     max_rate: range.max_sample_rate(),
                     format: range.sample_format(),
+                    buffer_size: *range.buffer_size(),
                 })
                 .collect();
             match prefer_f32_config(&plain, default_supported.sample_rate()) {
                 Some(config) => (config, SampleFormat::F32),
                 None => (
-                    default_supported.config(),
+                    default_config_with_buffer(&default_supported),
                     default_supported.sample_format(),
                 ),
             }
@@ -333,7 +375,7 @@ fn resolve_mic(
                 "warning: could not list the microphone's supported configs ({err}); using the default config"
             ));
             (
-                default_supported.config(),
+                default_config_with_buffer(&default_supported),
                 default_supported.sample_format(),
             )
         }
@@ -366,6 +408,10 @@ fn log_recording_from(resolved: &ResolvedMic) {
         "mic format: {:?} {channels}ch {sample_rate} Hz",
         resolved.format
     ));
+    mlog(&format!(
+        "mic buffer: {}",
+        describe_buffer_size(resolved.config.buffer_size)
+    ));
 }
 
 /// Open the stream for a resolved microphone and start recording.
@@ -378,38 +424,39 @@ fn open_recorder(resolved: &ResolvedMic, steps: &mut Vec<StartStep>) -> anyhow::
     let sample_rate = config.sample_rate;
     let samples = Arc::new(Mutex::new(Vec::with_capacity((sample_rate as usize) * 60)));
     let stream_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let callbacks = Arc::new(AtomicU64::new(0));
     let stream = match format {
-            SampleFormat::I8 => build_stream::<i8>(device, config, channels, &samples, &stream_error),
+            SampleFormat::I8 => build_stream::<i8>(device, config, channels, &samples, &stream_error, &callbacks),
             SampleFormat::I16 => {
-                build_stream::<i16>(device, config, channels, &samples, &stream_error)
+                build_stream::<i16>(device, config, channels, &samples, &stream_error, &callbacks)
             }
             SampleFormat::I24 => {
-                build_stream::<I24>(device, config, channels, &samples, &stream_error)
+                build_stream::<I24>(device, config, channels, &samples, &stream_error, &callbacks)
             }
             SampleFormat::I32 => {
-                build_stream::<i32>(device, config, channels, &samples, &stream_error)
+                build_stream::<i32>(device, config, channels, &samples, &stream_error, &callbacks)
             }
             SampleFormat::I64 => {
-                build_stream::<i64>(device, config, channels, &samples, &stream_error)
+                build_stream::<i64>(device, config, channels, &samples, &stream_error, &callbacks)
             }
-            SampleFormat::U8 => build_stream::<u8>(device, config, channels, &samples, &stream_error),
+            SampleFormat::U8 => build_stream::<u8>(device, config, channels, &samples, &stream_error, &callbacks),
             SampleFormat::U16 => {
-                build_stream::<u16>(device, config, channels, &samples, &stream_error)
+                build_stream::<u16>(device, config, channels, &samples, &stream_error, &callbacks)
             }
             SampleFormat::U24 => {
-                build_stream::<U24>(device, config, channels, &samples, &stream_error)
+                build_stream::<U24>(device, config, channels, &samples, &stream_error, &callbacks)
             }
             SampleFormat::U32 => {
-                build_stream::<u32>(device, config, channels, &samples, &stream_error)
+                build_stream::<u32>(device, config, channels, &samples, &stream_error, &callbacks)
             }
             SampleFormat::U64 => {
-                build_stream::<u64>(device, config, channels, &samples, &stream_error)
+                build_stream::<u64>(device, config, channels, &samples, &stream_error, &callbacks)
             }
             SampleFormat::F32 => {
-                build_stream::<f32>(device, config, channels, &samples, &stream_error)
+                build_stream::<f32>(device, config, channels, &samples, &stream_error, &callbacks)
             }
             SampleFormat::F64 => {
-                build_stream::<f64>(device, config, channels, &samples, &stream_error)
+                build_stream::<f64>(device, config, channels, &samples, &stream_error, &callbacks)
             }
             format => {
                 anyhow::bail!(
@@ -429,6 +476,7 @@ fn open_recorder(resolved: &ResolvedMic, steps: &mut Vec<StartStep>) -> anyhow::
         stream,
         samples,
         stream_error,
+        callbacks,
         sample_rate,
         mic_name: resolved.mic_name.clone(),
     })
@@ -583,10 +631,30 @@ impl Recorder {
         take_buffer(&self.samples)
     }
 
+    /// Wait for one more input callback after the stop request, so audio held
+    /// in the device's buffer is delivered before the stream is dropped.
+    /// Bounded at 200 ms: a stalled mic just waits that out, never hangs.
+    pub(crate) fn drain(&self) {
+        let drain_start = Instant::now();
+        let seen = self.callbacks.load(Ordering::Relaxed);
+        let deadline = drain_start + Duration::from_millis(200);
+        while self.callbacks.load(Ordering::Relaxed) == seen && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        if mic_debug() {
+            mlog(&format!(
+                "mic drain: {}ms",
+                drain_start.elapsed().as_millis()
+            ));
+        }
+    }
+
     /// Stop recording and return the audio as 16 kHz mono samples.
     pub(crate) fn stop(self) -> anyhow::Result<Vec<f32>> {
-        // Drain most samples before stopping, then the trailing few after
-        // the stream is dropped, so no sample is lost.
+        // Let the device deliver its buffered tail first, then drain most
+        // samples before stopping and the trailing few after the stream is
+        // dropped, so no sample is lost.
+        self.drain();
         let mut mono = self.take_new();
         drop(self.stream);
         if let Some(text) = stream_error_text(&self.stream_error) {
@@ -611,6 +679,7 @@ fn build_stream<T>(
     channels: usize,
     samples: &Arc<Mutex<Vec<f32>>>,
     stream_error: &Arc<Mutex<Option<String>>>,
+    callbacks: &Arc<AtomicU64>,
 ) -> Result<cpal::Stream, cpal::Error>
 where
     T: SizedSample,
@@ -618,10 +687,13 @@ where
 {
     let data_samples = samples.clone();
     let data_errors = stream_error.clone();
+    let data_callbacks = callbacks.clone();
     let callback_errors = stream_error.clone();
     device.build_input_stream(
         *config,
-        move |data: &[T], _: &_| push_samples(data, channels, &data_samples, &data_errors),
+        move |data: &[T], _: &_| {
+            push_samples(data, channels, &data_samples, &data_errors, &data_callbacks)
+        },
         move |err| store_stream_error(&callback_errors, err.to_string()),
         None,
     )
@@ -635,10 +707,14 @@ fn push_samples<T>(
     channels: usize,
     samples: &Mutex<Vec<f32>>,
     stream_error: &Mutex<Option<String>>,
+    callbacks: &AtomicU64,
 ) where
     T: cpal::Sample,
     f32: FromSample<T>,
 {
+    if !data.is_empty() {
+        callbacks.fetch_add(1, Ordering::Relaxed);
+    }
     let interleaved: Vec<f32> = data.iter().map(|&s| f32::from_sample(s)).collect();
     let mono = downmix(&interleaved, channels);
     match samples.lock() {
@@ -773,6 +849,24 @@ mod tests {
             min_rate,
             max_rate,
             format,
+            buffer_size: SupportedBufferSize::Unknown,
+        }
+    }
+
+    fn ranged_buffer(
+        channels: u16,
+        min_rate: u32,
+        max_rate: u32,
+        format: SampleFormat,
+        min: u32,
+        max: u32,
+    ) -> ConfigRange {
+        ConfigRange {
+            channels,
+            min_rate,
+            max_rate,
+            format,
+            buffer_size: SupportedBufferSize::Range { min, max },
         }
     }
 
@@ -819,6 +913,62 @@ mod tests {
         assert_eq!(config.sample_rate, 48_000);
         // Only a degenerate F32 range: no pick (and no panic).
         assert!(prefer_f32_config(&ranges[..1], 48_000).is_none());
+    }
+
+    #[test]
+    fn buffer_size_is_20_ms_clamped_to_the_range() {
+        let range = |min: u32, max: u32| SupportedBufferSize::Range { min, max };
+        // 48 kHz wants 960 frames; inside the range it is used as-is.
+        assert_eq!(
+            choose_buffer_size(range(1, 4096), 48_000),
+            BufferSize::Fixed(960)
+        );
+        assert_eq!(wanted_buffer_frames(48_000), 960);
+        assert_eq!(wanted_buffer_frames(16_000), 320);
+        // Outside the range it clamps to the edge.
+        assert_eq!(
+            choose_buffer_size(range(1, 512), 48_000),
+            BufferSize::Fixed(512)
+        );
+        assert_eq!(
+            choose_buffer_size(range(2048, 8192), 48_000),
+            BufferSize::Fixed(2048)
+        );
+        // No range (or a degenerate one): the default buffer size.
+        assert_eq!(
+            choose_buffer_size(SupportedBufferSize::Unknown, 48_000),
+            BufferSize::Default
+        );
+        assert_eq!(
+            choose_buffer_size(range(512, 128), 48_000),
+            BufferSize::Default
+        );
+    }
+
+    #[test]
+    fn preferred_f32_config_carries_the_clamped_buffer() {
+        let ranges = vec![ranged_buffer(2, 8000, 96_000, SampleFormat::F32, 1, 512)];
+        let config = prefer_f32_config(&ranges, 48_000).unwrap();
+        assert_eq!(config.buffer_size, BufferSize::Fixed(512));
+        let ranges = vec![ranged_buffer(1, 8000, 48_000, SampleFormat::F32, 1, 8192)];
+        let config = prefer_f32_config(&ranges, 48_000).unwrap();
+        assert_eq!(config.buffer_size, BufferSize::Fixed(960));
+        // Unknown range: default.
+        let ranges = vec![range(2, 8000, 96_000, SampleFormat::F32)];
+        let config = prefer_f32_config(&ranges, 48_000).unwrap();
+        assert_eq!(config.buffer_size, BufferSize::Default);
+    }
+
+    #[test]
+    fn buffer_descriptions_name_fixed_and_default() {
+        assert_eq!(
+            describe_buffer_size(BufferSize::Fixed(960)),
+            "fixed 960 frames (~20 ms)"
+        );
+        assert_eq!(
+            describe_buffer_size(BufferSize::Default),
+            "default (the device reports no buffer range)"
+        );
     }
 
     #[test]
