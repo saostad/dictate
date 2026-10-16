@@ -79,6 +79,47 @@ pub(crate) fn toggle_text(state: State) -> &'static str {
     }
 }
 
+/// A settings change made from the tray menu: a checkbox toggle or a
+/// shortcut switch. Pure, so the confirmation text is unit-testable.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SettingsChange {
+    Sounds(bool),
+    Notifications(bool),
+    Streaming(bool),
+    Shortcut(String),
+}
+
+impl SettingsChange {
+    /// Body of the Info notification confirming the change.
+    pub(crate) fn notification_body(&self) -> String {
+        match self {
+            SettingsChange::Sounds(on) => format!("Sound cues: {}", on_off(*on)),
+            SettingsChange::Notifications(on) => {
+                format!("Notifications: {}", on_off(*on))
+            }
+            SettingsChange::Streaming(on) => {
+                format!("Type while speaking: {}", on_off(*on))
+            }
+            SettingsChange::Shortcut(display) => format!("Shortcut: {display}"),
+        }
+    }
+
+    /// Daemon-log line for the change: the key and value.
+    pub(crate) fn log_line(&self) -> String {
+        match self {
+            SettingsChange::Sounds(on) => format!("settings: sounds = {on}"),
+            SettingsChange::Notifications(on) => format!("settings: notifications = {on}"),
+            SettingsChange::Streaming(on) => format!("settings: streaming = {on}"),
+            SettingsChange::Shortcut(display) => format!("settings: hotkey = {display}"),
+        }
+    }
+}
+
+/// `on`/`off` word for a toggled switch.
+fn on_off(on: bool) -> &'static str {
+    if on { "on" } else { "off" }
+}
+
 /// One menu click, already matched to its item.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum TrayAction {
@@ -401,6 +442,51 @@ mod tests {
                 global_hotkey::hotkey::HotKey::from_str(name).is_ok(),
                 "{name} does not parse"
             );
+        }
+    }
+
+    #[test]
+    fn settings_change_confirmation_texts() {
+        let cases = [
+            (
+                SettingsChange::Sounds(true),
+                "Sound cues: on",
+                "settings: sounds = true",
+            ),
+            (
+                SettingsChange::Sounds(false),
+                "Sound cues: off",
+                "settings: sounds = false",
+            ),
+            (
+                SettingsChange::Notifications(true),
+                "Notifications: on",
+                "settings: notifications = true",
+            ),
+            (
+                SettingsChange::Notifications(false),
+                "Notifications: off",
+                "settings: notifications = false",
+            ),
+            (
+                SettingsChange::Streaming(true),
+                "Type while speaking: on",
+                "settings: streaming = true",
+            ),
+            (
+                SettingsChange::Streaming(false),
+                "Type while speaking: off",
+                "settings: streaming = false",
+            ),
+            (
+                SettingsChange::Shortcut("Ctrl+Alt+D".to_string()),
+                "Shortcut: Ctrl+Alt+D",
+                "settings: hotkey = Ctrl+Alt+D",
+            ),
+        ];
+        for (change, body, log) in cases {
+            assert_eq!(change.notification_body(), body, "{change:?}");
+            assert_eq!(change.log_line(), log, "{change:?}");
         }
     }
 

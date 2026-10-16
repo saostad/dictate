@@ -55,6 +55,18 @@ pub(crate) fn show(kind: Kind, summary: &str, body: &str) {
     });
 }
 
+/// Show a desktop notification even when notifications are disabled. Only
+/// for the "Notifications: off" toggle itself: the confirmation of that
+/// action. Returns immediately; failures warn once per process.
+pub(crate) fn show_forced(kind: Kind, summary: &str, body: &str) {
+    let owned = (summary.to_owned(), body.to_owned());
+    std::thread::spawn(move || {
+        if let Err(err) = show_blocking(kind, &owned.0, &owned.1) {
+            warn_once(&err);
+        }
+    });
+}
+
 /// Show a desktop notification on the calling thread, unless disabled.
 /// For short-lived processes (the client commands) that would exit before a
 /// spawned thread delivers the message. Failures warn once per process.

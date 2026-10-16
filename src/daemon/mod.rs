@@ -501,6 +501,7 @@ impl DaemonApp {
             tray.set_sounds_checked(new);
         }
         self.report_save_error(crate::config::save(&self.settings));
+        Self::confirm_settings_change(&crate::tray::SettingsChange::Sounds(new), false);
     }
 
     /// Flip the `Notifications` check, update the effective switch, save.
@@ -512,6 +513,9 @@ impl DaemonApp {
             tray.set_notifications_checked(new);
         }
         self.report_save_error(crate::config::save(&self.settings));
+        // Turning notifications off is confirmed even though they are now
+        // off: the notification is the confirmation of that action.
+        Self::confirm_settings_change(&crate::tray::SettingsChange::Notifications(new), !new);
     }
 
     /// Flip the `Type while speaking` check, update the effective switch, save.
@@ -523,6 +527,21 @@ impl DaemonApp {
             tray.set_streaming_checked(new);
         }
         self.report_save_error(crate::config::save(&self.settings));
+        Self::confirm_settings_change(&crate::tray::SettingsChange::Streaming(new), false);
+    }
+
+    /// Log a settings change and confirm it with an Info notification, so a
+    /// menu that closes on click still gives visible feedback. `force`
+    /// bypasses the notification switch: only the "Notifications: off"
+    /// toggle uses it.
+    fn confirm_settings_change(change: &crate::tray::SettingsChange, force: bool) {
+        dlog!("{}", change.log_line());
+        let body = change.notification_body();
+        if force {
+            crate::notify::show_forced(crate::notify::Kind::Info, "dictate", &body);
+        } else {
+            crate::notify::show(crate::notify::Kind::Info, "dictate", &body);
+        }
     }
 
     /// Log and notify a settings-save failure (the in-memory value stays).
@@ -585,6 +604,10 @@ impl DaemonApp {
         self.report_save_error(crate::config::save(&self.settings));
         self.sync_shortcut_checks();
         dlog!("Hotkey: {display} (tap to toggle, hold to talk)");
+        Self::confirm_settings_change(
+            &crate::tray::SettingsChange::Shortcut(display.to_string()),
+            false,
+        );
     }
 
     /// Notify a failed shortcut switch and re-check the current shortcut.
