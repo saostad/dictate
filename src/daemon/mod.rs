@@ -452,10 +452,11 @@ fn run_daemon_inner() -> anyhow::Result<()> {
         );
     }
     // Env wins; an unset or empty DICTATE_HOTKEY falls back to the file.
+    let mac = cfg!(target_os = "macos");
     let hotkey = match std::env::var("DICTATE_HOTKEY").ok() {
-        Some(value) if !value.is_empty() => crate::hotkey::resolve_hotkey(Some(&value))
+        Some(value) if !value.is_empty() => crate::hotkey::resolve_hotkey(Some(&value), mac)
             .map_err(|message| anyhow::anyhow!("{message}"))?,
-        _ => crate::hotkey::resolve_file_hotkey(&file_settings.hotkey)
+        _ => crate::hotkey::resolve_file_hotkey(&file_settings.hotkey, mac)
             .map_err(|message| anyhow::anyhow!("{message}"))?,
     };
     let load_start = Instant::now();
@@ -608,8 +609,16 @@ fn setup_hotkey(
         );
         return;
     }
+    let hotkey = match config.trigger {
+        crate::hotkey::Trigger::Key(hotkey) => hotkey,
+        // Modifier-only chord: the tap starts here in item 2.
+        crate::hotkey::Trigger::Chord(chord) => {
+            let _ = chord;
+            return;
+        }
+    };
     let manager = match GlobalHotKeyManager::new().and_then(|manager| {
-        manager.register(config.hotkey)?;
+        manager.register(hotkey)?;
         Ok(manager)
     }) {
         Ok(manager) => manager,
@@ -621,7 +630,7 @@ fn setup_hotkey(
             return;
         }
     };
-    app.hotkey = Some(config.hotkey);
+    app.hotkey = Some(hotkey);
     app._hotkey_manager = Some(manager);
     let proxy = event_loop.create_proxy();
     GlobalHotKeyEvent::set_event_handler(Some(move |event| {

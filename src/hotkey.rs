@@ -108,7 +108,6 @@ fn all_modifiers(value: &str) -> Option<ModifierSet> {
 
 /// Parse a modifier-only shortcut value (`"Cmd+Option"`): `Some` only when
 /// every part names a modifier and at least two distinct modifiers are set.
-#[allow(dead_code)] // wired up in the daemon next
 pub(crate) fn parse_modifier_only(value: &str) -> Option<ModifierSet> {
     let set = all_modifiers(value)?;
     (set.distinct_count() >= 2).then_some(set)
@@ -117,7 +116,6 @@ pub(crate) fn parse_modifier_only(value: &str) -> Option<ModifierSet> {
 /// User-facing error for an all-modifier value that can't be used: `None`
 /// when the value isn't all modifiers, or when it works (two or more
 /// modifiers on macOS).
-#[allow(dead_code)] // wired up in the daemon next
 pub(crate) fn modifier_only_error(value: &str, mac: bool) -> Option<String> {
     let set = all_modifiers(value)?;
     match set.distinct_count() {
@@ -191,28 +189,47 @@ impl ChordTracker {
 /// A press held at least this long is push-to-talk; a shorter one is a tap.
 pub(crate) const HOLD_THRESHOLD_MS: u64 = 400;
 
-/// The parsed hotkey plus the string shown to the user.
+/// What starts dictation: a global-hotkey combo or a macOS modifier chord.
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum Trigger {
+    Key(HotKey),
+    Chord(ModifierSet),
+}
+
+/// The parsed trigger plus the string shown to the user.
 #[derive(Debug)]
 pub(crate) struct HotkeyConfig {
-    pub hotkey: HotKey,
+    pub trigger: Trigger,
     pub display: String,
 }
 
 /// Resolve the daemon hotkey from the `DICTATE_HOTKEY` value (`None` when
-/// unset). An empty value means the default.
-pub(crate) fn resolve_hotkey(env: Option<&str>) -> Result<HotkeyConfig, String> {
+/// unset). An empty value means the default. `mac` selects the platform
+/// (callers pass `cfg!(target_os = "macos")`).
+pub(crate) fn resolve_hotkey(env: Option<&str>, mac: bool) -> Result<HotkeyConfig, String> {
     match env {
-        Some(value) if !value.is_empty() => HotKey::from_str(value)
-            .map(|hotkey| HotkeyConfig {
-                hotkey,
-                display: value.to_string(),
-            })
-            .map_err(|err| {
-                format!("Invalid DICTATE_HOTKEY \"{value}\": {err}. Example: Ctrl+Shift+Space")
-            }),
+        Some(value) if !value.is_empty() => {
+            if let Some(message) = modifier_only_error(value, mac) {
+                return Err(format!("Invalid DICTATE_HOTKEY \"{value}\": {message}"));
+            }
+            if let Some(chord) = parse_modifier_only(value) {
+                return Ok(HotkeyConfig {
+                    trigger: Trigger::Chord(chord),
+                    display: value.to_string(),
+                });
+            }
+            HotKey::from_str(value)
+                .map(|hotkey| HotkeyConfig {
+                    trigger: Trigger::Key(hotkey),
+                    display: value.to_string(),
+                })
+                .map_err(|err| {
+                    format!("Invalid DICTATE_HOTKEY \"{value}\": {err}. Example: Ctrl+Shift+Space")
+                })
+        }
         _ => HotKey::from_str(DEFAULT_HOTKEY)
             .map(|hotkey| HotkeyConfig {
-                hotkey,
+                trigger: Trigger::Key(hotkey),
                 display: DEFAULT_HOTKEY.to_string(),
             })
             .map_err(|err| {
@@ -224,13 +241,25 @@ pub(crate) fn resolve_hotkey(env: Option<&str>) -> Result<HotkeyConfig, String> 
 }
 
 /// Resolve a hotkey from the settings file. An empty value means the default.
-pub(crate) fn resolve_file_hotkey(value: &str) -> Result<HotkeyConfig, String> {
+/// `mac` selects the platform (callers pass `cfg!(target_os = "macos")`).
+pub(crate) fn resolve_file_hotkey(value: &str, mac: bool) -> Result<HotkeyConfig, String> {
     if value.is_empty() {
-        return resolve_hotkey(None);
+        return resolve_hotkey(None, mac);
+    }
+    if let Some(message) = modifier_only_error(value, mac) {
+        return Err(format!(
+            "Invalid hotkey \"{value}\" in the settings file: {message}"
+        ));
+    }
+    if let Some(chord) = parse_modifier_only(value) {
+        return Ok(HotkeyConfig {
+            trigger: Trigger::Chord(chord),
+            display: value.to_string(),
+        });
     }
     HotKey::from_str(value)
         .map(|hotkey| HotkeyConfig {
-            hotkey,
+            trigger: Trigger::Key(hotkey),
             display: value.to_string(),
         })
         .map_err(|err| {
@@ -361,35 +390,46 @@ mod tests {
 
     #[test]
     fn resolve_defaults_when_unset_or_empty() {
-        for env in [None, Some("")] {
-            let config = resolve_hotkey(env).unwrap();
-            assert_eq!(config.display, "Ctrl+Shift+Space");
-            assert_eq!(config.hotkey.key, Code::Space);
-            assert!(config.hotkey.mods.contains(Modifiers::CONTROL));
-            assert!(config.hotkey.mods.contains(Modifiers::SHIFT));
+        for mac in [true, false] {
+            for env in [None, Some("")] {
+                let config = resolve_hotkey(env, mac).unwrap();
+                assert_eq!(config.display, "Ctrl+Shift+Space");
+                let Trigger::Key(hotkey) = config.trigger else {
+                    panic!("default must be a key trigger");
+                };
+                assert_eq!(hotkey.key, Code::Space);
+                assert!(hotkey.mods.contains(Modifiers::CONTROL));
+                assert!(hotkey.mods.contains(Modifiers::SHIFT));
+            }
         }
     }
 
     #[test]
     fn resolve_accepts_custom_hotkey() {
-        let config = resolve_hotkey(Some("Alt+F9")).unwrap();
+        let config = resolve_hotkey(Some("Alt+F9"), false).unwrap();
         assert_eq!(config.display, "Alt+F9");
-        assert_eq!(config.hotkey.key, Code::F9);
-        assert!(config.hotkey.mods.contains(Modifiers::ALT));
+        let Trigger::Key(hotkey) = config.trigger else {
+            panic!("Alt+F9 must be a key trigger");
+        };
+        assert_eq!(hotkey.key, Code::F9);
+        assert!(hotkey.mods.contains(Modifiers::ALT));
     }
 
     #[test]
     fn file_hotkey_resolves_and_defaults_when_empty() {
-        let config = resolve_file_hotkey("F8").unwrap();
+        let config = resolve_file_hotkey("F8", false).unwrap();
         assert_eq!(config.display, "F8");
-        assert_eq!(config.hotkey.key, Code::F8);
-        let config = resolve_file_hotkey("").unwrap();
+        let Trigger::Key(hotkey) = config.trigger else {
+            panic!("F8 must be a key trigger");
+        };
+        assert_eq!(hotkey.key, Code::F8);
+        let config = resolve_file_hotkey("", false).unwrap();
         assert_eq!(config.display, "Ctrl+Shift+Space");
     }
 
     #[test]
     fn file_hotkey_rejects_bad_value_with_example() {
-        let err = resolve_file_hotkey("Shift+Foo").unwrap_err();
+        let err = resolve_file_hotkey("Shift+Foo", false).unwrap_err();
         assert!(
             err.starts_with("Invalid hotkey \"Shift+Foo\" in the settings file: "),
             "unexpected: {err}"
@@ -548,8 +588,50 @@ mod tests {
     }
 
     #[test]
+    fn modifier_only_trigger_resolves_per_os() {
+        // Cmd+Option on mac is a chord.
+        let config = resolve_hotkey(Some("Cmd+Option"), true).unwrap();
+        assert_eq!(config.display, "Cmd+Option");
+        assert!(
+            matches!(config.trigger, Trigger::Chord(set) if set == cmd_option()),
+            "unexpected: {:?}",
+            config.trigger
+        );
+        let config = resolve_file_hotkey("Cmd+Option", true).unwrap();
+        assert!(
+            matches!(config.trigger, Trigger::Chord(set) if set == cmd_option()),
+            "unexpected: {:?}",
+            config.trigger
+        );
+        // Same value elsewhere is an error naming macOS.
+        let err = resolve_hotkey(Some("Cmd+Option"), false).unwrap_err();
+        assert!(err.contains("work only on macOS"), "unexpected: {err}");
+        assert!(
+            err.starts_with("Invalid DICTATE_HOTKEY \"Cmd+Option\": "),
+            "unexpected: {err}"
+        );
+        let err = resolve_file_hotkey("Cmd+Option", false).unwrap_err();
+        assert!(err.contains("work only on macOS"), "unexpected: {err}");
+        assert!(
+            err.starts_with("Invalid hotkey \"Cmd+Option\" in the settings file: "),
+            "unexpected: {err}"
+        );
+        // A lone modifier names the two-modifier fix, with the right example.
+        let err = resolve_hotkey(Some("Cmd"), true).unwrap_err();
+        assert!(
+            err.contains("Use at least two modifier keys (for example Command+Option)"),
+            "unexpected: {err}"
+        );
+        let err = resolve_file_hotkey("Cmd", false).unwrap_err();
+        assert!(
+            err.contains("Use at least two modifier keys (for example Ctrl+Alt)"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
     fn resolve_rejects_bad_value_with_example() {
-        let err = resolve_hotkey(Some("Shift+Foo")).unwrap_err();
+        let err = resolve_hotkey(Some("Shift+Foo"), false).unwrap_err();
         assert!(
             err.starts_with("Invalid DICTATE_HOTKEY \"Shift+Foo\": "),
             "unexpected: {err}"
