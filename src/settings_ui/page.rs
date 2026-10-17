@@ -659,7 +659,7 @@ fn poll_shortcut_capture(
             capture.error = Some(if mac {
                 "Shortcuts with only modifier keys (like Command+Option) aren't supported yet. Add a key, for example Command+Option+Space."
             } else {
-                "Shortcuts with only modifier keys (like Command+Option) aren't supported yet. Add a key, for example Ctrl+Alt+Space."
+                "Shortcuts with only modifier keys (like Ctrl+Alt) aren't supported yet. Add a key, for example Ctrl+Alt+Space."
             }
             .to_string());
         }
