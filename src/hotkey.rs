@@ -64,6 +64,130 @@ pub(crate) fn shortcut_label(value: &str, mac: bool) -> String {
         .join("+")
 }
 
+/// Modifier keys of a modifier-only shortcut (the macOS event tap watches one
+/// of these): Command, Control, Option, Shift.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ModifierSet {
+    pub(crate) cmd: bool,
+    pub(crate) ctrl: bool,
+    pub(crate) option: bool,
+    pub(crate) shift: bool,
+}
+
+impl ModifierSet {
+    /// How many distinct modifiers are set.
+    fn distinct_count(self) -> usize {
+        [self.cmd, self.ctrl, self.option, self.shift]
+            .into_iter()
+            .filter(|held| *held)
+            .count()
+    }
+}
+
+/// The modifier set when every `+` part of the value (trimmed,
+/// case-insensitive) names a modifier — the same names [`shortcut_label`]
+/// maps — else `None`.
+fn all_modifiers(value: &str) -> Option<ModifierSet> {
+    let mut set = ModifierSet {
+        cmd: false,
+        ctrl: false,
+        option: false,
+        shift: false,
+    };
+    for part in value.split('+') {
+        match part.trim().to_ascii_lowercase().as_str() {
+            "cmd" | "command" | "super" | "meta" => set.cmd = true,
+            "ctrl" | "control" => set.ctrl = true,
+            "alt" | "option" => set.option = true,
+            "shift" => set.shift = true,
+            _ => return None,
+        }
+    }
+    Some(set)
+}
+
+/// Parse a modifier-only shortcut value (`"Cmd+Option"`): `Some` only when
+/// every part names a modifier and at least two distinct modifiers are set.
+#[allow(dead_code)] // wired up in the daemon next
+pub(crate) fn parse_modifier_only(value: &str) -> Option<ModifierSet> {
+    let set = all_modifiers(value)?;
+    (set.distinct_count() >= 2).then_some(set)
+}
+
+/// User-facing error for an all-modifier value that can't be used: `None`
+/// when the value isn't all modifiers, or when it works (two or more
+/// modifiers on macOS).
+#[allow(dead_code)] // wired up in the daemon next
+pub(crate) fn modifier_only_error(value: &str, mac: bool) -> Option<String> {
+    let set = all_modifiers(value)?;
+    match set.distinct_count() {
+        0 => None,
+        1 => Some(
+            if mac {
+                "Use at least two modifier keys (for example Command+Option), or add a key."
+            } else {
+                "Use at least two modifier keys (for example Ctrl+Alt), or add a key."
+            }
+            .to_string(),
+        ),
+        _ if mac => None,
+        _ => Some(
+            "Shortcuts with only modifier keys work only on macOS. Add a key, for example Ctrl+Alt+Space."
+                .to_string(),
+        ),
+    }
+}
+
+/// A watched modifier chord plus its press state: active once the exact held
+/// set matched, until anything changes.
+#[allow(dead_code)] // wired up in the daemon next
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChordTracker {
+    pub(crate) chord: ModifierSet,
+    pub(crate) active: bool,
+}
+
+/// What one tap event means for the watched chord.
+#[allow(dead_code)] // wired up in the daemon next
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChordEvent {
+    Pressed,
+    Released,
+    Interrupted,
+}
+
+#[allow(dead_code)] // wired up in the daemon next
+impl ChordTracker {
+    /// Feed one flags-changed event: `Pressed` when the held set becomes
+    /// exactly the chord, `Released` when an active chord stops matching.
+    /// Anything else (including repeats) is `None`.
+    pub(crate) fn on_flags(&mut self, held: ModifierSet) -> Option<ChordEvent> {
+        if self.active {
+            if held == self.chord {
+                None
+            } else {
+                self.active = false;
+                Some(ChordEvent::Released)
+            }
+        } else if held == self.chord {
+            self.active = true;
+            Some(ChordEvent::Pressed)
+        } else {
+            None
+        }
+    }
+
+    /// Feed one plain key-down: `Interrupted` while a chord is active (the
+    /// chord stays armed, so its release still reports `Released`).
+    pub(crate) fn on_key_down(&mut self) -> Option<ChordEvent> {
+        if self.active {
+            Some(ChordEvent::Interrupted)
+        } else {
+            None
+        }
+    }
+}
+
 /// A press held at least this long is push-to-talk; a shorter one is a tap.
 pub(crate) const HOLD_THRESHOLD_MS: u64 = 400;
 
@@ -305,6 +429,122 @@ mod tests {
                 assert!(HotKey::from_str(preset).is_ok(), "{preset} does not parse");
             }
         }
+    }
+
+    fn cmd_option() -> ModifierSet {
+        ModifierSet {
+            cmd: true,
+            ctrl: false,
+            option: true,
+            shift: false,
+        }
+    }
+
+    #[test]
+    fn modifier_only_values_need_two_distinct_modifiers() {
+        assert_eq!(parse_modifier_only("Cmd+Option"), Some(cmd_option()));
+        assert_eq!(parse_modifier_only("option+command"), Some(cmd_option()));
+        assert_eq!(parse_modifier_only("Cmd"), None);
+        assert_eq!(parse_modifier_only("Cmd+Space"), None);
+        assert_eq!(parse_modifier_only(""), None);
+        // The same modifier twice is one distinct modifier.
+        assert_eq!(parse_modifier_only("Cmd+Command"), None);
+        // Trimmed and case-insensitive.
+        assert_eq!(
+            parse_modifier_only("  ctrl + ALT + shift "),
+            Some(ModifierSet {
+                cmd: false,
+                ctrl: true,
+                option: true,
+                shift: true,
+            })
+        );
+    }
+
+    #[test]
+    fn modifier_only_errors_name_the_fix() {
+        assert_eq!(
+            modifier_only_error("Cmd", true).as_deref(),
+            Some("Use at least two modifier keys (for example Command+Option), or add a key.")
+        );
+        assert_eq!(
+            modifier_only_error("Ctrl", false).as_deref(),
+            Some("Use at least two modifier keys (for example Ctrl+Alt), or add a key.")
+        );
+        assert_eq!(modifier_only_error("Cmd+Option", true), None);
+        assert_eq!(
+            modifier_only_error("Ctrl+Alt", false).as_deref(),
+            Some(
+                "Shortcuts with only modifier keys work only on macOS. Add a key, for example Ctrl+Alt+Space."
+            )
+        );
+        assert_eq!(modifier_only_error("Ctrl+Shift+Space", true), None);
+        assert_eq!(modifier_only_error("not a shortcut", false), None);
+    }
+
+    #[test]
+    fn chord_presses_only_on_the_exact_held_set() {
+        let chord = cmd_option();
+        let mut tracker = ChordTracker {
+            chord,
+            active: false,
+        };
+        // A superset does not press.
+        let held = ModifierSet {
+            shift: true,
+            ..chord
+        };
+        assert_eq!(tracker.on_flags(held), None);
+        assert!(!tracker.active);
+        // Neither does a subset.
+        let held = ModifierSet {
+            option: false,
+            ..chord
+        };
+        assert_eq!(tracker.on_flags(held), None);
+        // The exact set presses; repeats don't.
+        assert_eq!(tracker.on_flags(chord), Some(ChordEvent::Pressed));
+        assert_eq!(tracker.on_flags(chord), None);
+    }
+
+    #[test]
+    fn chord_press_releases_on_any_change() {
+        let chord = cmd_option();
+        let mut tracker = ChordTracker {
+            chord,
+            active: false,
+        };
+        // Holding Cmd, then adding Option, presses.
+        let cmd_only = ModifierSet {
+            option: false,
+            ..chord
+        };
+        assert_eq!(tracker.on_flags(cmd_only), None);
+        assert_eq!(tracker.on_flags(chord), Some(ChordEvent::Pressed));
+        // Releasing only Option releases; a repeat of that is quiet.
+        assert_eq!(tracker.on_flags(cmd_only), Some(ChordEvent::Released));
+        assert_eq!(tracker.on_flags(cmd_only), None);
+    }
+
+    #[test]
+    fn chord_key_down_interrupts_but_stays_armed() {
+        let chord = cmd_option();
+        let mut tracker = ChordTracker {
+            chord,
+            active: false,
+        };
+        assert_eq!(tracker.on_key_down(), None);
+        assert_eq!(tracker.on_flags(chord), Some(ChordEvent::Pressed));
+        assert_eq!(tracker.on_key_down(), Some(ChordEvent::Interrupted));
+        // Still armed, so a later release still reports Released.
+        let empty = ModifierSet {
+            cmd: false,
+            ctrl: false,
+            option: false,
+            shift: false,
+        };
+        assert_eq!(tracker.on_flags(empty), Some(ChordEvent::Released));
+        assert_eq!(tracker.on_key_down(), None);
     }
 
     #[test]
