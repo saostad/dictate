@@ -5,7 +5,10 @@
 //! `notifications` (bool, default true), `mode` (`"whole"`/`"pauses"`/`"live"`,
 //! default `"whole"`), `hotkey` (string, default `Ctrl+Shift+Space`) and
 //! `microphone` (string, default `""` = the system default input). A missing
-//! file means defaults, never an error.
+//! file means defaults, never an error. On macOS the hotkey modifiers are
+//! spelled `Cmd`, `Option`, `Ctrl`, `Shift` (e.g. `Cmd+Option+Space`); the
+//! Settings window's `Record shortcut…` button captures one, and shortcuts
+//! with only modifier keys aren't supported yet.
 //!
 //! The environment still wins: `DICTATE_SOUNDS`, `DICTATE_NOTIFY`, `DICTATE_MODE`,
 //! `DICTATE_HOTKEY` and `DICTATE_MICROPHONE` override the file (`DICTATE_STREAMING`
@@ -391,7 +394,7 @@ fn escape(value: &str) -> String {
 /// Render all keys, each with a one-line comment.
 fn render(settings: &Settings) -> String {
     format!(
-        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Dictation mode: \"whole\" (type once at stop), \"pauses\" (type at pauses), \"live\" (type while speaking).\nmode = \"{}\"\n# Global hotkey: tap to toggle, hold to talk.\nhotkey = \"{}\"\n# Microphone: \"\" means the system default input, or a device id (see \"dictate mics\").\nmicrophone = \"{}\"\n",
+        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Dictation mode: \"whole\" (type once at stop), \"pauses\" (type at pauses), \"live\" (type while speaking).\nmode = \"{}\"\n# Global hotkey: tap to toggle, hold to talk. macOS names: Cmd, Option, Ctrl, Shift (e.g. Cmd+Option+Space); modifier-only shortcuts aren't supported yet.\nhotkey = \"{}\"\n# Microphone: \"\" means the system default input, or a device id (see \"dictate mics\").\nmicrophone = \"{}\"\n",
         settings.sounds,
         settings.notifications,
         settings.mode.as_str(),

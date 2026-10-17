@@ -241,6 +241,17 @@ Outside a Wayland session, `dictate daemon` also registers a global hotkey:
 DICTATE_HOTKEY=Alt+F9 dictate daemon
 ```
 
+On macOS the modifiers are named `Cmd`, `Option`, `Ctrl` and `Shift`:
+
+```sh
+DICTATE_HOTKEY=Cmd+Option+Space dictate daemon
+```
+
+You can also pick a preset or capture your own with the `Record shortcut…`
+button in the Settings window. Shortcuts with only modifier keys (like
+Command+Option with no other key) aren't supported yet; add a key, for
+example Command+Option+Space.
+
 - Tap (press and release quickly): toggles recording on and off.
 - Hold (keep it pressed): records while held and transcribes on release
   (push-to-talk).
