@@ -248,9 +248,14 @@ DICTATE_HOTKEY=Cmd+Option+Space dictate daemon
 ```
 
 You can also pick a preset or capture your own with the `Record shortcut…`
-button in the Settings window. Shortcuts with only modifier keys (like
-Command+Option with no other key) aren't supported yet; add a key, for
-example Command+Option+Space.
+button in the Settings window (on macOS you can also press just modifier
+keys, like Command+Option).
+
+Shortcuts with only modifier keys (at least two modifiers, e.g. `Cmd+Option`)
+work on macOS: pressing another key while holding them cancels that recording.
+They need Input Monitoring permission for Dictate (or the terminal that runs
+it) in System Settings → Privacy & Security. They are not available on
+Windows/Linux; add a key there, for example Ctrl+Alt+Space.
 
 - Tap (press and release quickly): toggles recording on and off.
 - Hold (keep it pressed): records while held and transcribes on release
@@ -261,7 +266,8 @@ prints a note; bind `dictate toggle` (or `start`/`stop`) in your compositor
 instead (see above).
 
 On macOS, grant Accessibility (for typing) and Microphone to the terminal or
-app that runs `dictate daemon`.
+app that runs `dictate daemon`. Modifier-only shortcuts (like Command+Option)
+also need Input Monitoring for the same terminal or app.
 
 ## Model
 
