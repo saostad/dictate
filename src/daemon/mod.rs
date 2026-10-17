@@ -17,7 +17,9 @@
 //! when stderr is not a terminal (compositor or on-demand autostart).
 
 /// Print one daemon line: stderr, and the log file when active (see
-/// [`init_file_log`]). Same syntax as `eprintln!`.
+/// [`init_file_log`]). Same syntax as `eprintln!`. Exported so the macOS
+/// event tap (`crate::modtap`) can log too.
+#[macro_export]
 macro_rules! dlog {
     ($($arg:tt)*) => {
         $crate::daemon::log_line(format_args!($($arg)*))

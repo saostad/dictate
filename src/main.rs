@@ -18,6 +18,8 @@ mod hotkey;
 mod live;
 mod mic;
 mod model;
+#[cfg(target_os = "macos")]
+mod modtap;
 mod notify;
 mod segment;
 mod settings_ui;

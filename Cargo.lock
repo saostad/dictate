@@ -871,6 +871,8 @@ dependencies = [
  "glutin-winit",
  "hound",
  "notify-rust",
+ "objc2-core-foundation",
+ "objc2-core-graphics",
  "parakeet-rs",
  "rubato",
  "tempfile",
