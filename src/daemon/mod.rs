@@ -1247,6 +1247,11 @@ impl DaemonApp {
                     self.apply_page_action(action);
                 }
                 window.capture = capture;
+                // egui-winit turns keys into clipboard events when it receives
+                // them, so the flag follows the recording state after every
+                // frame: keys pressed after the Record click arrive as plain
+                // `Event::Key`.
+                window.set_clipboard_shortcuts(!window.capture.recording);
                 if changed || delay.is_zero() {
                     // Changed settings repaint at once; an animation or a
                     // follow-up layout repaints without leaving Wait.

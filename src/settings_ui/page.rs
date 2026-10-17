@@ -596,8 +596,8 @@ fn shortcut_section(
 /// released span with no key shows the modifier-only hint. Key events are frame
 /// input (no widget focus or text field needed); handled ones are consumed so
 /// the rest of the page ignores captured keys. Repeats never trigger.
-/// Copy/Cut/Paste events (egui's form of Cmd+C/X/V) map back to their key with
-/// the frame modifiers so those combos record like any key.
+/// (egui's clipboard shortcuts stay off while recording, so every key arrives
+/// as a plain `Event::Key`.)
 fn poll_shortcut_capture(
     ui: &mut egui::Ui,
     actions: &mut Vec<PageAction>,
@@ -618,7 +618,7 @@ fn poll_shortcut_capture(
                     modifiers,
                     ..
                 } => Some((capture_key(*key, *physical_key), *modifiers)),
-                other => clipboard_capture_key(other).map(|key| (key, frame)),
+                _ => None,
             })
             .collect();
         (pressed, frame)
@@ -673,9 +673,7 @@ fn poll_shortcut_capture(
                         pressed: true,
                         repeat: false,
                         ..
-                    } | egui::Event::Copy
-                        | egui::Event::Cut
-                        | egui::Event::Paste(_)
+                    }
                 )
             });
         });
@@ -871,18 +869,6 @@ fn is_f_key(key: egui::Key) -> bool {
 /// is what was actually pressed.
 fn capture_key(key: egui::Key, physical_key: Option<egui::Key>) -> egui::Key {
     physical_key.unwrap_or(key)
-}
-
-/// The key behind a clipboard event while recording: egui reports Cmd+C/X/V
-/// as Copy/Cut/Paste instead of Key events, so they map back to C/X/V.
-/// Anything else is not a capture attempt (`None`).
-fn clipboard_capture_key(event: &egui::Event) -> Option<egui::Key> {
-    match event {
-        egui::Event::Copy => Some(egui::Key::C),
-        egui::Event::Cut => Some(egui::Key::X),
-        egui::Event::Paste(_) => Some(egui::Key::V),
-        _ => None,
-    }
 }
 
 /// True for bare modifier keys, which never complete a capture on their own.
@@ -1260,23 +1246,6 @@ mod tests {
             egui::Key::Num1
         );
         assert_eq!(capture_key(egui::Key::A, None), egui::Key::A);
-    }
-
-    #[test]
-    fn clipboard_events_map_back_to_their_key() {
-        assert_eq!(
-            clipboard_capture_key(&egui::Event::Copy),
-            Some(egui::Key::C)
-        );
-        assert_eq!(clipboard_capture_key(&egui::Event::Cut), Some(egui::Key::X));
-        assert_eq!(
-            clipboard_capture_key(&egui::Event::Paste("x".to_string())),
-            Some(egui::Key::V)
-        );
-        assert_eq!(
-            clipboard_capture_key(&egui::Event::Text("x".to_string())),
-            None
-        );
     }
 
     #[test]

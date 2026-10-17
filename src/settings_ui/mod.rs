@@ -236,6 +236,14 @@ impl SettingsWindow {
         self.egui_winit.on_window_event(&self.window, event).repaint
     }
 
+    /// Turn egui's clipboard shortcuts (Cmd+C/X/V, Shift+Delete, ...) on or
+    /// off: off while a shortcut is recording, so capture sees plain
+    /// `Event::Key`. Called after every frame, since egui-winit maps the keys
+    /// when it receives them, not when input is taken.
+    pub(crate) fn set_clipboard_shortcuts(&mut self, enabled: bool) {
+        self.egui_winit.set_clipboard_shortcuts(enabled);
+    }
+
     /// Run one frame: egui layout, platform output, paint, present. Returns
     /// the repaint delay egui asked for (`Duration::ZERO` = another frame
     /// immediately, `Duration::MAX` = nothing pending).
