@@ -609,11 +609,12 @@ fn poll_shortcut_capture(
             .filter_map(|event| match event {
                 egui::Event::Key {
                     key,
+                    physical_key,
                     pressed: true,
                     repeat: false,
                     modifiers,
                     ..
-                } => Some((*key, *modifiers)),
+                } => Some((capture_key(*key, *physical_key), *modifiers)),
                 _ => None,
             })
             .collect();
@@ -857,6 +858,14 @@ fn is_f_key(key: egui::Key) -> bool {
             | Key::F23
             | Key::F24
     )
+}
+
+/// The key a capture attempt uses: the physical position when known, else the
+/// logical key. egui-winit reports the logical key first (Shift+1 arrives as
+/// `!`), while global-hotkey registers physical key codes, so the physical key
+/// is what was actually pressed.
+fn capture_key(key: egui::Key, physical_key: Option<egui::Key>) -> egui::Key {
+    physical_key.unwrap_or(key)
 }
 
 /// True for bare modifier keys, which never complete a capture on their own.
@@ -1225,6 +1234,15 @@ mod tests {
             shortcut_from_keys(mods, egui::Key::CapsLock, false).unwrap_err(),
             "dictate can't use CapsLock as a shortcut key. Try a letter, digit, F key or Space."
         );
+    }
+
+    #[test]
+    fn capture_prefers_the_physical_key() {
+        assert_eq!(
+            capture_key(egui::Key::Exclamationmark, Some(egui::Key::Num1)),
+            egui::Key::Num1
+        );
+        assert_eq!(capture_key(egui::Key::A, None), egui::Key::A);
     }
 
     #[test]
