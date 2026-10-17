@@ -24,14 +24,14 @@ use crate::hotkey::{ChordEvent, ChordTracker, ModifierSet};
 /// the tap thread.
 pub(crate) struct ModifierTap {
     chord: Arc<Mutex<Option<ModifierSet>>>,
-    #[allow(dead_code)] // wired up in the daemon next
-    thread: JoinHandle<()>,
+    /// Held so the tap thread lives as long as the tap. Never read, hence
+    /// the underscore.
+    _thread: JoinHandle<()>,
 }
 
 impl ModifierTap {
     /// Start the listener thread: a listen-only session tap for flags-changed
     /// and key-down events, reporting chord events to `on_event`.
-    #[allow(dead_code)] // wired up in the daemon next
     pub(crate) fn start(on_event: impl Fn(ChordEvent) + Send + 'static) -> Result<Self, String> {
         let chord = Arc::new(Mutex::new(None));
         let thread_chord = Arc::clone(&chord);
@@ -41,7 +41,10 @@ impl ModifierTap {
             .spawn(move || run_tap_thread(thread_chord, Box::new(on_event), ready_tx))
             .map_err(|err| format!("Could not start the modifier-key listener: {err}"))?;
         match ready_rx.recv_timeout(Duration::from_secs(2)) {
-            Ok(Ok(())) => Ok(Self { chord, thread }),
+            Ok(Ok(())) => Ok(Self {
+                chord,
+                _thread: thread,
+            }),
             Ok(Err(message)) => Err(message),
             Err(_) => Err(
                 "Could not start the modifier-key listener: it did not start within 2 seconds."
@@ -52,7 +55,6 @@ impl ModifierTap {
 
     /// Watch a new chord (`None` watches nothing). The tap thread adopts it
     /// before its next event, resetting the tracker.
-    #[allow(dead_code)] // wired up in the daemon next
     pub(crate) fn set_chord(&self, chord: Option<ModifierSet>) {
         match self.chord.lock() {
             Ok(mut current) => {

@@ -30,7 +30,6 @@ macro_rules! dlog {
 pub(crate) mod socket;
 
 use std::path::{Path, PathBuf};
-use std::str::FromStr;
 use std::sync::{Arc, Mutex, MutexGuard, mpsc};
 use std::time::{Duration, Instant};
 
@@ -233,6 +232,9 @@ pub(crate) enum UserEvent {
     WorkerDone,
     /// A global hotkey press or release.
     HotKey(GlobalHotKeyEvent),
+    /// A modifier-chord press, release or interruption (macOS only; never
+    /// sent on other systems).
+    Chord(crate::hotkey::ChordEvent),
     /// A tray menu click.
     Menu(tray_icon::menu::MenuEvent),
     /// The worker swapped in a pending mode switch's model; the switch can
@@ -595,7 +597,7 @@ fn load_tdt_models(live_fallback: bool) -> anyhow::Result<(WorkerModels, bool)> 
     ))
 }
 
-/// Register the global hotkey (except on Wayland) and keep its manager alive
+/// Register the global trigger (except on Wayland) and keep its manager alive
 /// in the app. Never fatal: the socket commands always keep working.
 fn setup_hotkey(
     event_loop: &EventLoop<UserEvent>,
@@ -609,39 +611,61 @@ fn setup_hotkey(
         );
         return;
     }
-    let hotkey = match config.trigger {
-        crate::hotkey::Trigger::Key(hotkey) => hotkey,
-        // Modifier-only chord: the tap starts here in item 2.
-        crate::hotkey::Trigger::Chord(chord) => {
-            let _ = chord;
-            return;
-        }
-    };
-    let manager = match GlobalHotKeyManager::new().and_then(|manager| {
-        manager.register(hotkey)?;
-        Ok(manager)
-    }) {
-        Ok(manager) => manager,
-        Err(err) => {
-            dlog!(
-                "Could not register hotkey {}: {err}. Socket commands still work.",
-                config.display
-            );
-            return;
-        }
-    };
-    app.hotkey = Some(hotkey);
-    app._hotkey_manager = Some(manager);
+    // Forward HotKey events now, so a later switch to a key trigger works
+    // even when startup uses a chord.
     let proxy = event_loop.create_proxy();
     GlobalHotKeyEvent::set_event_handler(Some(move |event| {
         if proxy.send_event(UserEvent::HotKey(event)).is_err() {
             // The event loop is closed; the daemon is shutting down.
         }
     }));
-    dlog!(
-        "Hotkey: {} (tap to toggle, hold to talk)",
-        crate::hotkey::shortcut_label(&config.display, cfg!(target_os = "macos"))
-    );
+    let mac = cfg!(target_os = "macos");
+    let label = crate::hotkey::shortcut_label(&config.display, mac);
+    match config.trigger {
+        crate::hotkey::Trigger::Key(hotkey) => {
+            let manager = match GlobalHotKeyManager::new().and_then(|manager| {
+                manager.register(hotkey)?;
+                Ok(manager)
+            }) {
+                Ok(manager) => manager,
+                Err(err) => {
+                    dlog!(
+                        "Could not register hotkey {}: {err}. Socket commands still work.",
+                        config.display
+                    );
+                    return;
+                }
+            };
+            app.hotkey = Some(hotkey);
+            app._hotkey_manager = Some(manager);
+            dlog!("Hotkey: {label} (tap to toggle, hold to talk)");
+        }
+        crate::hotkey::Trigger::Chord(chord) => {
+            #[cfg(target_os = "macos")]
+            {
+                if let Err(message) = app.ensure_modifier_tap() {
+                    dlog!("{message} Socket commands still work.");
+                    app.last_shortcut_error = Some(message.clone());
+                    crate::notify::show(
+                        crate::notify::Kind::Error,
+                        &format!("dictate: could not use shortcut {label}"),
+                        &message,
+                    );
+                    return;
+                }
+                if let Some(tap) = &app.modifier_tap {
+                    tap.set_chord(Some(chord));
+                }
+                app.hotkey = None;
+                dlog!("Hotkey: {label} (tap to toggle, hold to talk)");
+            }
+            #[cfg(not(target_os = "macos"))]
+            {
+                let _ = chord;
+                // Unreachable: resolve rejects chords on other systems.
+            }
+        }
+    }
 }
 
 /// Daemon state, owned by the event-loop thread: the recording state, the
@@ -659,6 +683,13 @@ struct DaemonApp {
     hotkey_display: String,
     press_started: Option<Instant>,
     tap_armed: bool,
+    /// True when the current recording was started by a modifier-chord press
+    /// (so `Interrupted` may cancel it; socket-started recordings never are).
+    chord_started_recording: bool,
+    /// The modifier-only shortcut listener (macOS only, started lazily when
+    /// a chord shortcut is used).
+    #[cfg(target_os = "macos")]
+    modifier_tap: Option<crate::modtap::ModifierTap>,
     worker_gone_notified: bool,
     settings: crate::config::Settings,
     /// Live was requested but failed the startup checks: live recordings run
@@ -724,6 +755,9 @@ impl DaemonApp {
             hotkey_display: String::new(),
             press_started: None,
             tap_armed: false,
+            chord_started_recording: false,
+            #[cfg(target_os = "macos")]
+            modifier_tap: None,
             worker_gone_notified: false,
             settings,
             live_fallback,
@@ -797,7 +831,56 @@ impl DaemonApp {
         if self.hotkey.map(|hotkey| hotkey.id()) != Some(event.id) {
             return;
         }
-        match event.state {
+        self.handle_trigger(event.state);
+    }
+
+    /// Map a modifier-chord event to a command and run it. Presses and
+    /// releases share the hotkey logic; a chord-started recording remembers
+    /// its origin so `Interrupted` (another key pressed while held) can
+    /// cancel it.
+    fn handle_chord(&mut self, event: crate::hotkey::ChordEvent) {
+        match event {
+            crate::hotkey::ChordEvent::Pressed => {
+                let before = self.state;
+                self.handle_trigger(HotKeyState::Pressed);
+                if before == State::Idle && self.state == State::Recording {
+                    self.chord_started_recording = true;
+                }
+            }
+            crate::hotkey::ChordEvent::Released => {
+                self.handle_trigger(HotKeyState::Released);
+                self.chord_started_recording = false;
+            }
+            crate::hotkey::ChordEvent::Interrupted => {
+                if self.chord_started_recording && self.state == State::Recording {
+                    drop(self.handle_command(Command::Cancel));
+                    self.press_started = None;
+                    self.tap_armed = false;
+                    self.chord_started_recording = false;
+                    dlog!(
+                        "Recording cancelled: another key was pressed with {}",
+                        crate::hotkey::shortcut_label(
+                            &self.hotkey_display,
+                            cfg!(target_os = "macos")
+                        )
+                    );
+                }
+            }
+        }
+    }
+
+    /// Shared press/release logic for both trigger sources. While the
+    /// Settings window is recording a shortcut, presses are ignored so
+    /// trying the current shortcut doesn't start dictation.
+    fn handle_trigger(&mut self, state: HotKeyState) {
+        if self
+            .settings_window
+            .as_ref()
+            .is_some_and(|window| window.capture.recording)
+        {
+            return;
+        }
+        match state {
             HotKeyState::Pressed => {
                 self.press_started = Some(Instant::now());
                 if let Some(cmd) = crate::hotkey::hotkey_action(
@@ -1102,50 +1185,120 @@ impl DaemonApp {
         }
     }
 
-    /// Switch the global shortcut to `display`: register the new one first
-    /// (so a failure keeps the old one working), then unregister the old one
-    /// and save. Failures notify and keep the old shortcut checked.
+    /// Start the modifier-key listener if it isn't running yet (macOS only).
+    /// The tap reports chord events back as `UserEvent::Chord`.
+    #[cfg(target_os = "macos")]
+    fn ensure_modifier_tap(&mut self) -> Result<(), String> {
+        if self.modifier_tap.is_some() {
+            return Ok(());
+        }
+        let proxy = self.menu_proxy.clone();
+        let tap = crate::modtap::ModifierTap::start(move |event| {
+            if proxy.send_event(UserEvent::Chord(event)).is_err() {
+                dlog!(
+                    "dictate: modifier-key listener: the event loop is closed; dropping a chord event"
+                );
+            }
+        })?;
+        self.modifier_tap = Some(tap);
+        Ok(())
+    }
+
+    /// Switch the global shortcut to `display`: the new trigger is made
+    /// working first (so a failure keeps the old one), then the old one is
+    /// removed and the settings saved. Failures notify and keep the old
+    /// shortcut checked.
     fn switch_hotkey(&mut self, display: &str) {
         if display == self.hotkey_display {
             self.last_shortcut_error = None;
             return;
         }
-        let new_key = match HotKey::from_str(display) {
-            Ok(key) => key,
-            Err(err) => {
-                self.shortcut_failed(display, &format!("{err}"));
+        let mac = cfg!(target_os = "macos");
+        let config = match crate::hotkey::resolve_file_hotkey(display, mac) {
+            Ok(config) => config,
+            Err(message) => {
+                self.shortcut_failed(display, &message);
                 return;
             }
         };
-        if self._hotkey_manager.is_none() {
-            match GlobalHotKeyManager::new() {
-                Ok(manager) => self._hotkey_manager = Some(manager),
-                Err(err) => {
+        match config.trigger {
+            crate::hotkey::Trigger::Key(new_key) => {
+                if self._hotkey_manager.is_none() {
+                    match GlobalHotKeyManager::new() {
+                        Ok(manager) => self._hotkey_manager = Some(manager),
+                        Err(err) => {
+                            self.shortcut_failed(display, &format!("{err}"));
+                            return;
+                        }
+                    }
+                }
+                let Some(manager) = &self._hotkey_manager else {
+                    self.shortcut_failed(display, "the hotkey manager is gone");
+                    return;
+                };
+                if let Err(err) = manager.register(new_key) {
                     self.shortcut_failed(display, &format!("{err}"));
                     return;
                 }
+                // The new key works: drop the old chord, then the old key.
+                #[cfg(target_os = "macos")]
+                if let Some(tap) = &self.modifier_tap {
+                    tap.set_chord(None);
+                }
+                if let Some(old) = self.hotkey
+                    && let Err(err) = manager.unregister(old)
+                {
+                    dlog!(
+                        "error: Could not unregister shortcut {}: {err}",
+                        self.hotkey_display
+                    );
+                }
+                self.hotkey = Some(new_key);
+                self.finish_hotkey_switch(display);
+            }
+            crate::hotkey::Trigger::Chord(new_chord) => {
+                #[cfg(target_os = "macos")]
+                {
+                    if let Err(message) = self.ensure_modifier_tap() {
+                        self.shortcut_failed(display, &message);
+                        return;
+                    }
+                    if let Some(tap) = &self.modifier_tap {
+                        tap.set_chord(Some(new_chord));
+                    }
+                    // The new chord works: drop the old key, if any.
+                    if let Some(old) = self.hotkey
+                        && let Some(manager) = &self._hotkey_manager
+                        && let Err(err) = manager.unregister(old)
+                    {
+                        dlog!(
+                            "error: Could not unregister shortcut {}: {err}",
+                            self.hotkey_display
+                        );
+                    }
+                    self.hotkey = None;
+                    self.finish_hotkey_switch(display);
+                }
+                #[cfg(not(target_os = "macos"))]
+                {
+                    let _ = new_chord;
+                    // Unreachable: resolve rejects chords on other systems.
+                    self.shortcut_failed(
+                        display,
+                        "Shortcuts with only modifier keys work only on macOS. Add a key, for example Ctrl+Alt+Space.",
+                    );
+                }
             }
         }
-        let Some(manager) = &self._hotkey_manager else {
-            self.shortcut_failed(display, "the hotkey manager is gone");
-            return;
-        };
-        if let Err(err) = manager.register(new_key) {
-            self.shortcut_failed(display, &format!("{err}"));
-            return;
-        }
-        if let Some(old) = self.hotkey
-            && let Err(err) = manager.unregister(old)
-        {
-            dlog!(
-                "error: Could not unregister shortcut {}: {err}",
-                self.hotkey_display
-            );
-        }
-        self.hotkey = Some(new_key);
+    }
+
+    /// Save a successful shortcut switch, clear the press state, log and
+    /// confirm it.
+    fn finish_hotkey_switch(&mut self, display: &str) {
         self.hotkey_display = display.to_string();
         self.press_started = None;
         self.tap_armed = false;
+        self.chord_started_recording = false;
         self.last_shortcut_error = None;
         self.settings.hotkey = display.to_string();
         self.report_save_error(crate::config::save(&self.settings));
@@ -1713,6 +1866,7 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
                 self.refresh_settings();
             }
             UserEvent::HotKey(event) => self.handle_hotkey(event),
+            UserEvent::Chord(event) => self.handle_chord(event),
             UserEvent::Menu(event) => self.handle_menu(event, event_loop),
             UserEvent::OpenSettings => self.open_settings(event_loop),
             UserEvent::SettingsRefresh => self.refresh_settings(),

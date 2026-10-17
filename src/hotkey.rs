@@ -138,7 +138,7 @@ pub(crate) fn modifier_only_error(value: &str, mac: bool) -> Option<String> {
 
 /// A watched modifier chord plus its press state: active once the exact held
 /// set matched, until anything changes.
-#[allow(dead_code)] // wired up in the daemon next
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only the macOS tap drives it
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ChordTracker {
     pub(crate) chord: ModifierSet,
@@ -146,7 +146,6 @@ pub(crate) struct ChordTracker {
 }
 
 /// What one tap event means for the watched chord.
-#[allow(dead_code)] // wired up in the daemon next
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChordEvent {
     Pressed,
@@ -154,7 +153,7 @@ pub(crate) enum ChordEvent {
     Interrupted,
 }
 
-#[allow(dead_code)] // wired up in the daemon next
+#[cfg_attr(not(target_os = "macos"), allow(dead_code))] // only the macOS tap drives it
 impl ChordTracker {
     /// Feed one flags-changed event: `Pressed` when the held set becomes
     /// exactly the chord, `Released` when an active chord stops matching.
