@@ -4,6 +4,10 @@
 //! intents ([`PageAction`]); the daemon applies them through the same code
 //! paths the tray menu uses, so there is no duplicate logic.
 
+use std::str::FromStr;
+
+use global_hotkey::hotkey::HotKey;
+
 use crate::config::{Mode, Settings};
 use crate::daemon::LiveSpeedCheck;
 use crate::mic::Mic;
@@ -416,8 +420,13 @@ fn command_from_arg(arg: &str) -> String {
     arg.trim().to_string()
 }
 
-/// Render one page frame, collecting the user's intents.
-pub(crate) fn show_page(ui: &mut egui::Ui, view: &PageView) -> Vec<PageAction> {
+/// Render one page frame, collecting the user's intents. `capture` is the
+/// window's shortcut-recording state, taken out for the frame.
+pub(crate) fn show_page(
+    ui: &mut egui::Ui,
+    view: &PageView,
+    capture: &mut crate::settings_ui::ShortcutCapture,
+) -> Vec<PageAction> {
     ui.style_mut().text_styles.insert(
         egui::TextStyle::Small,
         egui::FontId::proportional(EXPLAIN_SIZE),
@@ -431,7 +440,7 @@ pub(crate) fn show_page(ui: &mut egui::Ui, view: &PageView) -> Vec<PageAction> {
                 section_gap(ui);
                 mode_section(ui, view, &mut actions);
                 section_gap(ui);
-                shortcut_section(ui, view, &mut actions);
+                shortcut_section(ui, view, &mut actions, capture);
                 section_gap(ui);
                 general_section(ui, view, &mut actions);
                 section_gap(ui);
@@ -522,31 +531,348 @@ fn mode_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction
     }
 }
 
-fn shortcut_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
+fn shortcut_section(
+    ui: &mut egui::Ui,
+    view: &PageView,
+    actions: &mut Vec<PageAction>,
+    capture: &mut crate::settings_ui::ShortcutCapture,
+) {
     heading(ui, "Shortcut");
     if view.wayland {
         wayland_shortcut_section(ui, view, actions);
         return;
     }
     let mac = cfg!(target_os = "macos");
+    if capture.recording {
+        // Read the frame input before any widget runs, so captured keys never
+        // reach the rest of the page.
+        poll_shortcut_capture(ui, actions, capture, mac);
+    }
     let presets = crate::hotkey::shortcut_presets(mac);
-    egui::ComboBox::from_label("")
-        .selected_text(crate::hotkey::shortcut_label(&view.settings.hotkey, mac))
-        .show_ui(ui, |ui| {
-            for preset in presets {
-                if ui
-                    .selectable_label(
-                        view.settings.hotkey == *preset,
-                        crate::hotkey::shortcut_label(preset, mac),
-                    )
-                    .clicked()
+    let current = view.settings.hotkey.as_str();
+    ui.horizontal(|ui| {
+        egui::ComboBox::from_label("")
+            .selected_text(crate::hotkey::shortcut_label(current, mac))
+            .show_ui(ui, |ui| {
+                if !presets.contains(&current)
+                    && ui
+                        .selectable_label(true, crate::hotkey::shortcut_label(current, mac))
+                        .clicked()
                 {
-                    actions.push(PageAction::SelectShortcut(preset.to_string()));
+                    actions.push(PageAction::SelectShortcut(current.to_string()));
                 }
-            }
-        });
+                for preset in presets {
+                    if ui
+                        .selectable_label(
+                            *preset == current,
+                            crate::hotkey::shortcut_label(preset, mac),
+                        )
+                        .clicked()
+                    {
+                        actions.push(PageAction::SelectShortcut(preset.to_string()));
+                    }
+                }
+            });
+        let label = if capture.recording {
+            "Cancel"
+        } else {
+            "Record shortcut…"
+        };
+        if ui.button(label).clicked() {
+            capture.recording = !capture.recording;
+            capture.error = None;
+            capture.mods_seen = false;
+        }
+    });
+    if capture.recording {
+        ui.label("Press the new shortcut now (Esc to cancel).");
+    }
     explain(ui, "Tap to toggle dictation, hold to talk.");
-    inline_error(ui, view.shortcut_error);
+    inline_error(ui, capture.error.as_deref().or(view.shortcut_error));
+}
+
+/// Handle one frame of shortcut recording: Esc cancels, the first real key
+/// press builds a value via [`shortcut_from_keys`], and a modifiers-held-then-
+/// released span with no key shows the modifier-only hint. Key events are frame
+/// input (no widget focus or text field needed); handled ones are consumed so
+/// the rest of the page ignores captured keys. Repeats never trigger.
+fn poll_shortcut_capture(
+    ui: &mut egui::Ui,
+    actions: &mut Vec<PageAction>,
+    capture: &mut crate::settings_ui::ShortcutCapture,
+    mac: bool,
+) {
+    let (pressed, modifiers) = ui.input(|input| {
+        let pressed: Vec<(egui::Key, egui::Modifiers)> = input
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::Key {
+                    key,
+                    pressed: true,
+                    repeat: false,
+                    modifiers,
+                    ..
+                } => Some((*key, *modifiers)),
+                _ => None,
+            })
+            .collect();
+        (pressed, input.modifiers)
+    });
+    let mut saw_key = false;
+    for (key, key_modifiers) in &pressed {
+        // Bare modifier presses are not capture attempts; they only feed the
+        // modifier-only detection below.
+        if is_modifier_key(*key) {
+            continue;
+        }
+        saw_key = true;
+        if *key == egui::Key::Escape {
+            capture.recording = false;
+            capture.error = None;
+            capture.mods_seen = false;
+            break;
+        }
+        match shortcut_from_keys(*key_modifiers, *key, mac) {
+            Ok(value) => {
+                capture.recording = false;
+                capture.error = None;
+                capture.mods_seen = false;
+                actions.push(PageAction::SelectShortcut(value));
+                break;
+            }
+            Err(message) => {
+                capture.error = Some(message);
+                // Keep recording; a later key this frame still applies.
+            }
+        }
+    }
+    if capture.recording {
+        if modifiers.any() || pressed.iter().any(|(_, held)| held.any()) {
+            capture.mods_seen = true;
+        } else if capture.mods_seen && !saw_key {
+            capture.mods_seen = false;
+            capture.error = Some(if mac {
+                "Shortcuts with only modifier keys (like Command+Option) aren't supported yet. Add a key, for example Command+Option+Space."
+            } else {
+                "Shortcuts with only modifier keys (like Command+Option) aren't supported yet. Add a key, for example Ctrl+Alt+Space."
+            }
+            .to_string());
+        }
+    }
+    if !pressed.is_empty() {
+        ui.input_mut(|input| {
+            input.events.retain(|event| {
+                !matches!(
+                    event,
+                    egui::Event::Key {
+                        pressed: true,
+                        repeat: false,
+                        ..
+                    }
+                )
+            });
+        });
+    }
+}
+
+/// Build a stored shortcut value from a captured key press: modifiers in
+/// platform order plus the global-hotkey key name. The raw `ctrl` field (not
+/// `command`) keeps Ctrl and Cmd separate on mac. Errors are user-facing
+/// inline messages; recording continues.
+pub(crate) fn shortcut_from_keys(
+    modifiers: egui::Modifiers,
+    key: egui::Key,
+    mac: bool,
+) -> Result<String, String> {
+    let key_name = egui_key_name(key).ok_or_else(|| {
+        format!(
+            "dictate can't use {} as a shortcut key. Try a letter, digit, F key or Space.",
+            key.name()
+        )
+    })?;
+    let mut parts: Vec<&str> = Vec::new();
+    if mac {
+        if modifiers.mac_cmd {
+            parts.push("Cmd");
+        }
+        if modifiers.ctrl {
+            parts.push("Ctrl");
+        }
+        if modifiers.alt {
+            parts.push("Option");
+        }
+        if modifiers.shift {
+            parts.push("Shift");
+        }
+    } else {
+        if modifiers.ctrl {
+            parts.push("Ctrl");
+        }
+        if modifiers.alt {
+            parts.push("Alt");
+        }
+        if modifiers.shift {
+            parts.push("Shift");
+        }
+    }
+    if parts.is_empty() && !is_f_key(key) {
+        return Err(if mac {
+            "Add Command, Control, Option or Shift (or use an F key), so normal typing doesn't start dictation."
+        } else {
+            "Add Ctrl, Alt or Shift (or use an F key), so normal typing doesn't start dictation."
+        }
+        .to_string());
+    }
+    parts.push(key_name);
+    let value = parts.join("+");
+    if let Err(err) = HotKey::from_str(&value) {
+        return Err(format!(
+            "Internal error: built shortcut \"{value}\" failed to parse: {err}"
+        ));
+    }
+    Ok(value)
+}
+
+/// Global-hotkey key name for an egui key, or `None` when the parser has no
+/// such key (F25+, Insert, Caps Lock, media keys, bare modifiers, ...).
+fn egui_key_name(key: egui::Key) -> Option<&'static str> {
+    use egui::Key;
+    Some(match key {
+        Key::A => "A",
+        Key::B => "B",
+        Key::C => "C",
+        Key::D => "D",
+        Key::E => "E",
+        Key::F => "F",
+        Key::G => "G",
+        Key::H => "H",
+        Key::I => "I",
+        Key::J => "J",
+        Key::K => "K",
+        Key::L => "L",
+        Key::M => "M",
+        Key::N => "N",
+        Key::O => "O",
+        Key::P => "P",
+        Key::Q => "Q",
+        Key::R => "R",
+        Key::S => "S",
+        Key::T => "T",
+        Key::U => "U",
+        Key::V => "V",
+        Key::W => "W",
+        Key::X => "X",
+        Key::Y => "Y",
+        Key::Z => "Z",
+        Key::Num0 => "0",
+        Key::Num1 => "1",
+        Key::Num2 => "2",
+        Key::Num3 => "3",
+        Key::Num4 => "4",
+        Key::Num5 => "5",
+        Key::Num6 => "6",
+        Key::Num7 => "7",
+        Key::Num8 => "8",
+        Key::Num9 => "9",
+        Key::F1 => "F1",
+        Key::F2 => "F2",
+        Key::F3 => "F3",
+        Key::F4 => "F4",
+        Key::F5 => "F5",
+        Key::F6 => "F6",
+        Key::F7 => "F7",
+        Key::F8 => "F8",
+        Key::F9 => "F9",
+        Key::F10 => "F10",
+        Key::F11 => "F11",
+        Key::F12 => "F12",
+        Key::F13 => "F13",
+        Key::F14 => "F14",
+        Key::F15 => "F15",
+        Key::F16 => "F16",
+        Key::F17 => "F17",
+        Key::F18 => "F18",
+        Key::F19 => "F19",
+        Key::F20 => "F20",
+        Key::F21 => "F21",
+        Key::F22 => "F22",
+        Key::F23 => "F23",
+        Key::F24 => "F24",
+        Key::Space => "Space",
+        Key::Enter => "Enter",
+        Key::Tab => "Tab",
+        Key::Backspace => "Backspace",
+        Key::Delete => "Delete",
+        Key::ArrowDown => "ArrowDown",
+        Key::ArrowLeft => "ArrowLeft",
+        Key::ArrowRight => "ArrowRight",
+        Key::ArrowUp => "ArrowUp",
+        Key::Home => "Home",
+        Key::End => "End",
+        Key::PageUp => "PageUp",
+        Key::PageDown => "PageDown",
+        Key::Comma => "Comma",
+        Key::Backslash => "Backslash",
+        Key::Slash => "Slash",
+        Key::Backtick => "Backquote",
+        Key::Minus => "Minus",
+        Key::Period => "Period",
+        Key::Equals => "Equal",
+        Key::Semicolon => "Semicolon",
+        Key::Quote => "Quote",
+        Key::OpenBracket => "BracketLeft",
+        Key::CloseBracket => "BracketRight",
+        _ => return None,
+    })
+}
+
+/// True for F1–F24, which may stand alone without modifiers.
+fn is_f_key(key: egui::Key) -> bool {
+    use egui::Key;
+    matches!(
+        key,
+        Key::F1
+            | Key::F2
+            | Key::F3
+            | Key::F4
+            | Key::F5
+            | Key::F6
+            | Key::F7
+            | Key::F8
+            | Key::F9
+            | Key::F10
+            | Key::F11
+            | Key::F12
+            | Key::F13
+            | Key::F14
+            | Key::F15
+            | Key::F16
+            | Key::F17
+            | Key::F18
+            | Key::F19
+            | Key::F20
+            | Key::F21
+            | Key::F22
+            | Key::F23
+            | Key::F24
+    )
+}
+
+/// True for bare modifier keys, which never complete a capture on their own.
+fn is_modifier_key(key: egui::Key) -> bool {
+    use egui::Key;
+    matches!(
+        key,
+        Key::ShiftLeft
+            | Key::ShiftRight
+            | Key::ControlLeft
+            | Key::ControlRight
+            | Key::AltLeft
+            | Key::AltRight
+            | Key::SuperLeft
+            | Key::SuperRight
+    )
 }
 
 /// Shortcut section on Wayland, where the app can't register its own
@@ -834,6 +1160,135 @@ mod tests {
         assert_eq!(binds.len(), 2);
         assert_eq!(binds[0].label, "toggle");
         assert_eq!(binds[1].label, "Toggle Dictate");
+    }
+
+    #[test]
+    fn capture_builds_values_and_errors() {
+        // Cmd+Option+Space on mac.
+        let mods = egui::Modifiers {
+            mac_cmd: true,
+            command: true,
+            alt: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            shortcut_from_keys(mods, egui::Key::Space, true).unwrap(),
+            "Cmd+Option+Space"
+        );
+        // Ctrl+Shift+D elsewhere.
+        let mods = egui::Modifiers {
+            ctrl: true,
+            command: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            shortcut_from_keys(mods, egui::Key::D, false).unwrap(),
+            "Ctrl+Shift+D"
+        );
+        // Plain A needs a modifier, with per-OS wording.
+        assert_eq!(
+            shortcut_from_keys(egui::Modifiers::NONE, egui::Key::A, true).unwrap_err(),
+            "Add Command, Control, Option or Shift (or use an F key), so normal typing doesn't start dictation."
+        );
+        assert_eq!(
+            shortcut_from_keys(egui::Modifiers::NONE, egui::Key::A, false).unwrap_err(),
+            "Add Ctrl, Alt or Shift (or use an F key), so normal typing doesn't start dictation."
+        );
+        // Plain F8 stands alone on both.
+        assert_eq!(
+            shortcut_from_keys(egui::Modifiers::NONE, egui::Key::F8, true).unwrap(),
+            "F8"
+        );
+        assert_eq!(
+            shortcut_from_keys(egui::Modifiers::NONE, egui::Key::F8, false).unwrap(),
+            "F8"
+        );
+        // Both Cmd and Ctrl kept on mac (raw ctrl, not merged command).
+        let mods = egui::Modifiers {
+            mac_cmd: true,
+            command: true,
+            ctrl: true,
+            shift: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            shortcut_from_keys(mods, egui::Key::D, true).unwrap(),
+            "Cmd+Ctrl+Shift+D"
+        );
+        // Unknown keys name the key.
+        let mods = egui::Modifiers {
+            ctrl: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            shortcut_from_keys(mods, egui::Key::CapsLock, false).unwrap_err(),
+            "dictate can't use CapsLock as a shortcut key. Try a letter, digit, F key or Space."
+        );
+    }
+
+    #[test]
+    fn every_captured_value_parses() {
+        use egui::{Key, Modifiers};
+        let mod_sets = [
+            Modifiers::NONE,
+            Modifiers {
+                ctrl: true,
+                ..Default::default()
+            },
+            Modifiers {
+                alt: true,
+                shift: true,
+                ..Default::default()
+            },
+            Modifiers {
+                mac_cmd: true,
+                ctrl: true,
+                alt: true,
+                shift: true,
+                ..Default::default()
+            },
+        ];
+        let keys = [
+            Key::A,
+            Key::Z,
+            Key::Num0,
+            Key::Num9,
+            Key::F1,
+            Key::F12,
+            Key::F24,
+            Key::Space,
+            Key::Enter,
+            Key::Tab,
+            Key::Backspace,
+            Key::Delete,
+            Key::ArrowUp,
+            Key::ArrowDown,
+            Key::Home,
+            Key::End,
+            Key::PageUp,
+            Key::PageDown,
+            Key::Comma,
+            Key::Period,
+            Key::Semicolon,
+            Key::Slash,
+            Key::Backslash,
+            Key::Quote,
+            Key::Backtick,
+            Key::Minus,
+            Key::Equals,
+            Key::OpenBracket,
+            Key::CloseBracket,
+        ];
+        for mac in [true, false] {
+            for mods in mod_sets {
+                for key in keys {
+                    if let Ok(value) = shortcut_from_keys(mods, key, mac) {
+                        assert!(HotKey::from_str(&value).is_ok(), "{value} does not parse");
+                    }
+                }
+            }
+        }
     }
 
     #[test]

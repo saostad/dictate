@@ -34,6 +34,17 @@ pub(crate) const FIXED_SIZE: (f64, f64) = (480.0, 640.0);
 #[cfg(target_os = "linux")]
 pub(crate) const APP_ID: &str = "dictate";
 
+/// Shortcut-recording state for the Settings page: whether the Record button
+/// is capturing, the last capture error shown inline, and whether modifiers
+/// were held with no key yet (modifier-only detection). Lives with the window,
+/// so closing the window resets it.
+#[derive(Debug, Default)]
+pub(crate) struct ShortcutCapture {
+    pub recording: bool,
+    pub error: Option<String>,
+    pub mods_seen: bool,
+}
+
 /// The open Settings window: winit window, glutin GL context and surface, and
 /// egui state. Everything lives on the event-loop thread and is dropped on
 /// close. [`Drop`] frees the GL objects while the context is still current.
@@ -51,6 +62,7 @@ pub(crate) struct SettingsWindow {
     egui_winit: egui_winit::State,
     painter: egui_glow::Painter,
     viewport_info: egui::ViewportInfo,
+    pub(crate) capture: ShortcutCapture,
 }
 
 impl SettingsWindow {
@@ -189,6 +201,7 @@ impl SettingsWindow {
             egui_winit,
             painter,
             viewport_info: egui::ViewportInfo::default(),
+            capture: ShortcutCapture::default(),
         })
     }
 

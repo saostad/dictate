@@ -1233,8 +1233,12 @@ impl DaemonApp {
             version: env!("CARGO_PKG_VERSION"),
         };
         let mut actions = Vec::new();
+        // The recording state lives with the window but is borrowed by the
+        // page for the frame, so it is taken out and put back around `redraw`
+        // (a failed frame drops the window, and the state with it).
+        let mut capture = std::mem::take(&mut window.capture);
         let outcome = window.redraw(event_loop, |ui| {
-            actions = crate::settings_ui::page::show_page(ui, &view);
+            actions = crate::settings_ui::page::show_page(ui, &view, &mut capture);
         });
         match outcome {
             Ok(delay) => {
@@ -1242,6 +1246,7 @@ impl DaemonApp {
                 for action in actions {
                     self.apply_page_action(action);
                 }
+                window.capture = capture;
                 if changed || delay.is_zero() {
                     // Changed settings repaint at once; an animation or a
                     // follow-up layout repaints without leaving Wait.
