@@ -581,11 +581,14 @@ fn shortcut_section(
         if ui.button(label).clicked() {
             capture.recording = !capture.recording;
             capture.error = None;
-            capture.mods_seen = false;
+            capture.held = None;
         }
     });
     if capture.recording {
         ui.label("Press the new shortcut now (Esc to cancel).");
+        if mac {
+            ui.label("Tip: you can also press just modifier keys, like Command+Option.");
+        }
     }
     explain(ui, "Tap to toggle dictation, hold to talk.");
     inline_error(ui, capture.error.as_deref().or(view.shortcut_error));
@@ -593,7 +596,7 @@ fn shortcut_section(
 
 /// Handle one frame of shortcut recording: Esc cancels, the first real key
 /// press builds a value via [`shortcut_from_keys`], and a modifiers-held-then-
-/// released span with no key shows the modifier-only hint. Key events are frame
+/// released span with no key records a modifier-only chord. Key events are frame
 /// input (no widget focus or text field needed); handled ones are consumed so
 /// the rest of the page ignores captured keys. Repeats never trigger.
 /// (egui's clipboard shortcuts stay off while recording, so every key arrives
@@ -634,14 +637,14 @@ fn poll_shortcut_capture(
         if *key == egui::Key::Escape {
             capture.recording = false;
             capture.error = None;
-            capture.mods_seen = false;
+            capture.held = None;
             break;
         }
         match shortcut_from_keys(*key_modifiers, *key, mac) {
             Ok(value) => {
                 capture.recording = false;
                 capture.error = None;
-                capture.mods_seen = false;
+                capture.held = None;
                 actions.push(PageAction::SelectShortcut(value));
                 break;
             }
@@ -652,16 +655,41 @@ fn poll_shortcut_capture(
         }
     }
     if capture.recording {
-        if modifiers.any() || pressed.iter().any(|(_, held)| held.any()) {
-            capture.mods_seen = true;
-        } else if capture.mods_seen && !saw_key {
-            capture.mods_seen = false;
-            capture.error = Some(if mac {
-                "Shortcuts with only modifier keys (like Command+Option) aren't supported yet. Add a key, for example Command+Option+Space."
-            } else {
-                "Shortcuts with only modifier keys (like Ctrl+Alt) aren't supported yet. Add a key, for example Ctrl+Alt+Space."
+        if saw_key {
+            // A key breaks the modifier-only span.
+            capture.held = None;
+        } else {
+            let mut current = modifier_set_from_egui(modifiers);
+            for (_, event_modifiers) in &pressed {
+                let set = modifier_set_from_egui(*event_modifiers);
+                current.cmd |= set.cmd;
+                current.ctrl |= set.ctrl;
+                current.option |= set.option;
+                current.shift |= set.shift;
             }
-            .to_string());
+            if current.cmd || current.ctrl || current.option || current.shift {
+                match &mut capture.held {
+                    Some(held) => {
+                        held.cmd |= current.cmd;
+                        held.ctrl |= current.ctrl;
+                        held.option |= current.option;
+                        held.shift |= current.shift;
+                    }
+                    None => capture.held = Some(current),
+                }
+            } else if let Some(held) = capture.held.take() {
+                // All modifiers released with no key in between: record the chord.
+                match modifier_only_value(held, mac) {
+                    Ok(value) => {
+                        capture.recording = false;
+                        capture.error = None;
+                        actions.push(PageAction::SelectShortcut(value));
+                    }
+                    Err(message) => {
+                        capture.error = Some(message);
+                    }
+                }
+            }
         }
     }
     if !pressed.is_empty() {
@@ -885,6 +913,41 @@ fn is_modifier_key(key: egui::Key) -> bool {
             | Key::SuperLeft
             | Key::SuperRight
     )
+}
+
+/// The chord modifiers held in one egui modifier state. Uses the raw `ctrl`
+/// field (not `command`) so Ctrl and Cmd stay separate on mac.
+fn modifier_set_from_egui(modifiers: egui::Modifiers) -> crate::hotkey::ModifierSet {
+    crate::hotkey::ModifierSet {
+        cmd: modifiers.mac_cmd,
+        ctrl: modifiers.ctrl,
+        option: modifiers.alt,
+        shift: modifiers.shift,
+    }
+}
+
+/// Stored value (or inline error) for a modifier-only span: the held
+/// modifiers in `Cmd, Ctrl, Option, Shift` order, rejected when unusable.
+fn modifier_only_value(held: crate::hotkey::ModifierSet, mac: bool) -> Result<String, String> {
+    let mut parts = Vec::new();
+    if held.cmd {
+        parts.push("Cmd");
+    }
+    if held.ctrl {
+        parts.push("Ctrl");
+    }
+    if held.option {
+        parts.push("Option");
+    }
+    if held.shift {
+        parts.push("Shift");
+    }
+    let value = parts.join("+");
+    if let Some(message) = crate::hotkey::modifier_only_error(&value, mac) {
+        Err(message)
+    } else {
+        Ok(value)
+    }
 }
 
 /// Shortcut section on Wayland, where the app can't register its own
@@ -1246,6 +1309,38 @@ mod tests {
             egui::Key::Num1
         );
         assert_eq!(capture_key(egui::Key::A, None), egui::Key::A);
+    }
+
+    #[test]
+    fn modifier_span_builds_chord_values_and_errors() {
+        use crate::hotkey::ModifierSet;
+        let cmd_option = ModifierSet {
+            cmd: true,
+            ctrl: false,
+            option: true,
+            shift: false,
+        };
+        assert_eq!(modifier_only_value(cmd_option, true).unwrap(), "Cmd+Option");
+        let cmd_only = ModifierSet {
+            cmd: true,
+            ctrl: false,
+            option: false,
+            shift: false,
+        };
+        assert_eq!(
+            modifier_only_value(cmd_only, true).unwrap_err(),
+            "Use at least two modifier keys (for example Command+Option), or add a key."
+        );
+        let ctrl_alt = ModifierSet {
+            cmd: false,
+            ctrl: true,
+            option: true,
+            shift: false,
+        };
+        assert_eq!(
+            modifier_only_value(ctrl_alt, false).unwrap_err(),
+            "Shortcuts with only modifier keys work only on macOS. Add a key, for example Ctrl+Alt+Space."
+        );
     }
 
     #[test]

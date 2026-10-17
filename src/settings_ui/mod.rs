@@ -35,14 +35,14 @@ pub(crate) const FIXED_SIZE: (f64, f64) = (480.0, 640.0);
 pub(crate) const APP_ID: &str = "dictate";
 
 /// Shortcut-recording state for the Settings page: whether the Record button
-/// is capturing, the last capture error shown inline, and whether modifiers
-/// were held with no key yet (modifier-only detection). Lives with the window,
-/// so closing the window resets it.
+/// is capturing, the last capture error shown inline, and the union of
+/// modifiers held in the current span (modifier-only detection; `None` when
+/// no span is open). Lives with the window, so closing the window resets it.
 #[derive(Debug, Default)]
 pub(crate) struct ShortcutCapture {
     pub recording: bool,
     pub error: Option<String>,
-    pub mods_seen: bool,
+    pub held: Option<crate::hotkey::ModifierSet>,
 }
 
 /// The open Settings window: winit window, glutin GL context and surface, and
