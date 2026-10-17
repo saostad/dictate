@@ -21,10 +21,6 @@ const RECORDING_RED: [u8; 4] = [229, 57, 53, 255];
 /// Transcribing icon color: amber (#FFB300).
 const TRANSCRIBING_AMBER: [u8; 4] = [255, 179, 0, 255];
 
-/// Shortcut choices offered in the Settings window.
-pub(crate) const SHORTCUT_OPTIONS: [&str; 4] =
-    ["Ctrl+Shift+Space", "Ctrl+Alt+Space", "Ctrl+Alt+D", "F8"];
-
 /// README section explaining the compositor keybinds.
 pub(crate) const README_USE_IT_URL: &str = "https://github.com/saostad/dictate#use-it";
 
@@ -120,7 +116,10 @@ impl SettingsChange {
                 format!("Notifications: {}", on_off(*on))
             }
             SettingsChange::Mode(mode) => format!("Mode: {}", mode.display_name()),
-            SettingsChange::Shortcut(display) => format!("Shortcut: {display}"),
+            SettingsChange::Shortcut(display) => format!(
+                "Shortcut: {}",
+                crate::hotkey::shortcut_label(display, cfg!(target_os = "macos"))
+            ),
             SettingsChange::Microphone { name, .. } => format!("Microphone: {name}"),
         }
     }
@@ -321,7 +320,6 @@ pub(crate) fn open_target(target: &str) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::str::FromStr;
 
     fn center_pixel(state: State) -> [u8; 4] {
         let (rgba, width, height) = icon_rgba(state);
@@ -395,16 +393,6 @@ mod tests {
     }
 
     #[test]
-    fn every_shortcut_option_parses() {
-        for name in SHORTCUT_OPTIONS {
-            assert!(
-                global_hotkey::hotkey::HotKey::from_str(name).is_ok(),
-                "{name} does not parse"
-            );
-        }
-    }
-
-    #[test]
     fn tooltip_shows_state_and_mode_name() {
         assert_eq!(
             tooltip_text(State::Idle, Mode::Whole, None),
@@ -443,6 +431,11 @@ mod tests {
 
     #[test]
     fn settings_change_confirmation_texts() {
+        // The confirmation shows the per-OS label; the log keeps the raw value.
+        #[cfg(target_os = "macos")]
+        let shortcut_body = "Shortcut: Control+Option+D";
+        #[cfg(not(target_os = "macos"))]
+        let shortcut_body = "Shortcut: Ctrl+Alt+D";
         let cases = [
             (
                 SettingsChange::Sounds(true),
@@ -481,7 +474,7 @@ mod tests {
             ),
             (
                 SettingsChange::Shortcut("Ctrl+Alt+D".to_string()),
-                "Shortcut: Ctrl+Alt+D",
+                shortcut_body,
                 "settings: hotkey = Ctrl+Alt+D",
             ),
             (

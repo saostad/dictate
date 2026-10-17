@@ -528,12 +528,17 @@ fn shortcut_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAc
         wayland_shortcut_section(ui, view, actions);
         return;
     }
+    let mac = cfg!(target_os = "macos");
+    let presets = crate::hotkey::shortcut_presets(mac);
     egui::ComboBox::from_label("")
-        .selected_text(view.settings.hotkey.as_str())
+        .selected_text(crate::hotkey::shortcut_label(&view.settings.hotkey, mac))
         .show_ui(ui, |ui| {
-            for preset in crate::tray::SHORTCUT_OPTIONS {
+            for preset in presets {
                 if ui
-                    .selectable_label(view.settings.hotkey == preset, preset)
+                    .selectable_label(
+                        view.settings.hotkey == *preset,
+                        crate::hotkey::shortcut_label(preset, mac),
+                    )
                     .clicked()
                 {
                     actions.push(PageAction::SelectShortcut(preset.to_string()));

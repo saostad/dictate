@@ -627,7 +627,10 @@ fn setup_hotkey(
             // The event loop is closed; the daemon is shutting down.
         }
     }));
-    dlog!("Hotkey: {} (tap to toggle, hold to talk)", config.display);
+    dlog!(
+        "Hotkey: {} (tap to toggle, hold to talk)",
+        crate::hotkey::shortcut_label(&config.display, cfg!(target_os = "macos"))
+    );
 }
 
 /// Daemon state, owned by the event-loop thread: the recording state, the
@@ -1135,7 +1138,10 @@ impl DaemonApp {
         self.last_shortcut_error = None;
         self.settings.hotkey = display.to_string();
         self.report_save_error(crate::config::save(&self.settings));
-        dlog!("Hotkey: {display} (tap to toggle, hold to talk)");
+        dlog!(
+            "Hotkey: {} (tap to toggle, hold to talk)",
+            crate::hotkey::shortcut_label(display, cfg!(target_os = "macos"))
+        );
         Self::confirm_settings_change(
             &crate::tray::SettingsChange::Shortcut(display.to_string()),
             false,
@@ -1149,7 +1155,10 @@ impl DaemonApp {
         self.last_shortcut_error = Some(err.to_string());
         crate::notify::show(
             crate::notify::Kind::Error,
-            &format!("dictate: could not use shortcut {display}"),
+            &format!(
+                "dictate: could not use shortcut {}",
+                crate::hotkey::shortcut_label(display, cfg!(target_os = "macos"))
+            ),
             err,
         );
     }

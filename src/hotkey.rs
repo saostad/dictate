@@ -13,6 +13,57 @@ use crate::daemon::{Command, State};
 /// Hotkey used when `DICTATE_HOTKEY` is unset or empty.
 pub(crate) const DEFAULT_HOTKEY: &str = "Ctrl+Shift+Space";
 
+/// Shortcut presets on macOS: parser strings, labelled per OS at display time.
+const MAC_SHORTCUT_PRESETS: [&str; 5] = [
+    "Ctrl+Shift+Space",
+    "Cmd+Shift+Space",
+    "Option+Space",
+    "Ctrl+Option+D",
+    "F8",
+];
+
+/// Shortcut presets on Windows and Linux.
+const OTHER_SHORTCUT_PRESETS: [&str; 4] =
+    ["Ctrl+Shift+Space", "Ctrl+Alt+Space", "Ctrl+Alt+D", "F8"];
+
+/// Shortcut choices offered in the Settings window. Callers pass
+/// `cfg!(target_os = "macos")`. Values stay parser strings; only the shown
+/// label changes per OS.
+pub(crate) fn shortcut_presets(mac: bool) -> &'static [&'static str] {
+    if mac {
+        &MAC_SHORTCUT_PRESETS
+    } else {
+        &OTHER_SHORTCUT_PRESETS
+    }
+}
+
+/// Display label for a stored shortcut value: modifiers renamed per OS, the
+/// key part kept as written. Pure, so the combo, tray and logs share it.
+pub(crate) fn shortcut_label(value: &str, mac: bool) -> String {
+    value
+        .split('+')
+        .map(|part| {
+            let part = part.trim();
+            match part.to_ascii_lowercase().as_str() {
+                "ctrl" | "control" => {
+                    if mac {
+                        "Control".to_string()
+                    } else {
+                        "Ctrl".to_string()
+                    }
+                }
+                "alt" | "option" => if mac { "Option" } else { "Alt" }.to_string(),
+                "cmd" | "command" | "super" | "meta" => {
+                    if mac { "Command" } else { "Super" }.to_string()
+                }
+                "shift" => "Shift".to_string(),
+                _ => part.to_string(),
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("+")
+}
+
 /// A press held at least this long is push-to-talk; a shorter one is a tap.
 pub(crate) const HOLD_THRESHOLD_MS: u64 = 400;
 
@@ -223,6 +274,37 @@ mod tests {
             err.ends_with(". Example: Ctrl+Shift+Space"),
             "unexpected: {err}"
         );
+    }
+
+    #[test]
+    fn shortcut_labels_rename_modifiers_per_os() {
+        let cases = [
+            (
+                "Ctrl+Shift+Space",
+                "Control+Shift+Space",
+                "Ctrl+Shift+Space",
+            ),
+            ("cmd+option+K", "Command+Option+K", "Super+Alt+K"),
+            ("Super+Alt+D", "Command+Option+D", "Super+Alt+D"),
+            ("F8", "F8", "F8"),
+        ];
+        for (value, mac_label, other_label) in cases {
+            assert_eq!(shortcut_label(value, true), mac_label, "{value} on mac");
+            assert_eq!(
+                shortcut_label(value, false),
+                other_label,
+                "{value} elsewhere"
+            );
+        }
+    }
+
+    #[test]
+    fn every_shortcut_preset_parses() {
+        for mac in [true, false] {
+            for preset in shortcut_presets(mac) {
+                assert!(HotKey::from_str(preset).is_ok(), "{preset} does not parse");
+            }
+        }
     }
 
     #[test]
