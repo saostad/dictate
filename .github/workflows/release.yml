@@ -57,9 +57,11 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          shared-key: registry-only-v1
-          cache-targets: false
-          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          key: release-${{ matrix.asset }}
+      - uses: actions/cache@v4
+        with:
+          path: .model
+          key: parakeet-tdt-0.6b-v2-int8-0bbb45a
       - name: Download ONNX Runtime (Linux x86_64)
         if: matrix.asset == 'dictate-linux-x86_64'
         run: |

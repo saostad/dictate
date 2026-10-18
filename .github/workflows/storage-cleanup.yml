@@ -21,6 +21,7 @@ concurrency:
 permissions:
   actions: write
   contents: write
+  pull-requests: read
 
 jobs:
   cleanup:
@@ -30,7 +31,6 @@ jobs:
       - name: Keep latest builds, release downloads, and dependency caches
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
-          CACHE_BUDGET_GIB: ${{ vars.ACTIONS_CACHE_BUDGET_GIB || '2' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
         with:
           script: |
@@ -39,10 +39,6 @@ jobs:
             const dryRun = process.env.DRY_RUN === 'true';
             const repository = (await github.rest.repos.get({owner, repo})).data;
             const defaultRef = `refs/heads/${repository.default_branch}`;
-            const cacheBudgetBytes = Number(process.env.CACHE_BUDGET_GIB || '2') * 2 ** 30;
-            if (!Number.isFinite(cacheBudgetBytes) || cacheBudgetBytes <= 0) {
-              throw new Error('CACHE_BUDGET_GIB must be a positive number.');
-            }
             const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {owner, repo, per_page: 100});
             const releases = await github.paginate(github.rest.repos.listReleases, {owner, repo, per_page: 100});
             const caches = await github.paginate(github.rest.actions.getActionsCacheList, {owner, repo, per_page: 100});
@@ -99,18 +95,41 @@ jobs:
               core.warning('Latest app release has no downloads; keeping older release assets.');
             }
 
-            // Keep the newest generation per dependency-cache family on the default branch.
-            // PR/tag caches and superseded lockfile generations are recreatable duplicates.
+            // Keep warm caches for active refs, including PR builds and OS/archive variants.
+            // Remove only abandoned refs and superseded generations within the same scope.
+            const activeRefs = new Map([[defaultRef, true]]);
+            async function isActiveRef(ref) {
+              if (activeRefs.has(ref)) return activeRefs.get(ref);
+              const pull = /^refs\/pull\/(\d+)\/(?:merge|head)$/.exec(ref);
+              const branch = /^refs\/heads\/(.+)$/.exec(ref);
+              const tag = /^refs\/tags\/(.+)$/.exec(ref);
+              let active = true;
+              try {
+                if (pull) {
+                  active = (await github.rest.pulls.get({owner, repo, pull_number: Number(pull[1])})).data.state === 'open';
+                } else if (branch) {
+                  await github.rest.repos.getBranch({owner, repo, branch: branch[1]});
+                } else if (tag) {
+                  await github.rest.git.getRef({owner, repo, ref: `tags/${tag[1]}`});
+                } else {
+                  core.warning(`Keep caches for unrecognized ref ${ref}`);
+                }
+              } catch (error) {
+                if (error.status !== 404) throw error;
+                core.info(`Ref ${ref} no longer exists; its caches can be removed.`);
+                active = false;
+              }
+              activeRefs.set(ref, active);
+              return active;
+            }
             const families = new Set();
             const oldCaches = [];
-            let retainedCacheBytes = 0;
             for (const cache of caches.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))) {
-              const family = cache.key.replace(/-[a-f0-9]{8,64}$/, '');
-              if (cache.ref !== defaultRef || families.has(family) || retainedCacheBytes + cache.size_in_bytes > cacheBudgetBytes) {
+              const family = `${cache.ref}:${cache.version}:${cache.key.replace(/-[a-f0-9]{8,64}$/, '')}`;
+              if (!(await isActiveRef(cache.ref)) || families.has(family)) {
                 oldCaches.push(cache);
               } else {
                 families.add(family);
-                retainedCacheBytes += cache.size_in_bytes;
                 core.info(`Keep cache ${cache.id}: ${cache.key}`);
               }
             }

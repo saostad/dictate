@@ -20,10 +20,6 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-        with:
-          shared-key: registry-only-v1
-          cache-targets: false
-          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Check formatting
         run: cargo fmt --check
       - name: Lint
@@ -49,10 +45,14 @@ jobs:
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
+      - uses: actions/cache@v4
         with:
-          shared-key: registry-only-v1
-          cache-targets: false
-          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
+          path: .model
+          key: parakeet-tdt-0.6b-v2-int8-0bbb45a
+      - uses: actions/cache@v4
+        with:
+          path: nemotron-streaming-en-0.6b-int8
+          key: nemotron-en-0.6b-int8-95df6c8
       - name: Download model
         run: cargo run --release -- download
       - name: Download Live model
