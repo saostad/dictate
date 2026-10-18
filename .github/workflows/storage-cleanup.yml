@@ -30,6 +30,7 @@ jobs:
       - name: Keep latest builds, release downloads, and dependency caches
         uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
         env:
+          CACHE_BUDGET_GIB: ${{ vars.ACTIONS_CACHE_BUDGET_GIB || '2' }}
           DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
         with:
           script: |
@@ -38,6 +39,10 @@ jobs:
             const dryRun = process.env.DRY_RUN === 'true';
             const repository = (await github.rest.repos.get({owner, repo})).data;
             const defaultRef = `refs/heads/${repository.default_branch}`;
+            const cacheBudgetBytes = Number(process.env.CACHE_BUDGET_GIB || '2') * 2 ** 30;
+            if (!Number.isFinite(cacheBudgetBytes) || cacheBudgetBytes <= 0) {
+              throw new Error('CACHE_BUDGET_GIB must be a positive number.');
+            }
             const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {owner, repo, per_page: 100});
             const releases = await github.paginate(github.rest.repos.listReleases, {owner, repo, per_page: 100});
             const caches = await github.paginate(github.rest.actions.getActionsCacheList, {owner, repo, per_page: 100});
@@ -98,12 +103,14 @@ jobs:
             // PR/tag caches and superseded lockfile generations are recreatable duplicates.
             const families = new Set();
             const oldCaches = [];
+            let retainedCacheBytes = 0;
             for (const cache of caches.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))) {
               const family = cache.key.replace(/-[a-f0-9]{8,64}$/, '');
-              if (cache.ref !== defaultRef || families.has(family)) {
+              if (cache.ref !== defaultRef || families.has(family) || retainedCacheBytes + cache.size_in_bytes > cacheBudgetBytes) {
                 oldCaches.push(cache);
               } else {
                 families.add(family);
+                retainedCacheBytes += cache.size_in_bytes;
                 core.info(`Keep cache ${cache.id}: ${cache.key}`);
               }
             }
