@@ -57,11 +57,9 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.asset }}
-      - uses: actions/cache@v4
-        with:
-          path: .model
-          key: parakeet-tdt-0.6b-v2-int8-0bbb45a
+          shared-key: registry-only-v1
+          cache-targets: false
+          save-if: ${{ github.ref == format('refs/heads/{0}', github.event.repository.default_branch) }}
       - name: Download ONNX Runtime (Linux x86_64)
         if: matrix.asset == 'dictate-linux-x86_64'
         run: |
@@ -189,6 +187,7 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: runner.os != 'Windows'
         with:
+          retention-days: 1
           name: ${{ matrix.asset }}
           path: |
             ${{ matrix.asset }}.tar.gz
@@ -196,12 +195,16 @@ jobs:
       - uses: actions/upload-artifact@v4
         if: runner.os == 'Windows'
         with:
+          retention-days: 1
           name: ${{ matrix.asset }}
           path: |
             ${{ matrix.asset }}.zip
             ${{ matrix.asset }}.zip.sha256
 
   release:
+    permissions:
+      contents: write
+      actions: write
     needs: build
     if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
@@ -241,3 +244,16 @@ jobs:
             3. `dictate daemon` — keeps the model loaded; see the README for hotkeys and key binds.
 
             Verify downloads with `shasum -a 256 -c <file>.sha256` (Linux/macOS).
+
+      - name: Remove temporary artifacts after publishing the release
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              owner, repo, run_id: context.runId, per_page: 100
+            });
+            for (const artifact of artifacts) {
+              core.info(`Delete published build handoff ${artifact.name} (${artifact.id})`);
+              await github.rest.actions.deleteArtifact({owner, repo, artifact_id: artifact.id});
+            }

@@ -1,0 +1,132 @@
+name: Storage cleanup
+
+# No checkout: workflow_run has write access, so never execute pull-request code.
+on:
+  workflow_run:
+    workflows: ["ci", "release"]
+    types: [completed]
+  schedule:
+    - cron: '23 7 * * *'
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: Preview deletions without changing stored files
+        type: boolean
+        default: true
+
+concurrency:
+  group: storage-cleanup
+  cancel-in-progress: false
+
+permissions:
+  actions: write
+  contents: write
+
+jobs:
+  cleanup:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Keep latest builds, release downloads, and dependency caches
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        env:
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run || false }}
+        with:
+          script: |
+            // This runs without checking out repository code, including on workflow_run.
+            const {owner, repo} = context.repo;
+            const dryRun = process.env.DRY_RUN === 'true';
+            const repository = (await github.rest.repos.get({owner, repo})).data;
+            const defaultRef = `refs/heads/${repository.default_branch}`;
+            const artifacts = await github.paginate(github.rest.actions.listArtifactsForRepo, {owner, repo, per_page: 100});
+            const releases = await github.paginate(github.rest.repos.listReleases, {owner, repo, per_page: 100});
+            const caches = await github.paginate(github.rest.actions.getActionsCacheList, {owner, repo, per_page: 100});
+            const workflows = await github.paginate(github.rest.actions.listRepoWorkflows, {owner, repo, per_page: 100});
+            const activeWorkflowIds = new Set(workflows.filter(workflow => workflow.state === 'active').map(workflow => workflow.id));
+            const runs = new Map();
+            for (const artifact of artifacts) {
+              const runId = artifact.workflow_run?.id;
+              if (runId && !runs.has(runId)) {
+                runs.set(runId, (await github.rest.actions.getWorkflowRun({owner, repo, run_id: runId})).data);
+              }
+            }
+
+            // Keep one complete successful build per workflow, including all matrix outputs.
+            // Failed builds are kept only if that workflow has no successful build artifacts.
+            const latestRuns = new Map();
+            for (const run of runs.values()) {
+              if (run.status !== 'completed' || !activeWorkflowIds.has(run.workflow_id)) continue;
+              const previous = latestRuns.get(run.workflow_id);
+              const success = run.conclusion === 'success';
+              const previousSuccess = previous?.conclusion === 'success';
+              if (!previous || (success && !previousSuccess) ||
+                  (success === previousSuccess && new Date(run.created_at) > new Date(previous.created_at))) {
+                latestRuns.set(run.workflow_id, run);
+              }
+            }
+            const keepRunIds = new Set([...latestRuns.values()].map(run => run.id));
+            const oldArtifacts = artifacts.filter(artifact => {
+              const run = runs.get(artifact.workflow_run?.id);
+              if (!run || run.status !== 'completed' || keepRunIds.has(run.id)) {
+                core.info(`Keep artifact ${artifact.id}: ${artifact.name} (latest build or active/unknown run)`);
+                return false;
+              }
+              return true;
+            });
+
+            // Only versioned app releases are pruned. Named model/data releases are independent
+            // runtime downloads and must not be confused with the latest app version.
+            const appReleases = releases.filter(release => !release.draft && /^v\d/.test(release.tag_name))
+              .sort((a, b) => new Date(b.published_at) - new Date(a.published_at));
+            const latestRelease = appReleases[0];
+            const oldAssets = [];
+            if (latestRelease?.assets.length) {
+              core.info(`Keep all downloads for ${latestRelease.tag_name}`);
+              for (const release of appReleases.slice(1)) {
+                // Immutable releases cannot be modified. Preserve them and report explicitly.
+                if (release.immutable) {
+                  core.warning(`Keep immutable release ${release.tag_name}`);
+                  continue;
+                }
+                for (const asset of release.assets) oldAssets.push({asset, tag: release.tag_name});
+              }
+            } else if (latestRelease) {
+              core.warning('Latest app release has no downloads; keeping older release assets.');
+            }
+
+            // Keep the newest generation per dependency-cache family on the default branch.
+            // PR/tag caches and superseded lockfile generations are recreatable duplicates.
+            const families = new Set();
+            const oldCaches = [];
+            for (const cache of caches.sort((a, b) => new Date(b.created_at) - new Date(a.created_at))) {
+              const family = cache.key.replace(/-[a-f0-9]{8,64}$/, '');
+              if (cache.ref !== defaultRef || families.has(family)) {
+                oldCaches.push(cache);
+              } else {
+                families.add(family);
+                core.info(`Keep cache ${cache.id}: ${cache.key}`);
+              }
+            }
+
+            let bytes = 0;
+            for (const artifact of oldArtifacts) {
+              core.info(`${dryRun ? 'Would delete' : 'Delete'} artifact ${artifact.id}: ${artifact.name}`);
+              if (!dryRun) await github.rest.actions.deleteArtifact({owner, repo, artifact_id: artifact.id});
+              bytes += artifact.size_in_bytes;
+            }
+            for (const {asset, tag} of oldAssets) {
+              core.info(`${dryRun ? 'Would delete' : 'Delete'} release asset ${asset.id}: ${tag}/${asset.name}`);
+              if (!dryRun) await github.rest.repos.deleteReleaseAsset({owner, repo, asset_id: asset.id});
+              bytes += asset.size;
+            }
+            for (const cache of oldCaches) {
+              core.info(`${dryRun ? 'Would delete' : 'Delete'} cache ${cache.id}: ${cache.key} (${cache.ref})`);
+              if (!dryRun) await github.rest.actions.deleteActionsCacheById({owner, repo, cache_id: cache.id});
+              bytes += cache.size_in_bytes;
+            }
+            await core.summary.addHeading('Storage cleanup')
+              .addRaw(`${dryRun ? 'Dry run: would remove' : 'Removed'} ${oldArtifacts.length} artifacts, ` +
+                `${oldAssets.length} old release downloads, and ${oldCaches.length} caches ` +
+                `(${(bytes / 2 ** 20).toFixed(1)} MiB). ` +
+                'Source tags, release notes, named model releases, and active build artifacts are preserved.')
+              .write();
