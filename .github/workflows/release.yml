@@ -1,31 +1,69 @@
 name: release
 
+# Every push to main that passes ci is released: the next version comes from the
+# commit messages (scripts/next-version.sh), the binaries are built with it, and
+# only after all builds pass is the version commit tagged, pushed, and published.
 on:
+  workflow_run:
+    workflows: ["ci"]
+    types: [completed]
+    branches: [main]
   push:
     tags:
       - 'v*'
   workflow_dispatch:
 
+# A newer green push to main replaces an unfinished release; it includes the same commits.
+concurrency:
+  group: ${{ github.event_name == 'workflow_run' && github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push' && 'release-main' || format('release-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'workflow_run' }}
+
 permissions:
   contents: write
 
 jobs:
-  check-version:
-    if: startsWith(github.ref, 'refs/tags/')
+  version:
+    if: >-
+      github.event_name != 'workflow_run' ||
+      (github.event.workflow_run.conclusion == 'success' &&
+       github.event.workflow_run.event == 'push' &&
+       github.event.workflow_run.head_repository.full_name == github.repository)
     runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
     steps:
       - uses: actions/checkout@v4
-      - name: Check tag matches Cargo.toml version
+        with:
+          ref: ${{ github.event.workflow_run.head_sha || github.sha }}
+          fetch-depth: 0
+      - name: Choose the release version
+        id: version
         run: |
-          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
-          if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
-            echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION"
-            exit 1
-          fi
+          set -eu
+          CURRENT="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          case "$GITHUB_EVENT_NAME" in
+            workflow_run)
+              VERSION="$(sh scripts/next-version.sh)"
+              if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+                echo "Tag v$VERSION already exists"
+                exit 1
+              fi
+              echo "Releasing v$VERSION (was $CURRENT)"
+              ;;
+            *)
+              VERSION="$CURRENT"
+              if [ "$GITHUB_REF_TYPE" = tag ] && [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+                echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION"
+                exit 1
+              fi
+              ;;
+          esac
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
   build:
-    needs: check-version
-    if: always() && (needs.check-version.result == 'success' || needs.check-version.result == 'skipped')
+    needs: version
     strategy:
       fail-fast: false
       matrix:
@@ -49,6 +87,12 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - name: Set the release version
+        if: github.event_name == 'workflow_run'
+        shell: bash
+        run: sh scripts/set-version.sh "${{ needs.version.outputs.version }}"
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
@@ -207,18 +251,62 @@ jobs:
     permissions:
       contents: write
       actions: write
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/')
+    needs: [version, build]
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_run'
     runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
+      - uses: actions/checkout@v4
+        if: github.event_name == 'workflow_run'
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          fetch-depth: 0
+      - name: Commit, tag, and push the release version
+        id: tag
+        if: github.event_name == 'workflow_run'
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          sh scripts/set-version.sh "$VERSION"
+          git commit -qam "chore: release v$VERSION [skip ci]"
+          git tag "v$VERSION"
+          if git push --atomic origin HEAD:refs/heads/main "refs/tags/v$VERSION"; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # main moved while building. Commits that run ci get their own release, which
+          # includes these commits too. Only [skip ci] commits (workflow and storage
+          # chores) never release themselves, so release on top of those.
+          git fetch -q origin main
+          RUNS_CI=false
+          for c in $(git rev-list "${{ needs.version.outputs.sha }}..origin/main"); do
+            if ! git log -1 --format=%B "$c" | grep -qiE '\[(skip ci|ci skip|no ci|skip actions|actions skip)\]'; then
+              RUNS_CI=true
+            fi
+          done
+          if [ "$RUNS_CI" = true ]; then
+            echo "::notice::main has newer commits; their release will include these."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git rebase -q origin/main
+          git tag -f "v$VERSION"
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/v$VERSION"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
+        if: steps.tag.outputs.publish != 'false'
         with:
           merge-multiple: true
           path: dist
       - name: List artifacts
+        if: steps.tag.outputs.publish != 'false'
         run: ls -la dist
       - uses: softprops/action-gh-release@v2
+        if: steps.tag.outputs.publish != 'false'
         with:
+          tag_name: v${{ env.VERSION }}
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
