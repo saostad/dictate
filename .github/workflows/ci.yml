@@ -254,6 +254,8 @@ jobs:
           echo $out
           $lower = ($out | Out-String).ToLower()
           if ($lower -notmatch "ask not what your country") { Write-Error "transcription check failed: expected 'ask not what your country' in stdout"; exit 1 }
+      # Runs the binary that ships; compiling tests would rebuild every dependency,
+      # since the release profile aborts on panic and the test harness cannot.
       - name: Transcribe real clips with every model
         shell: bash
         run: |
@@ -261,7 +263,10 @@ jobs:
           if [ "${{ matrix.asset }}" = "dictate-linux-x86_64" ]; then
             export ORT_DYLIB_PATH=/tmp/ort/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so.1.31.0
           fi
-          cargo test --release --locked --target ${{ matrix.target }} ${{ matrix.flags }} -- --ignored --nocapture
+          BIN=./target/${{ matrix.target }}/release/dictate
+          PYTHON=python3
+          if [ "$RUNNER_OS" = Windows ]; then BIN="$BIN.exe"; PYTHON=python; fi
+          "$PYTHON" -I scripts/check-real-models.py "$BIN"
       - uses: actions/upload-artifact@v4
         if: needs.version.outputs.release != 'none' && runner.os != 'Windows'
         with:
