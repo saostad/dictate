@@ -313,7 +313,12 @@ impl Asr {
     /// Load Fluid Speech Mini from `dir`.
     pub fn load_fluid(dir: &Path) -> anyhow::Result<Self> {
         let model = crate::fluid::FluidModel::load(dir)
-            .with_context(|| format!("Loading Fluid Speech Mini from {} failed", dir.display()))?;
+            .with_context(|| {
+                format!(
+                    "Loading Fluid Speech Mini from {} failed. If this keeps happening, delete that folder and run \"dictate download --fluid\" again",
+                    dir.display()
+                )
+            })?;
         eprintln!("using {} threads", intra_threads());
         Ok(Self {
             engine: Engine::Fluid(model),
@@ -335,7 +340,7 @@ impl Asr {
                 let result = model.transcribe_samples(samples.to_vec(), 16_000, 1, None)?;
                 Ok(result.text.trim().to_string())
             }
-            Engine::Fluid(model) => model.transcribe(samples),
+            Engine::Fluid(model) => Ok(model.transcribe(samples)?.trim().to_string()),
         }
     }
 

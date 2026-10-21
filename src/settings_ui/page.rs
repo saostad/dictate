@@ -120,8 +120,8 @@ pub(crate) fn mode_loading_line(target: Mode) -> String {
 /// Status line while a switch's model downloads in the background.
 pub(crate) fn download_line(target: SwitchTarget, percent: u64) -> String {
     let name = match target {
-        SwitchTarget::Mode(Mode::Live) => "Live model",
-        _ => SpeechModel::Fluid.display_name(),
+        SwitchTarget::SpeechModel(model) => model.display_name(),
+        SwitchTarget::Mode(_) => "Live model",
     };
     format!("Downloading {name}… {percent}%")
 }

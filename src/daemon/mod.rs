@@ -1150,6 +1150,23 @@ impl DaemonApp {
         if model == self.settings.model {
             return;
         }
+        if let Some(pinned) = std::env::var("DICTATE_SPEECH_MODEL")
+            .ok()
+            .as_deref()
+            .and_then(crate::config::SpeechModel::parse)
+            && pinned != model
+        {
+            let message = format!(
+                "DICTATE_SPEECH_MODEL={} overrides this setting",
+                pinned.as_str()
+            );
+            dlog!(
+                "Speech model switch to {} refused: {message}",
+                model.as_str()
+            );
+            crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
+            return;
+        }
         if self.current_mode() != crate::config::Mode::Live && self.loaded_asr_model == Some(model)
         {
             self.complete_switch(SwitchTarget::SpeechModel(model));
@@ -1163,6 +1180,7 @@ impl DaemonApp {
     /// speech-model switch while Live is active, only save it).
     fn begin_switch(&mut self, target: SwitchTarget) {
         let download_first = switch_needs_download(target);
+        lock_progress(&self.switch_progress).percent = 0;
         self.mode_switch = Some(ModelSwitch {
             target,
             downloading: download_first,
@@ -1471,7 +1489,7 @@ impl DaemonApp {
             downloading: self
                 .mode_switch
                 .as_ref()
-                .is_some_and(|switch| switch.downloading),
+                .is_some_and(|switch| switch.downloading && progress.percent < 100),
             download_percent: progress.percent,
             checking_speed: progress.checking_speed,
             last_speed_check: progress.last_check,
@@ -1983,8 +2001,8 @@ fn download_progress_body(target: SwitchTarget, percent: u64) -> String {
 /// Speech Mini (only those two need a download).
 fn model_download_name(target: SwitchTarget) -> &'static str {
     match target {
-        SwitchTarget::Mode(crate::config::Mode::Live) => "Live model",
-        _ => crate::config::SpeechModel::Fluid.display_name(),
+        SwitchTarget::SpeechModel(model) => model.display_name(),
+        SwitchTarget::Mode(_) => "Live model",
     }
 }
 
@@ -2089,7 +2107,18 @@ fn download_for_switch(
         SwitchTarget::Mode(crate::config::Mode::Live) => {
             crate::model::download_live_files_with_progress(&mut on_progress)
         }
-        _ => crate::model::download_fluid_files_with_progress(&mut on_progress),
+        SwitchTarget::SpeechModel(crate::config::SpeechModel::Fluid) => {
+            crate::model::download_fluid_files_with_progress(&mut on_progress)
+        }
+        SwitchTarget::Mode(crate::config::Mode::Whole | crate::config::Mode::Pauses) => {
+            match crate::config::speech_model() {
+                crate::config::SpeechModel::Fluid => {
+                    crate::model::download_fluid_files_with_progress(&mut on_progress)
+                }
+                crate::config::SpeechModel::Standard => crate::model::download(),
+            }
+        }
+        SwitchTarget::SpeechModel(crate::config::SpeechModel::Standard) => crate::model::download(),
     };
     match result {
         Ok(()) => {

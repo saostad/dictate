@@ -103,7 +103,7 @@ impl Config {
             .get("eos_token_id")
             .and_then(serde_json::Value::as_u64)
             .map(|id| id as u32);
-        Ok(Self {
+        let config = Self {
             vocab_size: usize_field("vocab_size")?,
             blank_token_id: usize_field("blank_token_id")? as u32,
             pad_token_id: usize_field("pad_token_id")? as u32,
@@ -126,7 +126,21 @@ impl Config {
             subsampling_stride: usize_field("subsampling_stride")?,
             subsampling_layers: usize_field("subsampling_layers")?,
             frontend_chunk_frames: usize_field("frontend_chunk_frames")?,
-        })
+        };
+        for (name, value) in [
+            ("max_symbols_per_step", config.max_symbols_per_step),
+            ("hop_length", config.hop_length),
+            ("n_fft", config.n_fft),
+            ("win_length", config.win_length),
+            ("num_mel_bins", config.num_mel_bins),
+            ("subsampling_stride", config.subsampling_stride),
+            ("frontend_chunk_frames", config.frontend_chunk_frames),
+        ] {
+            if value == 0 {
+                bail!("config.json \"{name}\" must be greater than 0");
+            }
+        }
+        Ok(config)
     }
 }
 
@@ -329,7 +343,10 @@ pub(crate) fn parse_npy_f32(bytes: &[u8]) -> anyhow::Result<NpyF32> {
         .ok_or_else(|| anyhow::anyhow!("truncated .npy data"))?;
     let data = match descr.as_str() {
         "<f4" | "|f4" | "=f4" => {
-            if data_bytes.len() < count * 4 {
+            if count
+                .checked_mul(4)
+                .is_none_or(|bytes| data_bytes.len() < bytes)
+            {
                 bail!("truncated .npy data");
             }
             data_bytes[..count * 4]
@@ -340,7 +357,10 @@ pub(crate) fn parse_npy_f32(bytes: &[u8]) -> anyhow::Result<NpyF32> {
                 .collect()
         }
         "<f8" | "|f8" | "=f8" => {
-            if data_bytes.len() < count * 8 {
+            if count
+                .checked_mul(8)
+                .is_none_or(|bytes| data_bytes.len() < bytes)
+            {
                 bail!("truncated .npy data");
             }
             data_bytes[..count * 8]
@@ -697,6 +717,9 @@ impl FluidModel {
         frames: usize,
         valid: usize,
     ) -> anyhow::Result<Vec<(u32, usize)>> {
+        if frames == 0 || valid == 0 {
+            return Ok(Vec::new());
+        }
         let config = &self.config;
         let hidden = config.decoder_hidden_size;
         let layers = config.decoder_layers;
@@ -715,7 +738,7 @@ impl FluidModel {
         let mut c = c_out.to_vec();
         drop(outputs);
 
-        let budget = config.max_symbols_per_step * frames - 1;
+        let budget = config.max_symbols_per_step.saturating_mul(frames) - 1;
         let mut tokens: Vec<(u32, usize)> = Vec::new();
         let mut position = 0usize;
         loop {
@@ -948,6 +971,35 @@ mod tests {
         assert!(parse_npy_f32(b"not a numpy file").is_err());
         let bytes = npy_bytes(&[1], &[1.0]);
         assert!(parse_npy_f32(&bytes[..20]).is_err());
+    }
+
+    #[test]
+    fn rejects_npy_shape_whose_size_overflows() {
+        // `count * 4` would overflow: the header lies about the payload size.
+        let bytes = npy_bytes(&[usize::MAX / 2], &[1.0]);
+        assert!(parse_npy_f32(&bytes).is_err());
+    }
+
+    #[test]
+    fn rejects_zero_config_values() {
+        let json = r#"{"vocab_size": 8193, "blank_token_id": 8192, "pad_token_id": 2,
+            "durations": [0, 1, 2, 3, 4], "max_symbols_per_step": 0, "decoder_layers": 2,
+            "decoder_hidden_size": 640, "encoder_hidden_size": 1024, "sampling_rate": 16000,
+            "n_fft": 512, "hop_length": 160, "win_length": 400, "preemphasis": 0.97, "num_mel_bins": 128,
+            "max_single_pass_seconds": 40.0, "subsampling_kernel": 3, "subsampling_stride": 2,
+            "subsampling_layers": 3, "frontend_chunk_frames": 50}"#;
+        let err = Config::from_json(json).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("max_symbols_per_step"),
+            "unexpected: {err:#}"
+        );
+        assert!(
+            Config::from_json(&json.replace(
+                "\"max_symbols_per_step\": 0",
+                "\"max_symbols_per_step\": 10"
+            ))
+            .is_ok()
+        );
     }
 
     #[test]

@@ -398,7 +398,14 @@ fn download_file_inner(
     dest: &Path,
     mut report: Option<&mut dyn FnMut(u64)>,
 ) -> anyhow::Result<()> {
-    let mut response = ureq::get(url).call()?;
+    // Fail instead of hanging forever when the server never answers (a stuck
+    // background download would keep the daemon in Loading).
+    let mut response = ureq::get(url)
+        .config()
+        .timeout_connect(Some(std::time::Duration::from_secs(30)))
+        .timeout_recv_response(Some(std::time::Duration::from_secs(60)))
+        .build()
+        .call()?;
     let total = response.body().content_length();
     let mut reader = response.body_mut().as_reader();
     let mut file = fs::File::create(part)
