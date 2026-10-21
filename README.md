@@ -108,7 +108,9 @@ cargo build --release
 
 ```sh
 dictate download
+dictate download --fluid      # optional Fluid Speech Mini speech model
 dictate transcribe x.wav
+dictate transcribe --fluid x.wav
 dictate listen
 dictate mics
 ```
@@ -173,6 +175,8 @@ everything, applied immediately:
   one the last recording used.
 - **Dictation mode**: Whole recording, Type at pauses, or Live — with the
   loading, download and speed-check progress inline.
+- **Speech model**: Standard or Fluid Speech Mini for Whole and Pauses — with
+  download progress inline. Live always uses its own streaming model.
 - **Shortcut**: pick the global hotkey (on Wayland it explains the
   compositor keybinds instead).
 - **General**: start at login, sound cues, notifications.
@@ -219,18 +223,34 @@ logs and notifies (`dictate: this computer is too slow for Live mode`) and
 uses whole mode for that session. Without the model it does the same
 (`dictate: Live model missing`).
 
+## Speech model
+
+Whole and Pauses use one of two speech models. Pick one in the Settings window
+under **Speech model**. Switching loads the model on a background thread;
+picking Fluid Speech Mini downloads it first when missing (about 300 MB), with
+the progress shown inline. Live always uses its own streaming model, so this
+choice does not affect Live.
+
+| Speech model | Size | Trade-off |
+|---|---|---|
+| Standard (default) | part of `dictate download` | fastest, especially on older computers |
+| Fluid Speech Mini | about 300 MB extra | much better when other people talk nearby; slower on older computers |
+
+`dictate transcribe --fluid x.wav` transcribes one file with Fluid Speech Mini
+without changing the setting.
+
 ## Advanced: where settings are stored
 
 The Settings window manages settings for you (sound cues, notifications,
-mode, microphone, shortcut). They live in `config.toml` in the platform config
-directory (`~/.config/dictate/config.toml` on Linux,
+mode, speech model, microphone, shortcut). They live in `config.toml` in the
+platform config directory (`~/.config/dictate/config.toml` on Linux,
 `~/Library/Application Support/dictate/config.toml` on macOS,
 `%APPDATA%\dictate\config\config.toml` on Windows).
 
 The environment wins: `DICTATE_SOUNDS=0`, `DICTATE_NOTIFY=0`,
-`DICTATE_MODE=...`, `DICTATE_HOTKEY=...` and `DICTATE_MICROPHONE=...` override
-the file. The old `DICTATE_STREAMING` variable still works (it maps to
-whole/pauses).
+`DICTATE_MODE=...`, `DICTATE_SPEECH_MODEL=...`, `DICTATE_HOTKEY=...` and
+`DICTATE_MICROPHONE=...` override the file. The old `DICTATE_STREAMING`
+variable still works (it maps to whole/pauses).
 
 ## Global hotkey
 
@@ -272,16 +292,20 @@ also need Input Monitoring for the same terminal or app.
 ## Model
 
 Speech recognition uses NVIDIA Parakeet TDT 0.6B v2 (English), released under
-CC-BY-4.0, using the int8 ONNX export by istupakov. Pause segmentation (pauses
-mode) uses Silero VAD v6, released under MIT; `dictate download` fetches it
-too (2.3 MB, next to the speech model). Live mode uses NVIDIA Nemotron
-streaming 0.6B (English), int8 ONNX, fetched by `dictate download --live`
-(about 900 MB, next to the speech model).
+CC-BY-4.0, using the int8 ONNX export by istupakov. The optional Fluid Speech
+Mini model is by FluidVoice, released under CC BY 4.0, built on NVIDIA
+Parakeet TDT 0.6B v3 and Moondream Parakeet Ultra; `dictate download --fluid`
+fetches its ONNX export (about 300 MB). Pause segmentation (pauses mode) uses
+Silero VAD v6, released under MIT; `dictate download` fetches it too (2.3 MB,
+next to the speech model). Live mode uses NVIDIA Nemotron streaming 0.6B
+(English), int8 ONNX, fetched by `dictate download --live` (about 900 MB, next
+to the speech model).
 
-The model lives in the platform data directory
-(`~/.local/share/dictate/models/parakeet-tdt-0.6b-v2-int8` on Linux). Set
-`DICTATE_MODEL_DIR` to keep it elsewhere; `download` and every command that
-loads the model honor it.
+The models live in the platform data directory
+(`~/.local/share/dictate/models/parakeet-tdt-0.6b-v2-int8` and
+`~/.local/share/dictate/models/fluid-speech-mini-onnx` on Linux). Set
+`DICTATE_MODEL_DIR` to keep them elsewhere; `download` and every command that
+loads a model honor it.
 
 ## CPUs without AVX2 / system ONNX Runtime
 
@@ -304,6 +328,8 @@ Streaming diagnosis: set `DICTATE_DEBUG_SEGMENTS=<dir>` to save every emitted se
 ## License
 
 Code: MIT (see LICENSE). Speech model: NVIDIA Parakeet TDT 0.6B v2,
-CC-BY-4.0, downloaded at runtime by `dictate download` — not bundled. Live
-model: NVIDIA Nemotron streaming 0.6B, downloaded at runtime by
-`dictate download --live` — not bundled.
+CC-BY-4.0, downloaded at runtime by `dictate download` — not bundled. Fluid
+Speech Mini by FluidVoice, CC BY 4.0, built on NVIDIA Parakeet TDT 0.6B v3
+and Moondream Parakeet Ultra, downloaded at runtime by `dictate download
+--fluid` — not bundled. Live model: NVIDIA Nemotron streaming 0.6B,
+downloaded at runtime by `dictate download --live` — not bundled.

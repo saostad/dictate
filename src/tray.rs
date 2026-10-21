@@ -103,6 +103,7 @@ pub(crate) enum SettingsChange {
     Sounds(bool),
     Notifications(bool),
     Mode(Mode),
+    SpeechModel(crate::config::SpeechModel),
     Shortcut(String),
     Microphone { id: String, name: String },
 }
@@ -116,6 +117,9 @@ impl SettingsChange {
                 format!("Notifications: {}", on_off(*on))
             }
             SettingsChange::Mode(mode) => format!("Mode: {}", mode.display_name()),
+            SettingsChange::SpeechModel(model) => {
+                format!("Speech model: {}", model.display_name())
+            }
             SettingsChange::Shortcut(display) => format!(
                 "Shortcut: {}",
                 crate::hotkey::shortcut_label(display, cfg!(target_os = "macos"))
@@ -130,6 +134,9 @@ impl SettingsChange {
             SettingsChange::Sounds(on) => format!("settings: sounds = {on}"),
             SettingsChange::Notifications(on) => format!("settings: notifications = {on}"),
             SettingsChange::Mode(mode) => format!("settings: mode = {}", mode.as_str()),
+            SettingsChange::SpeechModel(model) => {
+                format!("settings: model = {}", model.as_str())
+            }
             SettingsChange::Shortcut(display) => format!("settings: hotkey = {display}"),
             SettingsChange::Microphone { id, .. } => {
                 if id.is_empty() {
@@ -471,6 +478,16 @@ mod tests {
                 SettingsChange::Mode(Mode::Live),
                 "Mode: Live",
                 "settings: mode = live",
+            ),
+            (
+                SettingsChange::SpeechModel(crate::config::SpeechModel::Standard),
+                "Speech model: Standard",
+                "settings: model = standard",
+            ),
+            (
+                SettingsChange::SpeechModel(crate::config::SpeechModel::Fluid),
+                "Speech model: Fluid Speech Mini",
+                "settings: model = fluid",
             ),
             (
                 SettingsChange::Shortcut("Ctrl+Alt+D".to_string()),

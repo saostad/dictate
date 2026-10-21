@@ -5,8 +5,18 @@ use anyhow::Context;
 use parakeet_rs::ort::environment::Environment;
 use parakeet_rs::{ExecutionConfig, ParakeetTDT, TimestampMode, Transcriber};
 
+use crate::config::SpeechModel;
+
+/// The loaded Whole/Pauses recognizer. Both engines expose the same two
+/// operations, so every call site keeps calling [`Asr::transcribe`] and
+/// [`Asr::transcribe_words`] regardless of the selected model.
+enum Engine {
+    Parakeet(ParakeetTDT),
+    Fluid(crate::fluid::FluidModel),
+}
+
 pub struct Asr {
-    model: ParakeetTDT,
+    engine: Engine,
 }
 
 pub(crate) fn shared_environment() -> anyhow::Result<Environment> {
@@ -289,38 +299,68 @@ pub(crate) fn intra_threads() -> usize {
 }
 
 impl Asr {
+    /// Load the standard (NVIDIA Parakeet) model from `dir`.
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
         let threads = intra_threads();
-        let asr = load_inner(dir, threads)
+        let model = load_inner(dir, threads)
             .with_context(|| format!("Loading speech model from {} failed", dir.display()))?;
         eprintln!("using {threads} threads");
-        Ok(asr)
+        Ok(Self {
+            engine: Engine::Parakeet(model),
+        })
+    }
+
+    /// Load Fluid Speech Mini from `dir`.
+    pub fn load_fluid(dir: &Path) -> anyhow::Result<Self> {
+        let model = crate::fluid::FluidModel::load(dir)
+            .with_context(|| format!("Loading Fluid Speech Mini from {} failed", dir.display()))?;
+        eprintln!("using {} threads", intra_threads());
+        Ok(Self {
+            engine: Engine::Fluid(model),
+        })
+    }
+
+    /// Load the speech model selected in the settings (`model = "standard"` or
+    /// `"fluid"`, with `DICTATE_SPEECH_MODEL` winning).
+    pub fn load_configured() -> anyhow::Result<Self> {
+        match crate::config::speech_model() {
+            SpeechModel::Standard => Self::load(&crate::model::model_dir_checked()?),
+            SpeechModel::Fluid => Self::load_fluid(&crate::model::fluid_model_dir_checked()?),
+        }
     }
 
     pub fn transcribe(&mut self, samples: &[f32]) -> anyhow::Result<String> {
-        let result = self
-            .model
-            .transcribe_samples(samples.to_vec(), 16_000, 1, None)?;
-        Ok(result.text.trim().to_string())
+        match &mut self.engine {
+            Engine::Parakeet(model) => {
+                let result = model.transcribe_samples(samples.to_vec(), 16_000, 1, None)?;
+                Ok(result.text.trim().to_string())
+            }
+            Engine::Fluid(model) => model.transcribe(samples),
+        }
     }
 
     /// Transcribe with word-level timestamps (seconds).
     pub fn transcribe_words(&mut self, samples: &[f32]) -> anyhow::Result<Vec<Word>> {
-        let result = self.model.transcribe_samples(
-            samples.to_vec(),
-            16_000,
-            1,
-            Some(TimestampMode::Words),
-        )?;
-        Ok(result
-            .tokens
-            .into_iter()
-            .map(|token| Word {
-                text: token.text,
-                start: token.start,
-                end: token.end,
-            })
-            .collect())
+        match &mut self.engine {
+            Engine::Parakeet(model) => {
+                let result = model.transcribe_samples(
+                    samples.to_vec(),
+                    16_000,
+                    1,
+                    Some(TimestampMode::Words),
+                )?;
+                Ok(result
+                    .tokens
+                    .into_iter()
+                    .map(|token| Word {
+                        text: token.text,
+                        start: token.start,
+                        end: token.end,
+                    })
+                    .collect())
+            }
+            Engine::Fluid(model) => model.transcribe_words(samples),
+        }
     }
 
     /// Transcribe one streaming segment, returning the kept word texts plus
@@ -355,13 +395,12 @@ impl Asr {
     }
 }
 
-fn load_inner(dir: &Path, threads: usize) -> anyhow::Result<Asr> {
+fn load_inner(dir: &Path, threads: usize) -> anyhow::Result<ParakeetTDT> {
     let env = shared_environment()?;
     let config = ExecutionConfig::new()
         .with_environment(env)
         .with_intra_threads(threads);
-    let model = ParakeetTDT::from_pretrained(dir, Some(config))?;
-    Ok(Asr { model })
+    Ok(ParakeetTDT::from_pretrained(dir, Some(config))?)
 }
 
 #[cfg(test)]

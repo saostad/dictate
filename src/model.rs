@@ -21,6 +21,21 @@ const LIVE_FILES: &[(&str, u64)] = &[
     ("decoder_joint.onnx", 10_962_697),
     ("tokenizer.model", 251_056),
 ];
+const FLUID_REVISION: &str = "fc592620325027419883cf272e70588d8a788c0a";
+const FLUID_BASE_URL: &str =
+    "https://huggingface.co/FluidVoice-Labs/fluid-speech-mini-onnx/resolve";
+const FLUID_DIR_NAME: &str = "fluid-speech-mini-onnx";
+/// Fluid Speech Mini files with their exact pinned sizes in bytes.
+const FLUID_FILES: &[(&str, u64)] = &[
+    ("config.json", 508),
+    ("decoder.onnx", 24_461_296),
+    ("encoder.onnx", 426_102),
+    ("encoder.onnx.data", 253_429_760),
+    ("frontend.onnx", 8_697_130),
+    ("joint.onnx", 11_840_320),
+    ("mel_filters.npy", 131_712),
+    ("tokenizer.json", 1_159_959),
+];
 const VAD_URL: &str = "https://github.com/snakers4/silero-vad/raw/1e261b036686cd0017d500ee96acd1c4ba572a9d/src/silero_vad/data/silero_vad.onnx";
 const VAD_DIR_NAME: &str = "silero-vad-v6";
 const VAD_FILE_NAME: &str = "silero_vad.onnx";
@@ -84,6 +99,12 @@ fn vad_dir_for(model_dir: &Path) -> PathBuf {
     sibling_dir_for(model_dir, VAD_DIR_NAME)
 }
 
+/// Fluid Speech Mini dir for a parakeet model dir: the sibling
+/// `fluid-speech-mini-onnx` under the same models dir.
+fn fluid_dir_for(model_dir: &Path) -> PathBuf {
+    sibling_dir_for(model_dir, FLUID_DIR_NAME)
+}
+
 /// Live-model dir for a parakeet model dir: the sibling
 /// `nemotron-streaming-en-0.6b-int8` under the same models dir.
 fn live_dir_for(model_dir: &Path) -> PathBuf {
@@ -123,6 +144,31 @@ pub fn live_model_dir_checked() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
+/// The Fluid Speech Mini model directory. Creates nothing.
+pub fn fluid_model_dir() -> anyhow::Result<PathBuf> {
+    Ok(fluid_dir_for(&model_dir()?))
+}
+
+/// Error unless every Fluid Speech Mini file exists in `dir`.
+pub fn check_fluid_model_dir(dir: &Path) -> anyhow::Result<()> {
+    for (name, _) in FLUID_FILES {
+        if !dir.join(name).is_file() {
+            anyhow::bail!(
+                "Model file {name} is missing in {}. Run \"dictate download --fluid\" first (about 300 MB).",
+                dir.display()
+            );
+        }
+    }
+    Ok(())
+}
+
+/// The Fluid Speech Mini directory, checked for completeness.
+pub fn fluid_model_dir_checked() -> anyhow::Result<PathBuf> {
+    let dir = fluid_model_dir()?;
+    check_fluid_model_dir(&dir)?;
+    Ok(dir)
+}
+
 /// Path of the voice-detector model. Creates nothing.
 pub fn vad_model_path() -> anyhow::Result<PathBuf> {
     Ok(vad_dir_for(&model_dir()?).join(VAD_FILE_NAME))
@@ -157,6 +203,16 @@ pub fn download() -> anyhow::Result<()> {
 /// Download the speech model plus the Live streaming model.
 pub fn download_live() -> anyhow::Result<()> {
     download_inner(true)
+}
+
+/// Download the speech model plus Fluid Speech Mini (the voice detector
+/// Pauses mode needs comes with the speech model, as for `--live`).
+pub fn download_fluid() -> anyhow::Result<()> {
+    download()?;
+    download_fluid_files_with_progress(|_, _| {})?;
+    let dir = fluid_model_dir()?;
+    println!("Fluid Speech Mini ready in {}", dir.display());
+    Ok(())
 }
 
 fn download_inner(with_live: bool) -> anyhow::Result<()> {
@@ -197,16 +253,44 @@ fn download_live_files() -> anyhow::Result<()> {
 /// `progress(downloaded, total)` as bytes land across all files (`total` is
 /// the pinned size of every Live file; already-present files count up front).
 /// Used by the tray-menu download for progress notifications.
-pub fn download_live_files_with_progress<F>(mut progress: F) -> anyhow::Result<()>
+pub fn download_live_files_with_progress<F>(progress: F) -> anyhow::Result<()>
 where
     F: FnMut(u64, u64),
 {
     let dir = live_model_dir()?;
-    fs::create_dir_all(&dir)
+    download_files_with_progress(&dir, LIVE_BASE_URL, LIVE_REVISION, LIVE_FILES, progress)
+}
+
+/// Download any missing Fluid Speech Mini files, calling
+/// `progress(downloaded, total)` as bytes land across all files (`total` is
+/// the pinned size of every Fluid file; already-present files count up front).
+/// Used by the Settings page's background model switch.
+pub fn download_fluid_files_with_progress<F>(progress: F) -> anyhow::Result<()>
+where
+    F: FnMut(u64, u64),
+{
+    let dir = fluid_model_dir()?;
+    download_files_with_progress(&dir, FLUID_BASE_URL, FLUID_REVISION, FLUID_FILES, progress)
+}
+
+/// Download the files of one pinned model export into `dir`, verifying each
+/// file's exact size. A wrong-sized file is deleted and re-downloaded, never
+/// trusted. `progress` gets `(downloaded, total)` bytes across all files.
+fn download_files_with_progress<F>(
+    dir: &Path,
+    base_url: &str,
+    revision: &str,
+    files: &[(&str, u64)],
+    mut progress: F,
+) -> anyhow::Result<()>
+where
+    F: FnMut(u64, u64),
+{
+    fs::create_dir_all(dir)
         .with_context(|| format!("Could not create model directory {}", dir.display()))?;
-    let total: u64 = LIVE_FILES.iter().map(|(_, size)| size).sum();
+    let total: u64 = files.iter().map(|(_, size)| size).sum();
     let mut completed: u64 = 0;
-    for (name, size) in LIVE_FILES {
+    for (name, size) in files {
         let dest = dir.join(name);
         let present_len = dest.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         if dest.is_file() && present_len == *size {
@@ -217,7 +301,7 @@ where
         if dest.is_file() {
             eprintln!("{name}: wrong size ({present_len} bytes, expected {size}); re-downloading");
         }
-        let url = format!("{LIVE_BASE_URL}/{LIVE_REVISION}/{name}");
+        let url = format!("{base_url}/{revision}/{name}");
         let mut report = |file_bytes: u64| progress(completed + file_bytes, total);
         download_file_report(&url, name, &dest, Some(&mut report))
             .with_context(|| format!("Downloading {name} from {url} failed"))?;
@@ -510,6 +594,44 @@ mod tests {
             fs::write(dir.join(name), b"stub").unwrap();
         }
         check_live_model_dir(&dir).unwrap();
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn fluid_dir_is_a_sibling_of_the_speech_model_dir() {
+        let model_dir = Path::new("/data/models/parakeet-tdt-0.6b-v2-int8");
+        assert_eq!(
+            fluid_dir_for(model_dir),
+            PathBuf::from("/data/models/fluid-speech-mini-onnx")
+        );
+    }
+
+    #[test]
+    fn missing_fluid_file_error_suggests_download_fluid() {
+        let dir = fresh_dir("fluid-missing");
+        fs::create_dir_all(&dir).unwrap();
+        let err = check_fluid_model_dir(&dir).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("config.json"), "unexpected: {msg}");
+        assert!(
+            msg.contains("dictate download --fluid"),
+            "unexpected: {msg}"
+        );
+        assert!(
+            msg.contains(&dir.display().to_string()),
+            "unexpected: {msg}"
+        );
+        cleanup(&dir);
+    }
+
+    #[test]
+    fn complete_fluid_dir_passes_check() {
+        let dir = fresh_dir("fluid-complete");
+        fs::create_dir_all(&dir).unwrap();
+        for (name, _) in FLUID_FILES {
+            fs::write(dir.join(name), b"stub").unwrap();
+        }
+        check_fluid_model_dir(&dir).unwrap();
         cleanup(&dir);
     }
 

@@ -14,6 +14,7 @@ mod autostart;
 mod config;
 mod cue;
 mod daemon;
+mod fluid;
 mod hotkey;
 mod live;
 mod mic;
@@ -51,20 +52,26 @@ fn run() -> anyhow::Result<()> {
     };
     match command.as_str() {
         "download" => {
-            let live = match args.next().as_deref() {
-                None => false,
-                Some("--live") => true,
-                Some(_) => {
-                    eprintln!("Usage: dictate download [--live]");
-                    std::process::exit(2);
+            let (mut live, mut fluid) = (false, false);
+            loop {
+                match args.next().as_deref() {
+                    None => break,
+                    Some("--live") => live = true,
+                    Some("--fluid") => fluid = true,
+                    Some(_) => {
+                        eprintln!("Usage: dictate download [--live | --fluid]");
+                        std::process::exit(2);
+                    }
                 }
-            };
-            if args.next().is_some() {
-                eprintln!("Usage: dictate download [--live]");
+            }
+            if live && fluid {
+                eprintln!("Usage: dictate download [--live | --fluid]");
                 std::process::exit(2);
             }
             if live {
                 model::download_live()
+            } else if fluid {
+                model::download_fluid()
             } else {
                 model::download()
             }
@@ -100,23 +107,32 @@ fn run() -> anyhow::Result<()> {
         "toggle" | "start" | "stop" | "cancel" | "status" | "settings" => run_client(&command),
         "transcribe" => {
             let Some(first) = args.next() else {
-                eprintln!("Usage: dictate transcribe [--live] <file.wav>");
+                eprintln!("Usage: dictate transcribe [--live | --fluid] <file.wav>");
                 std::process::exit(2);
             };
-            if first == "--segmented" {
-                let Some(file) = args.next() else {
-                    eprintln!("Usage: dictate transcribe [--segmented] <file.wav>");
-                    std::process::exit(2);
-                };
-                transcribe_segmented(Path::new(&file))
-            } else if first == "--live" {
-                let Some(file) = args.next() else {
-                    eprintln!("Usage: dictate transcribe [--live] <file.wav>");
-                    std::process::exit(2);
-                };
-                transcribe_live(Path::new(&file))
-            } else {
-                transcribe(Path::new(&first))
+            match first.as_str() {
+                "--segmented" => {
+                    let Some(file) = args.next() else {
+                        eprintln!("Usage: dictate transcribe [--segmented] <file.wav>");
+                        std::process::exit(2);
+                    };
+                    transcribe_segmented(Path::new(&file))
+                }
+                "--live" => {
+                    let Some(file) = args.next() else {
+                        eprintln!("Usage: dictate transcribe [--live] <file.wav>");
+                        std::process::exit(2);
+                    };
+                    transcribe_live(Path::new(&file))
+                }
+                "--fluid" => {
+                    let Some(file) = args.next() else {
+                        eprintln!("Usage: dictate transcribe [--fluid] <file.wav>");
+                        std::process::exit(2);
+                    };
+                    transcribe(Path::new(&file), Some(config::SpeechModel::Fluid))
+                }
+                _ => transcribe(Path::new(&first), None),
             }
         }
         "help" | "--help" => {
@@ -130,11 +146,16 @@ fn run() -> anyhow::Result<()> {
     }
 }
 
-fn transcribe(path: &Path) -> anyhow::Result<()> {
-    let dir = model::model_dir_checked()?;
+fn transcribe(path: &Path, model: Option<config::SpeechModel>) -> anyhow::Result<()> {
     let samples = audio::load_wav_16k_mono(path)?;
     let start = std::time::Instant::now();
-    let mut asr = asr::Asr::load(&dir)?;
+    let mut asr = match model {
+        Some(config::SpeechModel::Fluid) => {
+            asr::Asr::load_fluid(&model::fluid_model_dir_checked()?)?
+        }
+        Some(config::SpeechModel::Standard) => asr::Asr::load(&model::model_dir_checked()?)?,
+        None => asr::Asr::load_configured()?,
+    };
     eprintln!("model loaded in {} ms", start.elapsed().as_millis());
     let seconds = samples.len() as f32 / 16_000.0;
     let start = std::time::Instant::now();
@@ -156,11 +177,10 @@ fn transcribe(path: &Path) -> anyhow::Result<()> {
 /// same join rule). Prints the joined text to stdout and per-segment timings
 /// to stderr.
 fn transcribe_segmented(path: &Path) -> anyhow::Result<()> {
-    let dir = model::model_dir_checked()?;
     let (mono, rate) = audio::load_wav_mono(path)?;
     let vad = vad::Vad::load_default()?;
     let start = std::time::Instant::now();
-    let mut asr = asr::Asr::load(&dir)?;
+    let mut asr = asr::Asr::load_configured()?;
     eprintln!("model loaded in {} ms", start.elapsed().as_millis());
     let mut feeder = segment::Feeder::new(rate, vad)?;
     let mut run = SegmentRun::default();
@@ -297,7 +317,6 @@ fn append_live_output(text: &mut String, first: &mut bool, out: &str) {
 }
 
 fn listen() -> anyhow::Result<()> {
-    let dir = model::model_dir_checked()?;
     let (settings, problem) = config::load();
     config::init_effective(&settings);
     if let Some(problem) = problem {
@@ -308,7 +327,7 @@ fn listen() -> anyhow::Result<()> {
         std::env::var("DICTATE_MICROPHONE").ok().as_deref(),
     );
     let recorder = mic::Recorder::start(mic.as_deref())?;
-    let loader = std::thread::spawn(move || asr::Asr::load(&dir));
+    let loader = std::thread::spawn(asr::Asr::load_configured);
     eprintln!("Recording... press Enter to stop.");
     let mut line = String::new();
     std::io::stdin()
@@ -438,7 +457,7 @@ pub(crate) fn is_app_bundle_executable(exe: &Path) -> bool {
 }
 
 fn usage() -> &'static str {
-    "Usage: dictate <command> [args]\n\nCommands:\n  download [--live]      Download the speech model (about 660 MB; --live also fetches the Live model, about 900 MB)\n  transcribe [--live] <file.wav>  Transcribe a WAV file and print the text\n  listen                 Record from the microphone and print the text\n  mics                   List the microphones and the selected one\n  daemon [--background]  Run the dictation daemon (keeps the model loaded)
+    "Usage: dictate <command> [args]\n\nCommands:\n  download [--live | --fluid]  Download the speech model (about 660 MB); --live or --fluid also fetches that optional model\n  transcribe [--live | --fluid] <file.wav>  Transcribe a WAV file (--fluid forces Fluid Speech Mini)\n  listen                 Record from the microphone and print the text\n  mics                   List the microphones and the selected one\n  daemon [--background]  Run the dictation daemon (keeps the model loaded)
   autostart on|off|status  Turn start-at-login on or off, or show the setting\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  settings               Open the Settings window via the daemon\n  help                   Show this help"
 }
 

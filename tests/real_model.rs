@@ -33,6 +33,27 @@ fn transcribe_with_downloaded_model() {
     );
 }
 
+#[test]
+#[ignore]
+fn transcribe_with_fluid_model() {
+    let wav = test_wav();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_dictate"))
+        .args(["transcribe", "--fluid", &wav])
+        .output()
+        .expect("run dictate transcribe --fluid");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.to_lowercase()
+            .contains("ask not what your country can do for you"),
+        "unexpected Fluid transcription: {text}"
+    );
+}
+
 /// Read any WAV as mono f32 samples plus its sample rate (i16/f32, downmixed).
 fn read_wav_mono(path: &str) -> (Vec<f32>, u32) {
     let mut reader = hound::WavReader::open(path).expect("open test WAV");

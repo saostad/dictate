@@ -8,8 +8,8 @@ use std::str::FromStr;
 
 use global_hotkey::hotkey::HotKey;
 
-use crate::config::{Mode, Settings};
-use crate::daemon::LiveSpeedCheck;
+use crate::config::{Mode, Settings, SpeechModel};
+use crate::daemon::{LiveSpeedCheck, SwitchTarget};
 use crate::mic::Mic;
 
 /// GitHub releases page (the About section's "Check for updates" button).
@@ -44,6 +44,21 @@ pub(crate) const MODE_OPTIONS: [(Mode, &str, &str); 3] = [
     ),
 ];
 
+/// Whole/Pauses speech models offered on the page, in order, with their radio
+/// label and one-line explanation.
+pub(crate) const SPEECH_MODEL_OPTIONS: [(SpeechModel, &str, &str); 2] = [
+    (
+        SpeechModel::Standard,
+        "Standard",
+        "Default. Fastest on older computers.",
+    ),
+    (
+        SpeechModel::Fluid,
+        "Fluid Speech Mini",
+        "Better when other people talk nearby. About 300 MB; slower.",
+    ),
+];
+
 /// User intents from one page frame, applied by the daemon.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum PageAction {
@@ -51,6 +66,7 @@ pub(crate) enum PageAction {
     RefreshMics,
     RefreshBinds,
     SelectMode(Mode),
+    SelectSpeechModel(SpeechModel),
     SelectShortcut(String),
     ToggleSounds,
     ToggleNotifications,
@@ -64,11 +80,11 @@ pub(crate) struct PageView<'a> {
     pub settings: &'a Settings,
     pub mics: &'a [Mic],
     pub active_mic: Option<&'a str>,
-    /// A mode switch is loading this mode in the background, if any.
-    pub switch_target: Option<Mode>,
-    /// The switch is downloading the Live model first.
+    /// A mode or speech-model switch is loading in the background, if any.
+    pub switch_target: Option<SwitchTarget>,
+    /// The switch is downloading the target model first.
     pub downloading: bool,
-    /// Live-model download progress, 0–100.
+    /// Model download progress, 0–100.
     pub download_percent: u64,
     /// The Live speed check is running now.
     pub checking_speed: bool,
@@ -101,9 +117,18 @@ pub(crate) fn mode_loading_line(target: Mode) -> String {
     format!("Loading {} model…", target.display_name())
 }
 
-/// Status line while the Live model downloads.
-pub(crate) fn mode_download_line(percent: u64) -> String {
-    format!("Downloading Live model… {percent}%")
+/// Status line while a switch's model downloads in the background.
+pub(crate) fn download_line(target: SwitchTarget, percent: u64) -> String {
+    let name = match target {
+        SwitchTarget::Mode(Mode::Live) => "Live model",
+        _ => SpeechModel::Fluid.display_name(),
+    };
+    format!("Downloading {name}… {percent}%")
+}
+
+/// Status line while a speech-model switch loads in the background.
+pub(crate) fn speech_model_loading_line(model: SpeechModel) -> String {
+    format!("Loading {}…", model.display_name())
 }
 
 /// Status line for a finished Live speed check.
@@ -440,6 +465,8 @@ pub(crate) fn show_page(
                 section_gap(ui);
                 mode_section(ui, view, &mut actions);
                 section_gap(ui);
+                speech_model_section(ui, view, &mut actions);
+                section_gap(ui);
                 shortcut_section(ui, view, &mut actions, capture);
                 section_gap(ui);
                 general_section(ui, view, &mut actions);
@@ -518,16 +545,42 @@ fn mode_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction
         }
         explain(ui, explanation);
     }
-    if view.downloading {
-        ui.label(mode_download_line(view.download_percent));
-    } else if let Some(target) = view.switch_target {
-        ui.label(mode_loading_line(target));
+    if let Some(SwitchTarget::Mode(mode)) = view.switch_target {
+        if view.downloading {
+            ui.label(download_line(
+                SwitchTarget::Mode(mode),
+                view.download_percent,
+            ));
+        } else {
+            ui.label(mode_loading_line(mode));
+        }
     }
     if view.checking_speed {
         ui.label("Checking Live speed…");
     }
     if let Some(check) = view.last_speed_check {
         ui.label(speed_check_line(check));
+    }
+}
+
+fn speech_model_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
+    heading(ui, "Speech model");
+    for (model, label, explanation) in SPEECH_MODEL_OPTIONS {
+        if ui.radio(view.settings.model == model, label).clicked() {
+            actions.push(PageAction::SelectSpeechModel(model));
+        }
+        explain(ui, explanation);
+    }
+    explain(ui, "Live always uses its own streaming model.");
+    if let Some(SwitchTarget::SpeechModel(model)) = view.switch_target {
+        if view.downloading {
+            ui.label(download_line(
+                SwitchTarget::SpeechModel(model),
+                view.download_percent,
+            ));
+        } else {
+            ui.label(speech_model_loading_line(model));
+        }
     }
 }
 
@@ -1067,11 +1120,44 @@ mod tests {
     }
 
     #[test]
+    fn speech_model_options_cover_both_models_with_their_text() {
+        let models: Vec<SpeechModel> = SPEECH_MODEL_OPTIONS
+            .iter()
+            .map(|(model, _, _)| *model)
+            .collect();
+        assert_eq!(models, vec![SpeechModel::Standard, SpeechModel::Fluid]);
+        assert_eq!(SPEECH_MODEL_OPTIONS[0].1, "Standard");
+        assert_eq!(
+            SPEECH_MODEL_OPTIONS[0].2,
+            "Default. Fastest on older computers."
+        );
+        assert_eq!(SPEECH_MODEL_OPTIONS[1].1, "Fluid Speech Mini");
+        assert_eq!(
+            SPEECH_MODEL_OPTIONS[1].2,
+            "Better when other people talk nearby. About 300 MB; slower."
+        );
+    }
+
+    #[test]
     fn mode_status_lines() {
         assert_eq!(mode_loading_line(Mode::Live), "Loading Live model…");
         assert_eq!(mode_loading_line(Mode::Pauses), "Loading Pauses model…");
-        assert_eq!(mode_download_line(25), "Downloading Live model… 25%");
-        assert_eq!(mode_download_line(100), "Downloading Live model… 100%");
+        let live = SwitchTarget::Mode(Mode::Live);
+        assert_eq!(download_line(live, 25), "Downloading Live model… 25%");
+        assert_eq!(download_line(live, 100), "Downloading Live model… 100%");
+        let fluid = SwitchTarget::SpeechModel(SpeechModel::Fluid);
+        assert_eq!(
+            download_line(fluid, 50),
+            "Downloading Fluid Speech Mini… 50%"
+        );
+        assert_eq!(
+            speech_model_loading_line(SpeechModel::Fluid),
+            "Loading Fluid Speech Mini…"
+        );
+        assert_eq!(
+            speech_model_loading_line(SpeechModel::Standard),
+            "Loading Standard…"
+        );
         assert_eq!(
             speed_check_line(LiveSpeedCheck {
                 ms: 120,

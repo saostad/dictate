@@ -53,9 +53,15 @@ jobs:
         with:
           path: nemotron-streaming-en-0.6b-int8
           key: nemotron-en-0.6b-int8-95df6c8
+      - uses: actions/cache@v4
+        with:
+          path: fluid-speech-mini-onnx
+          key: fluid-speech-mini-onnx-fc59262
       - name: Download model
         run: cargo run --release -- download
       - name: Download Live model
         run: cargo run --release -- download --live
+      - name: Download Fluid Speech Mini model
+        run: cargo run --release -- download --fluid
       - name: Transcribe real clip
         run: cargo test --release -- --ignored --nocapture

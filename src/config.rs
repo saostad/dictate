@@ -3,7 +3,8 @@
 //! A tiny TOML subset parsed by hand (no new crates): `#` comments, blank
 //! lines, `key = true|false` and `key = "string"`. Keys are `sounds` and
 //! `notifications` (bool, default true), `mode` (`"whole"`/`"pauses"`/`"live"`,
-//! default `"whole"`), `hotkey` (string, default `Ctrl+Shift+Space`) and
+//! default `"whole"`), `model` (`"standard"`/`"fluid"`, default `"standard"`),
+//! `hotkey` (string, default `Ctrl+Shift+Space`) and
 //! `microphone` (string, default `""` = the system default input). A missing
 //! file means defaults, never an error. On macOS the hotkey modifiers are
 //! spelled `Cmd`, `Option`, `Ctrl`, `Shift` (e.g. `Cmd+Option+Space`); the
@@ -13,8 +14,9 @@
 //! cancels that recording. They are not available on Windows/Linux.
 //!
 //! The environment still wins: `DICTATE_SOUNDS`, `DICTATE_NOTIFY`, `DICTATE_MODE`,
-//! `DICTATE_HOTKEY` and `DICTATE_MICROPHONE` override the file (`DICTATE_STREAMING`
-//! still works when `DICTATE_MODE` is unset). The daemon resolves file + env once
+//! `DICTATE_SPEECH_MODEL`, `DICTATE_HOTKEY` and `DICTATE_MICROPHONE` override the
+//! file (`DICTATE_STREAMING` still works when `DICTATE_MODE` is unset). The
+//! daemon resolves file + env once
 //! at startup into the effective switches below, which `cue`, `notify` and the
 //! daemon read instead of touching the environment per call (the microphone is
 //! resolved per recording instead: it is read rarely, and only the daemon's
@@ -76,12 +78,57 @@ impl Mode {
     }
 }
 
+/// Speech model for Whole and Pauses modes. Live always uses its own model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum SpeechModel {
+    /// NVIDIA Parakeet TDT 0.6B v2: the default, fastest on older computers.
+    #[default]
+    Standard,
+    /// Fluid Speech Mini: better when other people talk nearby.
+    Fluid,
+}
+
+impl SpeechModel {
+    /// The `config.toml` / `DICTATE_SPEECH_MODEL` spelling.
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            SpeechModel::Standard => "standard",
+            SpeechModel::Fluid => "fluid",
+        }
+    }
+
+    /// Display name in the Settings window and notifications.
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            SpeechModel::Standard => "Standard",
+            SpeechModel::Fluid => "Fluid Speech Mini",
+        }
+    }
+
+    /// Parse one model value; `None` for anything else.
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        match value {
+            "standard" => Some(SpeechModel::Standard),
+            "fluid" => Some(SpeechModel::Fluid),
+            _ => None,
+        }
+    }
+
+    fn from_discriminant(value: u8) -> Self {
+        match value {
+            1 => SpeechModel::Fluid,
+            _ => SpeechModel::Standard,
+        }
+    }
+}
+
 /// Settings from the file (before env overrides).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Settings {
     pub sounds: bool,
     pub notifications: bool,
     pub mode: Mode,
+    pub model: SpeechModel,
     pub hotkey: String,
     pub microphone: String,
 }
@@ -92,6 +139,7 @@ impl Default for Settings {
             sounds: true,
             notifications: true,
             mode: Mode::Whole,
+            model: SpeechModel::Standard,
             hotkey: crate::hotkey::DEFAULT_HOTKEY.to_string(),
             microphone: String::new(),
         }
@@ -104,6 +152,8 @@ static SOUNDS_ON: AtomicBool = AtomicBool::new(true);
 static NOTIFY_ON: AtomicBool = AtomicBool::new(true);
 /// Effective dictation mode (file + env, resolved at startup).
 static MODE: AtomicU8 = AtomicU8::new(0);
+/// Effective speech model for Whole/Pauses (file + env, resolved at startup).
+static SPEECH_MODEL: AtomicU8 = AtomicU8::new(0);
 
 /// Combine one bool setting with its env override: unset env keeps the file
 /// value, `"0"` turns it off, anything else turns it on.
@@ -134,6 +184,16 @@ pub(crate) fn resolve_mode(
         None => file,
         Some("0") => Mode::Whole,
         Some(_) => Mode::Pauses,
+    }
+}
+
+/// Combine the speech-model setting with its env override:
+/// `DICTATE_SPEECH_MODEL` wins when set to a valid non-empty value, otherwise
+/// the file value. An invalid or empty env falls through like an unset one.
+pub(crate) fn resolve_speech_model(file: SpeechModel, env: Option<&str>) -> SpeechModel {
+    match env {
+        Some(value) if !value.is_empty() => SpeechModel::parse(value).unwrap_or(file),
+        _ => file,
     }
 }
 
@@ -171,10 +231,15 @@ fn mode_env_now() -> (Option<String>, Option<String>, Option<String>) {
 /// environment. The daemon calls this once with the loaded file; short-lived
 /// processes call it with defaults so `DICTATE_*=0` still applies.
 pub(crate) fn init_effective(settings: &Settings) {
-    refresh_from(settings.sounds, settings.notifications, settings.mode);
+    refresh_from(
+        settings.sounds,
+        settings.notifications,
+        settings.mode,
+        settings.model,
+    );
 }
 
-fn refresh_from(sounds: bool, notifications: bool, mode: Mode) {
+fn refresh_from(sounds: bool, notifications: bool, mode: Mode, model: SpeechModel) {
     SOUNDS_ON.store(
         apply_env(sounds, std::env::var("DICTATE_SOUNDS").ok().as_deref()),
         Ordering::SeqCst,
@@ -187,6 +252,7 @@ fn refresh_from(sounds: bool, notifications: bool, mode: Mode) {
         Ordering::SeqCst,
     );
     refresh_mode(mode);
+    refresh_speech_model(model);
 }
 
 /// Effective sound-cue switch, read by `cue` on every start/stop.
@@ -202,6 +268,11 @@ pub(crate) fn notifications_on() -> bool {
 /// Effective dictation mode, read by the daemon on every start.
 pub(crate) fn mode() -> Mode {
     Mode::from_discriminant(MODE.load(Ordering::SeqCst))
+}
+
+/// Effective speech model for Whole/Pauses, read when a model is loaded.
+pub(crate) fn speech_model() -> SpeechModel {
+    SpeechModel::from_discriminant(SPEECH_MODEL.load(Ordering::SeqCst))
 }
 
 /// Update the effective sound switch after the tray changed the file value
@@ -231,6 +302,25 @@ pub(crate) fn refresh_mode(file_value: Mode) {
     }
     MODE.store(
         resolve_mode(file_value, mode_env.as_deref(), streaming_env.as_deref()) as u8,
+        Ordering::SeqCst,
+    );
+}
+
+/// Update the effective speech model after the Settings page changed the file
+/// value (env still wins). An invalid `DICTATE_SPEECH_MODEL` warns on stderr
+/// and falls through.
+pub(crate) fn refresh_speech_model(file_value: SpeechModel) {
+    let env = std::env::var("DICTATE_SPEECH_MODEL").ok();
+    if let Some(value) = env.as_deref()
+        && !value.is_empty()
+        && SpeechModel::parse(value).is_none()
+    {
+        eprintln!(
+            "warning: invalid DICTATE_SPEECH_MODEL \"{value}\": expected \"standard\" or \"fluid\""
+        );
+    }
+    SPEECH_MODEL.store(
+        resolve_speech_model(file_value, env.as_deref()) as u8,
         Ordering::SeqCst,
     );
 }
@@ -319,6 +409,18 @@ pub(crate) fn parse(text: &str) -> Result<Settings, String> {
                     )
                 })?;
             }
+            "model" => {
+                let parsed = parse_string(value).map_err(|problem| {
+                    format!(
+                        "config.toml line {line_number}: invalid value for \"model\": {problem}"
+                    )
+                })?;
+                settings.model = SpeechModel::parse(&parsed).ok_or_else(|| {
+                    format!(
+                        "config.toml line {line_number}: invalid value for \"model\": expected \"standard\" or \"fluid\""
+                    )
+                })?;
+            }
             "hotkey" => {
                 settings.hotkey = parse_string(value).map_err(|problem| {
                     format!(
@@ -396,10 +498,11 @@ fn escape(value: &str) -> String {
 /// Render all keys, each with a one-line comment.
 fn render(settings: &Settings) -> String {
     format!(
-        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Dictation mode: \"whole\" (type once at stop), \"pauses\" (type at pauses), \"live\" (type while speaking).\nmode = \"{}\"\n# Global hotkey: tap to toggle, hold to talk. macOS names: Cmd, Option, Ctrl, Shift (e.g. Cmd+Option+Space); modifier-only shortcuts (at least two modifiers, macOS only, need Input Monitoring; pressing another key cancels).\nhotkey = \"{}\"\n# Microphone: \"\" means the system default input, or a device id (see \"dictate mics\").\nmicrophone = \"{}\"\n",
+        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Dictation mode: \"whole\" (type once at stop), \"pauses\" (type at pauses), \"live\" (type while speaking).\nmode = \"{}\"\n# Speech model for whole and pauses: \"standard\" (NVIDIA Parakeet) or \"fluid\" (Fluid Speech Mini).\nmodel = \"{}\"\n# Global hotkey: tap to toggle, hold to talk. macOS names: Cmd, Option, Ctrl, Shift (e.g. Cmd+Option+Space); modifier-only shortcuts (at least two modifiers, macOS only, need Input Monitoring; pressing another key cancels).\nhotkey = \"{}\"\n# Microphone: \"\" means the system default input, or a device id (see \"dictate mics\").\nmicrophone = \"{}\"\n",
         settings.sounds,
         settings.notifications,
         settings.mode.as_str(),
+        settings.model.as_str(),
         escape(&settings.hotkey),
         escape(&settings.microphone)
     )
@@ -549,6 +652,67 @@ mod tests {
     }
 
     #[test]
+    fn parses_speech_model_and_defaults_to_standard() {
+        assert_eq!(Settings::default().model, SpeechModel::Standard);
+        assert_eq!(
+            parse("model = \"fluid\"\n").unwrap().model,
+            SpeechModel::Fluid
+        );
+        assert_eq!(
+            parse("model = \"standard\"\n").unwrap().model,
+            SpeechModel::Standard
+        );
+    }
+
+    #[test]
+    fn bad_speech_model_says_expected_values() {
+        let err = parse("model = \"large\"\n").unwrap_err();
+        assert!(err.contains("line 1"), "unexpected: {err}");
+        assert!(
+            err.contains("expected \"standard\" or \"fluid\""),
+            "unexpected: {err}"
+        );
+        let err = parse("model = true\n").unwrap_err();
+        assert!(
+            err.contains("invalid value for \"model\""),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn speech_model_env_precedence() {
+        assert_eq!(
+            resolve_speech_model(SpeechModel::Standard, Some("fluid")),
+            SpeechModel::Fluid
+        );
+        assert_eq!(
+            resolve_speech_model(SpeechModel::Fluid, Some("standard")),
+            SpeechModel::Standard
+        );
+        // Empty and invalid values fall through to the file value.
+        assert_eq!(
+            resolve_speech_model(SpeechModel::Fluid, Some("")),
+            SpeechModel::Fluid
+        );
+        assert_eq!(
+            resolve_speech_model(SpeechModel::Fluid, Some("large")),
+            SpeechModel::Fluid
+        );
+        assert_eq!(
+            resolve_speech_model(SpeechModel::Standard, None),
+            SpeechModel::Standard
+        );
+    }
+
+    #[test]
+    fn speech_model_display_names() {
+        assert_eq!(SpeechModel::Standard.display_name(), "Standard");
+        assert_eq!(SpeechModel::Fluid.display_name(), "Fluid Speech Mini");
+        assert_eq!(SpeechModel::Standard.as_str(), "standard");
+        assert_eq!(SpeechModel::Fluid.as_str(), "fluid");
+    }
+
+    #[test]
     fn microphone_defaults_to_empty_and_parses() {
         assert_eq!(Settings::default().microphone, "");
         let settings = parse("microphone = \"pulseaudio:alsa_input.pci\"\n").unwrap();
@@ -608,6 +772,7 @@ mod tests {
                 sounds: false,
                 notifications: false,
                 mode: Mode::Pauses,
+                model: SpeechModel::Fluid,
                 hotkey: "say \"hi\" \\ now".to_string(),
                 microphone: "pulseaudio:alsa_input.pci".to_string(),
             },
@@ -679,12 +844,17 @@ mod tests {
             sounds: false,
             notifications: true,
             mode: Mode::Whole,
+            model: SpeechModel::Standard,
             hotkey: "F8".to_string(),
             microphone: String::new(),
         };
         save_to(&path, &settings).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("# Play a short tone"), "unexpected:\n{text}");
+        assert!(
+            text.contains("# Speech model for whole"),
+            "unexpected:\n{text}"
+        );
         assert_eq!(parse(&text).unwrap(), settings);
         assert!(!path.with_file_name("config.toml.tmp").exists());
         std::fs::remove_dir_all(path.parent().unwrap()).ok();

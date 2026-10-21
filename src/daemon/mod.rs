@@ -170,12 +170,12 @@ pub(crate) enum Job {
     LiveEnd { stop_time: Instant },
     /// Discard a pauses/Live recording; already-typed text stays.
     Cancel,
-    /// Swap in a freshly loaded TDT model (a Settings-page switch to
-    /// whole/pauses); drops the Live model, then acks
+    /// Swap in a freshly loaded Whole/Pauses speech model (a Settings-page
+    /// mode or speech-model switch); drops the Live model, then acks
     /// [`UserEvent::ModeSwapped`].
-    SwapTdt(crate::asr::Asr),
+    SwapAsr(crate::asr::Asr),
     /// Swap in a freshly loaded Live model (a Settings-page switch to live);
-    /// drops the TDT model, then acks [`UserEvent::ModeSwapped`].
+    /// drops the Whole/Pauses model, then acks [`UserEvent::ModeSwapped`].
     SwapLive(crate::live::Live),
 }
 
@@ -189,7 +189,7 @@ impl std::fmt::Debug for Job {
             Job::LiveChunk(_) => "LiveChunk",
             Job::LiveEnd { .. } => "LiveEnd",
             Job::Cancel => "Cancel",
-            Job::SwapTdt(_) => "SwapTdt",
+            Job::SwapAsr(_) => "SwapAsr",
             Job::SwapLive(_) => "SwapLive",
         };
         write!(f, "{name}")
@@ -234,6 +234,7 @@ pub(crate) enum UserEvent {
     HotKey(GlobalHotKeyEvent),
     /// A modifier-chord press, release or interruption (macOS only; never
     /// sent on other systems).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Chord(crate::hotkey::ChordEvent),
     /// A tray menu click.
     Menu(tray_icon::menu::MenuEvent),
@@ -251,11 +252,11 @@ pub(crate) enum UserEvent {
     SettingsRefresh,
 }
 
-/// Progress of a background mode switch, shared between the loader thread and
+/// Progress of a background model switch, shared between the loader thread and
 /// the Settings page (which shows it inline; the tray label shows Loading).
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SwitchProgress {
-    /// Live-model download progress, 0–100.
+    /// Model download progress, 0–100.
     pub percent: u64,
     /// The Live speed check is running now.
     pub checking_speed: bool,
@@ -289,24 +290,32 @@ fn lock_progress(progress: &Mutex<SwitchProgress>) -> MutexGuard<'_, SwitchProgr
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// A mode switch running on a background thread (the event loop stays
-/// responsive). While one is in flight the tray label reads Loading and start
-/// requests are refused.
-enum ModeSwitch {
-    /// Loading the target mode's model (Live loads always benchmark too).
-    Loading { target: crate::config::Mode },
-    /// Downloading the Live model, then loading it (always targets Live).
-    Downloading,
+/// What a Settings-page model switch changes: the dictation mode or the
+/// Whole/Pauses speech model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum SwitchTarget {
+    Mode(crate::config::Mode),
+    SpeechModel(crate::config::SpeechModel),
 }
 
-impl ModeSwitch {
-    /// The mode the switch is heading to.
-    fn target(&self) -> crate::config::Mode {
+impl SwitchTarget {
+    /// The speech model being switched to, if this is a speech-model switch.
+    fn speech_model(self) -> Option<crate::config::SpeechModel> {
         match self {
-            ModeSwitch::Loading { target } => *target,
-            ModeSwitch::Downloading => crate::config::Mode::Live,
+            SwitchTarget::Mode(_) => None,
+            SwitchTarget::SpeechModel(model) => Some(model),
         }
     }
+}
+
+/// A model switch running on a background thread (the event loop stays
+/// responsive). While one is in flight the tray label reads Loading and start
+/// requests are refused.
+struct ModelSwitch {
+    /// What the switch changes.
+    target: SwitchTarget,
+    /// The target model's files are downloading first.
+    downloading: bool,
 }
 
 /// Daemon log file, opened when stderr is not a terminal.
@@ -497,7 +506,7 @@ fn run_daemon_inner() -> anyhow::Result<()> {
         .context("Could not start the daemon event loop")?;
     let (to_worker, worker_rx) = mpsc::channel::<Job>();
     let worker_proxy = event_loop.create_proxy();
-    let worker_has_tdt = models.tdt.is_some();
+    let loaded_asr_model = models.asr.as_ref().map(|_| crate::config::speech_model());
     let worker = std::thread::spawn(move || transcribe_worker(worker_rx, worker_proxy, models));
     #[cfg(unix)]
     {
@@ -513,7 +522,7 @@ fn run_daemon_inner() -> anyhow::Result<()> {
         worker,
         file_settings,
         live_fallback,
-        worker_has_tdt,
+        loaded_asr_model,
         switch_progress,
         event_loop.create_proxy(),
     );
@@ -527,10 +536,10 @@ fn run_daemon_inner() -> anyhow::Result<()> {
 }
 
 /// Models owned by the transcription worker. Only the startup mode's model
-/// is loaded; the TDT model loads lazily if the tray later switches from
-/// live to pauses (the only cross-family switch without a restart).
+/// is loaded; the Whole/Pauses model loads lazily if the tray later switches
+/// from live to pauses (the only cross-family switch without a restart).
 struct WorkerModels {
-    tdt: Option<crate::asr::Asr>,
+    asr: Option<crate::asr::Asr>,
     live: Option<crate::live::Live>,
 }
 
@@ -543,7 +552,7 @@ fn load_daemon_models(
     progress: &Mutex<SwitchProgress>,
 ) -> anyhow::Result<(WorkerModels, bool)> {
     if mode != crate::config::Mode::Live {
-        return load_tdt_models(false);
+        return load_asr_models(false);
     }
     if crate::model::live_model_dir_checked().is_err() {
         let body = "Run \"dictate download --live\" (about 900 MB). Using Whole recording.";
@@ -553,7 +562,7 @@ fn load_daemon_models(
             "dictate: Live model missing",
             body,
         );
-        return load_tdt_models(true);
+        return load_asr_models(true);
     }
     let dir = crate::model::live_model_dir_checked()?;
     let env = crate::asr::shared_environment()?;
@@ -572,25 +581,24 @@ fn load_daemon_models(
             &body,
         );
         drop(live);
-        return load_tdt_models(true);
+        return load_asr_models(true);
     }
     Ok((
         WorkerModels {
-            tdt: None,
+            asr: None,
             live: Some(live),
         },
         false,
     ))
 }
 
-/// Load the TDT model for whole/pauses mode, or as the Live fallback. The
-/// caller prints Ready once the socket is bound too.
-fn load_tdt_models(live_fallback: bool) -> anyhow::Result<(WorkerModels, bool)> {
-    let dir = crate::model::model_dir_checked()?;
-    let asr = crate::asr::Asr::load(&dir)?;
+/// Load the configured Whole/Pauses model, or the Live fallback. The caller
+/// prints Ready once the socket is bound too.
+fn load_asr_models(live_fallback: bool) -> anyhow::Result<(WorkerModels, bool)> {
+    let asr = crate::asr::Asr::load_configured()?;
     Ok((
         WorkerModels {
-            tdt: Some(asr),
+            asr: Some(asr),
             live: None,
         },
         live_fallback,
@@ -695,10 +703,11 @@ struct DaemonApp {
     /// Live was requested but failed the startup checks: live recordings run
     /// whole for this session.
     live_fallback: bool,
-    /// The worker holds the TDT model (whole/pauses need no load then).
-    worker_has_tdt: bool,
-    /// A mode switch loading on a background thread, if any.
-    mode_switch: Option<ModeSwitch>,
+    /// The speech model the worker currently holds for Whole/Pauses, if any
+    /// (whole/pauses need no load then).
+    loaded_asr_model: Option<crate::config::SpeechModel>,
+    /// A model switch loading on a background thread, if any.
+    mode_switch: Option<ModelSwitch>,
     tray: Option<crate::tray::Tray>,
     tray_attempted: bool,
     /// The open Settings window, if any. `None` while closed: the window, GL
@@ -740,7 +749,7 @@ impl DaemonApp {
         worker: std::thread::JoinHandle<()>,
         settings: crate::config::Settings,
         live_fallback: bool,
-        worker_has_tdt: bool,
+        loaded_asr_model: Option<crate::config::SpeechModel>,
         switch_progress: Arc<Mutex<SwitchProgress>>,
         menu_proxy: EventLoopProxy<UserEvent>,
     ) -> Self {
@@ -761,7 +770,7 @@ impl DaemonApp {
             worker_gone_notified: false,
             settings,
             live_fallback,
-            worker_has_tdt,
+            loaded_asr_model,
             mode_switch: None,
             tray: None,
             tray_attempted: false,
@@ -1065,7 +1074,7 @@ impl DaemonApp {
     }
 
     /// Switch the dictation mode from the Settings page. Whole and pauses
-    /// share the TDT model, so switching between them with it loaded is
+    /// share one speech model, so switching between them with it loaded is
     /// instant; anything else loads the needed model on a background thread
     /// (Live always benchmarks too) and completes on `ModeSwapped`. Picking
     /// Live with its model missing downloads it first, on the same thread.
@@ -1085,9 +1094,10 @@ impl DaemonApp {
             return;
         }
         if let Some(switch) = &self.mode_switch {
-            let message = match switch {
-                ModeSwitch::Downloading => "Already downloading",
-                ModeSwitch::Loading { .. } => "Model loading…",
+            let message = if switch.downloading {
+                "Already downloading"
+            } else {
+                "Model loading…"
             };
             dlog!("Mode switch to {} refused: {message}", target.as_str());
             crate::notify::show(crate::notify::Kind::Info, "dictate", message);
@@ -1096,27 +1106,79 @@ impl DaemonApp {
         if target == self.settings.mode {
             return;
         }
-        if target != crate::config::Mode::Live && self.worker_has_tdt {
-            self.complete_mode_switch(target);
+        if target != crate::config::Mode::Live
+            && self.loaded_asr_model == Some(crate::config::speech_model())
+        {
+            self.complete_switch(SwitchTarget::Mode(target));
             return;
         }
-        let download_first =
-            target == crate::config::Mode::Live && crate::model::live_model_dir_checked().is_err();
-        self.mode_switch = Some(if download_first {
-            ModeSwitch::Downloading
-        } else {
-            ModeSwitch::Loading { target }
+        self.begin_switch(SwitchTarget::Mode(target));
+    }
+
+    /// Switch the Whole/Pauses speech model from the Settings page. The new
+    /// model loads (and, for Fluid, downloads when missing) on a background
+    /// thread, then swaps into the worker and completes on `ModeSwapped`.
+    /// Live uses its own model, so there the choice is only saved.
+    /// Refused while recording or transcribing, and while a switch is already
+    /// running (only one download at a time).
+    fn switch_speech_model(&mut self, model: crate::config::SpeechModel) {
+        if self.state != State::Idle {
+            dlog!(
+                "Speech model switch to {} refused: finish the current dictation first",
+                model.as_str()
+            );
+            crate::notify::show(
+                crate::notify::Kind::Info,
+                "dictate",
+                "Finish the current dictation first",
+            );
+            return;
+        }
+        if let Some(switch) = &self.mode_switch {
+            let message = if switch.downloading {
+                "Already downloading"
+            } else {
+                "Model loading…"
+            };
+            dlog!(
+                "Speech model switch to {} refused: {message}",
+                model.as_str()
+            );
+            crate::notify::show(crate::notify::Kind::Info, "dictate", message);
+            return;
+        }
+        if model == self.settings.model {
+            return;
+        }
+        if self.current_mode() != crate::config::Mode::Live && self.loaded_asr_model == Some(model)
+        {
+            self.complete_switch(SwitchTarget::SpeechModel(model));
+            return;
+        }
+        self.begin_switch(SwitchTarget::SpeechModel(model));
+    }
+
+    /// Start a background model switch: optionally download the target's
+    /// missing files, then load it and hand it to the worker (or, for a
+    /// speech-model switch while Live is active, only save it).
+    fn begin_switch(&mut self, target: SwitchTarget) {
+        let download_first = switch_needs_download(target);
+        self.mode_switch = Some(ModelSwitch {
+            target,
+            downloading: download_first,
         });
         self.sync_tray();
         let previous = self.settings.mode;
+        let in_live = self.current_mode() == crate::config::Mode::Live;
         let to_worker = self.to_worker.clone();
         let proxy = self.menu_proxy.clone();
         let progress = Arc::clone(&self.switch_progress);
         std::thread::spawn(move || {
             let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                run_mode_switch_loader(
+                run_model_switch_loader(
                     target,
                     previous,
+                    in_live,
                     download_first,
                     &to_worker,
                     &proxy,
@@ -1128,7 +1190,7 @@ impl DaemonApp {
                 dlog!("error: {message}");
                 crate::notify::show(
                     crate::notify::Kind::Error,
-                    "dictate: could not switch mode",
+                    "dictate: could not switch model",
                     message,
                 );
                 send_switch_failed(&proxy);
@@ -1136,17 +1198,39 @@ impl DaemonApp {
         });
     }
 
-    /// Finish a mode switch once the worker holds the new model: update the
-    /// settings, save, and confirm. The previous mode is untouched on every
-    /// failure path, so reaching here means the switch landed.
-    fn complete_mode_switch(&mut self, target: crate::config::Mode) {
-        self.settings.mode = target;
-        crate::config::refresh_mode(target);
-        self.worker_has_tdt = target != crate::config::Mode::Live;
-        self.live_fallback = false;
+    /// Finish a switch once the worker holds the new model: update the
+    /// settings, save, and confirm. The previous setting is untouched on
+    /// every failure path, so reaching here means the switch landed.
+    fn complete_switch(&mut self, target: SwitchTarget) {
+        match target {
+            SwitchTarget::Mode(mode) => {
+                self.settings.mode = mode;
+                crate::config::refresh_mode(mode);
+                self.loaded_asr_model = if mode == crate::config::Mode::Live {
+                    None
+                } else {
+                    Some(crate::config::speech_model())
+                };
+                self.live_fallback = false;
+                self.report_save_error(crate::config::save(&self.settings));
+                Self::confirm_settings_change(&crate::tray::SettingsChange::Mode(mode), true);
+            }
+            SwitchTarget::SpeechModel(model) => {
+                self.settings.model = model;
+                crate::config::refresh_speech_model(model);
+                self.loaded_asr_model = if self.current_mode() == crate::config::Mode::Live {
+                    None
+                } else {
+                    Some(model)
+                };
+                self.report_save_error(crate::config::save(&self.settings));
+                Self::confirm_settings_change(
+                    &crate::tray::SettingsChange::SpeechModel(model),
+                    true,
+                );
+            }
+        }
         self.mode_switch = None;
-        self.report_save_error(crate::config::save(&self.settings));
-        Self::confirm_settings_change(&crate::tray::SettingsChange::Mode(target), true);
         self.sync_tray();
     }
 
@@ -1383,8 +1467,11 @@ impl DaemonApp {
             settings: &self.settings,
             mics: &self.mics,
             active_mic: self.active_mic.as_deref(),
-            switch_target: self.mode_switch.as_ref().map(ModeSwitch::target),
-            downloading: matches!(self.mode_switch, Some(ModeSwitch::Downloading)),
+            switch_target: self.mode_switch.as_ref().map(|switch| switch.target),
+            downloading: self
+                .mode_switch
+                .as_ref()
+                .is_some_and(|switch| switch.downloading),
             download_percent: progress.percent,
             checking_speed: progress.checking_speed,
             last_speed_check: progress.last_check,
@@ -1456,6 +1543,7 @@ impl DaemonApp {
             PageAction::RefreshMics => self.refresh_microphones(),
             PageAction::RefreshBinds => self.refresh_hyprland_binds(),
             PageAction::SelectMode(mode) => self.switch_mode(mode),
+            PageAction::SelectSpeechModel(model) => self.switch_speech_model(model),
             PageAction::SelectShortcut(display) => self.switch_hotkey(&display),
             PageAction::ToggleSounds => self.flip_sounds(),
             PageAction::ToggleNotifications => self.flip_notifications(),
@@ -1854,8 +1942,8 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
             UserEvent::ModeSwapped => {
                 // One switch at a time; a stale ack with nothing pending is
                 // ignored.
-                if let Some(target) = self.mode_switch.as_ref().map(ModeSwitch::target) {
-                    self.complete_mode_switch(target);
+                if let Some(target) = self.mode_switch.as_ref().map(|switch| switch.target) {
+                    self.complete_switch(target);
                 }
                 self.refresh_settings();
             }
@@ -1874,7 +1962,7 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
     }
 }
 
-/// Milestone percentages notified during a background Live download.
+/// Milestone percentages notified during a background model download.
 const DOWNLOAD_MILESTONES: [u64; 3] = [25, 50, 75];
 
 /// How many of the 25/50/75 milestones `percent` has reached.
@@ -1885,27 +1973,71 @@ fn milestones_reached(percent: u64) -> usize {
         .count()
 }
 
-/// Body of a Live-download progress notification.
-fn live_download_body(percent: u64) -> String {
-    format!("Downloading Live model… {percent}%")
+/// Body of a model-download progress notification, e.g.
+/// `Downloading Live model… 50%` or `Downloading Fluid Speech Mini… 50%`.
+fn download_progress_body(target: SwitchTarget, percent: u64) -> String {
+    format!("Downloading {}… {percent}%", model_download_name(target))
 }
 
-/// Background model load for a Settings-page mode switch: optionally downloads the
-/// Live model first (with progress notifications), loads the target's model
-/// (Live always benchmarks too) and hands it to the transcription worker for
-/// the swap. Exactly one terminal outcome: a `Job::Swap*` sent to the worker
-/// (which acks `UserEvent::ModeSwapped`), or a `UserEvent::ModeSwitchFailed`
-/// after logging + notifying the specific failure. The previous mode is kept
-/// on every failure; nothing is saved.
-fn run_mode_switch_loader(
-    target: crate::config::Mode,
+/// Human name of the model a switch downloads: the Live model or Fluid
+/// Speech Mini (only those two need a download).
+fn model_download_name(target: SwitchTarget) -> &'static str {
+    match target {
+        SwitchTarget::Mode(crate::config::Mode::Live) => "Live model",
+        _ => crate::config::SpeechModel::Fluid.display_name(),
+    }
+}
+
+/// Whether a switch must download the target's model before loading it. Live
+/// and Fluid have their own files; the Standard model is part of
+/// `dictate download`.
+fn switch_needs_download(target: SwitchTarget) -> bool {
+    match target {
+        SwitchTarget::Mode(crate::config::Mode::Live) => {
+            crate::model::live_model_dir_checked().is_err()
+        }
+        SwitchTarget::Mode(crate::config::Mode::Whole | crate::config::Mode::Pauses) => {
+            match crate::config::speech_model() {
+                crate::config::SpeechModel::Standard => false,
+                crate::config::SpeechModel::Fluid => {
+                    crate::model::fluid_model_dir_checked().is_err()
+                }
+            }
+        }
+        SwitchTarget::SpeechModel(crate::config::SpeechModel::Standard) => false,
+        SwitchTarget::SpeechModel(crate::config::SpeechModel::Fluid) => {
+            crate::model::fluid_model_dir_checked().is_err()
+        }
+    }
+}
+
+/// Background model load for a Settings-page switch: optionally downloads the
+/// target's model first (with progress notifications), loads it (Live always
+/// benchmarks too) and hands it to the transcription worker for the swap. A
+/// speech-model switch while Live runs only saves the choice, since Live has
+/// its own model. Exactly one terminal outcome: a `Job::Swap*` sent to the
+/// worker (which acks `UserEvent::ModeSwapped`), a `UserEvent::ModeSwapped`
+/// sent directly, or a `UserEvent::ModeSwitchFailed` after logging + notifying
+/// the specific failure. The previous setting is kept on every failure;
+/// nothing is saved.
+fn run_model_switch_loader(
+    target: SwitchTarget,
     previous: crate::config::Mode,
+    in_live: bool,
     download_first: bool,
     to_worker: &mpsc::Sender<Job>,
     proxy: &EventLoopProxy<UserEvent>,
     progress: &Mutex<SwitchProgress>,
 ) {
-    if download_first && download_live_for_switch(proxy, progress).is_err() {
+    if download_first && download_for_switch(target, proxy, progress).is_err() {
+        return;
+    }
+    // Live keeps its own model while the Whole/Pauses choice changes: only
+    // the saved setting needs to land.
+    if in_live && target.speech_model().is_some() {
+        if proxy.send_event(UserEvent::ModeSwapped).is_err() {
+            // The event loop is closed; the daemon is shutting down.
+        }
         return;
     }
     let swap = match load_switch_model(target, previous, proxy, progress) {
@@ -1924,17 +2056,19 @@ fn run_mode_switch_loader(
     // Else the worker acks `ModeSwapped` once the swap lands.
 }
 
-/// Download the Live model for a Settings-page switch, notifying at 25/50/75% (each
-/// milestone replaces the previous one). Milestones already passed by
-/// present files don't notify: only this download's progress does. A failure
-/// is logged + notified with the real error and fails the switch.
-fn download_live_for_switch(
+/// Download the target's missing model files for a Settings-page switch,
+/// notifying at 25/50/75% (each milestone replaces the previous one).
+/// Milestones already passed by present files don't notify: only this
+/// download's progress does. A failure is logged + notified with the real
+/// error and fails the switch.
+fn download_for_switch(
+    target: SwitchTarget,
     proxy: &EventLoopProxy<UserEvent>,
     progress: &Mutex<SwitchProgress>,
 ) -> Result<(), ()> {
     lock_progress(progress).percent = 0;
     let mut sent: Option<usize> = None;
-    let result = crate::model::download_live_files_with_progress(|downloaded, total| {
+    let mut on_progress = |downloaded: u64, total: u64| {
         let percent = downloaded * 100 / total.max(1);
         lock_progress(progress).percent = percent.min(100);
         let reached = milestones_reached(percent);
@@ -1945,12 +2079,18 @@ fn download_live_for_switch(
         while *sent < reached {
             let milestone = DOWNLOAD_MILESTONES[*sent];
             *sent += 1;
-            crate::notify::show_progress(&live_download_body(milestone));
+            crate::notify::show_progress(&download_progress_body(target, milestone));
         }
         if *sent != before {
             send_settings_refresh(proxy);
         }
-    });
+    };
+    let result = match target {
+        SwitchTarget::Mode(crate::config::Mode::Live) => {
+            crate::model::download_live_files_with_progress(&mut on_progress)
+        }
+        _ => crate::model::download_fluid_files_with_progress(&mut on_progress),
+    };
     match result {
         Ok(()) => {
             lock_progress(progress).percent = 100;
@@ -1958,11 +2098,12 @@ fn download_live_for_switch(
             Ok(())
         }
         Err(err) => {
+            let name = model_download_name(target);
             let message = format!("{err:#}");
-            dlog!("error: dictate: Live download failed: {message}");
+            dlog!("error: dictate: {name} download failed: {message}");
             crate::notify::show(
                 crate::notify::Kind::Error,
-                "dictate: Live download failed",
+                &format!("dictate: {name} download failed"),
                 &message,
             );
             send_switch_failed(proxy);
@@ -1971,28 +2112,35 @@ fn download_live_for_switch(
     }
 }
 
-/// Load the target's model for a mode switch, as the swap job to send. Live
-/// always runs the speed gate; failures are already logged + notified.
+/// Load the target's model for a switch, as the swap job to send. Live always
+/// runs the speed gate; failures are already logged + notified.
 fn load_switch_model(
-    target: crate::config::Mode,
+    target: SwitchTarget,
     previous: crate::config::Mode,
     proxy: &EventLoopProxy<UserEvent>,
     progress: &Mutex<SwitchProgress>,
 ) -> Result<Job, ()> {
     match target {
-        crate::config::Mode::Live => {
+        SwitchTarget::Mode(crate::config::Mode::Live) => {
             load_live_for_switch(previous, proxy, progress).map(Job::SwapLive)
         }
-        crate::config::Mode::Whole | crate::config::Mode::Pauses => {
-            load_tdt_for_switch().map(Job::SwapTdt)
+        SwitchTarget::Mode(crate::config::Mode::Whole | crate::config::Mode::Pauses) => {
+            load_asr_for_switch(crate::config::speech_model()).map(Job::SwapAsr)
         }
+        SwitchTarget::SpeechModel(model) => load_asr_for_switch(model).map(Job::SwapAsr),
     }
 }
 
-/// Load the TDT model for a switch to whole/pauses mode. Failures are logged
-/// + notified with the real error (a missing model names `dictate download`).
-fn load_tdt_for_switch() -> Result<crate::asr::Asr, ()> {
-    let loaded = crate::model::model_dir_checked().and_then(|dir| crate::asr::Asr::load(&dir));
+/// Load one Whole/Pauses speech model. Failures are logged + notified with
+/// the real error (a missing model names its `dictate download` command).
+fn load_asr_for_switch(model: crate::config::SpeechModel) -> Result<crate::asr::Asr, ()> {
+    let loaded = match model {
+        crate::config::SpeechModel::Standard => {
+            crate::model::model_dir_checked().and_then(|dir| crate::asr::Asr::load(&dir))
+        }
+        crate::config::SpeechModel::Fluid => crate::model::fluid_model_dir_checked()
+            .and_then(|dir| crate::asr::Asr::load_fluid(&dir)),
+    };
     match loaded {
         Ok(asr) => Ok(asr),
         Err(err) => {
@@ -2044,14 +2192,14 @@ fn load_live_for_switch(
     Err(())
 }
 
-/// Log + notify a mode-switch load failure with the real error. The previous
-/// mode is kept and nothing is saved.
+/// Log + notify a model-switch load failure with the real error. The previous
+/// setting is kept and nothing is saved.
 fn switch_load_failed(err: anyhow::Error) {
     let message = format!("{err:#}");
-    dlog!("error: dictate: could not switch mode: {message}");
+    dlog!("error: dictate: could not switch model: {message}");
     crate::notify::show(
         crate::notify::Kind::Error,
-        "dictate: could not switch mode",
+        "dictate: could not switch model",
         &message,
     );
 }
@@ -2494,18 +2642,17 @@ impl LiveRun {
     }
 }
 
-/// The TDT model, loading it on first need (the tray can switch a live
-/// daemon to pauses without a restart).
-fn ensure_tdt(models: &mut WorkerModels) -> anyhow::Result<&mut crate::asr::Asr> {
-    if models.tdt.is_none() {
-        let dir = crate::model::model_dir_checked()?;
+/// The Whole/Pauses speech model, loading it on first need (the tray can
+/// switch a live daemon to pauses without a restart).
+fn ensure_asr(models: &mut WorkerModels) -> anyhow::Result<&mut crate::asr::Asr> {
+    if models.asr.is_none() {
         let start = Instant::now();
-        let asr = crate::asr::Asr::load(&dir)?;
+        let asr = crate::asr::Asr::load_configured()?;
         dlog!("model loaded in {} ms", start.elapsed().as_millis());
-        models.tdt = Some(asr);
+        models.asr = Some(asr);
     }
     models
-        .tdt
+        .asr
         .as_mut()
         .ok_or_else(|| anyhow::anyhow!("Internal error: speech model missing after load"))
 }
@@ -2572,7 +2719,7 @@ fn transcribe_worker(
         }
         match job {
             Job::Full(samples) => {
-                match ensure_tdt(&mut models) {
+                match ensure_asr(&mut models) {
                     Ok(asr) => transcribe_full(&samples, asr, typer.as_mut()),
                     Err(err) => {
                         dlog!("error: {err:#}");
@@ -2592,7 +2739,7 @@ fn transcribe_worker(
                 let seq = segments;
                 let seconds = segment.audio.len() as f32 / 16_000.0;
                 let context_s = segment.context.len() as f32 / 16_000.0;
-                let asr = match ensure_tdt(&mut models) {
+                let asr = match ensure_asr(&mut models) {
                     Ok(asr) => asr,
                     Err(err) => {
                         dlog!("error: {err:#}");
@@ -2839,8 +2986,8 @@ fn transcribe_worker(
                     break;
                 }
             }
-            Job::SwapTdt(model) => {
-                models.tdt = Some(model);
+            Job::SwapAsr(model) => {
+                models.asr = Some(model);
                 models.live = None;
                 if proxy.send_event(UserEvent::ModeSwapped).is_err() {
                     break;
@@ -2848,7 +2995,7 @@ fn transcribe_worker(
             }
             Job::SwapLive(model) => {
                 models.live = Some(model);
-                models.tdt = None;
+                models.asr = None;
                 if proxy.send_event(UserEvent::ModeSwapped).is_err() {
                     break;
                 }
@@ -3151,9 +3298,24 @@ mod tests {
 
     #[test]
     fn download_progress_body_names_the_milestone() {
-        assert_eq!(live_download_body(25), "Downloading Live model… 25%");
-        assert_eq!(live_download_body(50), "Downloading Live model… 50%");
-        assert_eq!(live_download_body(75), "Downloading Live model… 75%");
+        let live = SwitchTarget::Mode(crate::config::Mode::Live);
+        assert_eq!(
+            download_progress_body(live, 25),
+            "Downloading Live model… 25%"
+        );
+        assert_eq!(
+            download_progress_body(live, 50),
+            "Downloading Live model… 50%"
+        );
+        assert_eq!(
+            download_progress_body(live, 75),
+            "Downloading Live model… 75%"
+        );
+        let fluid = SwitchTarget::SpeechModel(crate::config::SpeechModel::Fluid);
+        assert_eq!(
+            download_progress_body(fluid, 50),
+            "Downloading Fluid Speech Mini… 50%"
+        );
     }
 
     #[test]
