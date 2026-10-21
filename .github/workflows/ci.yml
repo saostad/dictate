@@ -193,7 +193,7 @@ jobs:
             echo "  LICENSE-onnxruntime (MIT, Microsoft)"
           fi
           tar -czf "$ASSET.tar.gz" "$ASSET"
-      - name: Package archive (Windows)
+      - name: Stage installer files (Windows)
         if: runner.os == 'Windows'
         run: |
           $asset = "${{ matrix.asset }}"
@@ -212,7 +212,13 @@ jobs:
           } else {
             Write-Output "  (none)"
           }
-          Compress-Archive -Path $asset -DestinationPath "$asset.zip"
+      - name: Build installer (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $iscc = "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) { choco install innosetup -y --no-progress }
+          & $iscc "/DAppVersion=${{ needs.version.outputs.version }}" "/DSourceDir=$PWD\${{ matrix.asset }}" "/DOutputDir=$PWD" packaging\windows\dictate.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Write checksum (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -221,7 +227,7 @@ jobs:
       - name: Write checksum (Windows)
         if: runner.os == 'Windows'
         run: |
-          $archive = "${{ matrix.asset }}.zip"
+          $archive = "${{ matrix.asset }}-setup.exe"
           $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
           "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
           Get-Content "$archive.sha256"
@@ -242,18 +248,19 @@ jobs:
             echo "transcription check failed: expected 'ask not what your country' in stdout"
             exit 1
           }
-      - name: Check packaged binary transcribes (Windows)
+      - name: Check installed app transcribes (Windows)
         if: runner.os == 'Windows'
         run: |
-          $target = "${{ matrix.target }}"
-          Remove-Item -Recurse -Force e2e-check -ErrorAction SilentlyContinue
-          New-Item -ItemType Directory -Path e2e-check | Out-Null
-          Expand-Archive -Path "${{ matrix.asset }}.zip" -DestinationPath e2e-check
-          $out = & ".\e2e-check\${{ matrix.asset }}\dictate.exe" transcribe tests/fixtures/jfk.wav
+          $dir = "$env:RUNNER_TEMP\dictate-installed"
+          $setup = Start-Process -Wait -PassThru -FilePath ".\${{ matrix.asset }}-setup.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES", "/CURRENTUSER", "/MERGETASKS=!autostart", "/DIR=$dir"
+          if ($setup.ExitCode -ne 0) { Write-Error "installer exited with $($setup.ExitCode)"; exit 1 }
+          $out = & "$dir\dictate.exe" transcribe tests/fixtures/jfk.wav
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           echo $out
           $lower = ($out | Out-String).ToLower()
           if ($lower -notmatch "ask not what your country") { Write-Error "transcription check failed: expected 'ask not what your country' in stdout"; exit 1 }
+          $uninstall = Start-Process -Wait -PassThru -FilePath "$dir\unins000.exe" -ArgumentList "/VERYSILENT", "/SUPPRESSMSGBOXES"
+          if ($uninstall.ExitCode -ne 0) { Write-Error "uninstaller exited with $($uninstall.ExitCode)"; exit 1 }
       # Runs the binary that ships; compiling tests would rebuild every dependency,
       # since the release profile aborts on panic and the test harness cannot.
       - name: Transcribe real clips with every model
@@ -281,8 +288,8 @@ jobs:
           retention-days: 1
           name: ${{ matrix.asset }}
           path: |
-            ${{ matrix.asset }}.zip
-            ${{ matrix.asset }}.zip.sha256
+            ${{ matrix.asset }}-setup.exe
+            ${{ matrix.asset }}-setup.exe.sha256
 
   release:
     permissions:
@@ -346,8 +353,8 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
-            dist/*.zip
-            dist/*.zip.sha256
+            dist/*-setup.exe
+            dist/*-setup.exe.sha256
           generate_release_notes: true
           body: |
             ## Which file do I download?
@@ -357,13 +364,17 @@ jobs:
             | Linux, x86_64 (most PCs) | `dictate-linux-x86_64.tar.gz` (works on any x86_64 CPU, no ONNX Runtime install needed) |
             | Linux, aarch64 | `dictate-linux-aarch64.tar.gz` |
             | macOS, Apple Silicon | `dictate-macos-aarch64.tar.gz` |
-            | Windows, x86_64 | `dictate-windows-x86_64.zip` |
+            | Windows, x86_64 | `dictate-windows-x86_64-setup.exe` (installer) |
 
             There is no Intel macOS build (ONNX Runtime ships no prebuilt library for it).
 
             The Linux binaries need glibc 2.39+ (Ubuntu 24.04+, Fedora 40+, Arch).
 
             ## First run
+
+            **Windows:** run `dictate-windows-x86_64-setup.exe`. It downloads the speech model (~660 MB), adds Dictate to the Start menu, and starts it in the system tray. The installer isn't code-signed, so SmartScreen may warn: click More info → Run anyway.
+
+            **Linux and macOS:**
 
             1. Unpack the archive.
             2. `dictate download` — downloads the speech model (~660 MB).

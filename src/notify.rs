@@ -107,10 +107,9 @@ fn show_progress_blocking(body: &str) -> anyhow::Result<()> {
 }
 
 /// Show a desktop notification on the calling thread, unless disabled.
-/// For short-lived processes (the client commands) that would exit before a
-/// spawned thread delivers the message. Failures warn once per process.
-/// Unix-only: the only caller is the `#[cfg(unix)]` socket client.
-#[cfg(unix)]
+/// For short-lived processes (the client commands, a daemon that exits at
+/// start) that would exit before a spawned thread delivers the message.
+/// Failures warn once per process.
 pub(crate) fn show_now(kind: Kind, summary: &str, body: &str) {
     if !enabled_now() {
         return;

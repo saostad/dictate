@@ -25,11 +25,17 @@ Or download the archive for your OS from
 | Linux | x86_64 | `dictate-linux-x86_64.tar.gz` (works on any x86_64 CPU, no ONNX Runtime install needed) |
 | Linux | aarch64 | `dictate-linux-aarch64.tar.gz` |
 | macOS | Apple Silicon | `dictate-macos-aarch64.tar.gz` |
-| Windows | x86_64 | `dictate-windows-x86_64.zip` |
+| Windows | x86_64 | `dictate-windows-x86_64-setup.exe` (installer) |
 
 There is no Intel macOS build (ONNX Runtime ships no prebuilt library for it).
 
 The Linux binaries need glibc 2.39+ (Ubuntu 24.04+, Fedora 40+, Arch).
+
+On Windows, run the installer. It downloads the speech model (~660 MB),
+adds Dictate to the Start menu, optionally starts it when you sign in, and
+starts it in the system tray. Uninstall it from Settings → Apps.
+
+On Linux and macOS:
 
 1. Unpack the archive:
 
@@ -37,9 +43,6 @@ The Linux binaries need glibc 2.39+ (Ubuntu 24.04+, Fedora 40+, Arch).
    tar -xzf dictate-linux-x86_64.tar.gz
    cd dictate-linux-x86_64
    ```
-
-   On Windows, right-click → Extract All (or
-   `Expand-Archive dictate-windows-x86_64.zip .` in PowerShell).
 
 2. Download the speech model (~660 MB):
 
@@ -85,7 +88,7 @@ System Settings → General → Login Items to start it at login.
 
 ### Windows notes
 
-On first run, SmartScreen may warn about the unsigned binary: click
+The installer is not code-signed, so SmartScreen may warn about it: click
 "More info → Run anyway". Socket control commands (`dictate toggle`,
 `start`/`stop`) are not available on Windows yet — dictate with the
 global hotkey (Ctrl+Shift+Space by default).

@@ -406,6 +406,14 @@ pub(crate) fn run_daemon(background: bool) -> anyhow::Result<()> {
     repair_autostart();
     run_daemon_inner().map_err(|err| {
         mirror_to_log(&format!("error: {err:#}"));
+        // A background launch (login, Start menu) has no console to show it.
+        if background {
+            crate::notify::show_now(
+                crate::notify::Kind::Error,
+                "dictate could not start",
+                &format!("{err:#}"),
+            );
+        }
         err
     })
 }
@@ -426,10 +434,31 @@ fn detach_console(background: bool) {
 #[cfg(not(target_os = "windows"))]
 fn detach_console(_background: bool) {}
 
+/// Whether this is the only daemon in the session (Windows). Holds a named
+/// mutex for the life of the process; a second launch (Start menu while the
+/// login launch runs) finds it taken. A failure to check counts as only.
+#[cfg(target_os = "windows")]
+fn first_daemon_instance() -> bool {
+    const ERROR_ALREADY_EXISTS: u32 = 183;
+    let name: Vec<u16> = "Local\\dictate-daemon\0".encode_utf16().collect();
+    // SAFETY: `name` is a NUL-terminated UTF-16 string that outlives the call;
+    // null attributes are allowed. The handle is deliberately never closed, so
+    // the mutex lives as long as this process.
+    let handle = unsafe { CreateMutexW(std::ptr::null(), 0, name.as_ptr()) };
+    // SAFETY: GetLastError has no preconditions.
+    !handle.is_null() && unsafe { GetLastError() } != ERROR_ALREADY_EXISTS
+}
+
 #[cfg(target_os = "windows")]
 #[link(name = "kernel32")]
 unsafe extern "system" {
     fn FreeConsole() -> i32;
+    fn CreateMutexW(
+        attributes: *const std::ffi::c_void,
+        initial_owner: i32,
+        name: *const u16,
+    ) -> *mut std::ffi::c_void;
+    fn GetLastError() -> u32;
 }
 
 /// Self-repair: when start-at-login is on but the entry points at a different
@@ -461,6 +490,16 @@ fn run_daemon_inner() -> anyhow::Result<()> {
             "dictate: settings file has an error",
             &message,
         );
+    }
+    #[cfg(target_os = "windows")]
+    if !first_daemon_instance() {
+        dlog!("dictate is already running; exiting");
+        crate::notify::show_now(
+            crate::notify::Kind::Info,
+            "dictate is already running",
+            "Use its icon in the system tray.",
+        );
+        return Ok(());
     }
     // Env wins; an unset or empty DICTATE_HOTKEY falls back to the file.
     let mac = cfg!(target_os = "macos");
