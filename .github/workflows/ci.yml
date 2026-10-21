@@ -1,11 +1,61 @@
 name: ci
 
+# Every push builds and tests each platform's release binary once. On main, that
+# binary is built with the next version (scripts/next-version.sh), and when every
+# job passes it is tagged, pushed, and published as the release.
 on:
   push:
   pull_request:
+  workflow_dispatch:
+
+# A newer push to main cancels an unfinished one; its release includes the same commits.
+concurrency:
+  group: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' && 'ci-main' || format('ci-{0}', github.run_id) }}
+  cancel-in-progress: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  version:
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      sha: ${{ steps.version.outputs.sha }}
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Choose the version
+        id: version
+        run: |
+          set -eu
+          CURRENT="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF" = refs/heads/main ]; then
+            VERSION="$(sh scripts/next-version.sh)"
+            RELEASE=main
+            if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null; then
+              echo "Tag v$VERSION already exists"
+              exit 1
+            fi
+            echo "Releasing v$VERSION (was $CURRENT)"
+          elif [ "$GITHUB_EVENT_NAME" = push ] && [ "$GITHUB_REF_TYPE" = tag ] && [ "${GITHUB_REF_NAME#v}" != "$GITHUB_REF_NAME" ]; then
+            VERSION="$CURRENT"
+            RELEASE=tag
+            if [ "$GITHUB_REF_NAME" != "v$VERSION" ]; then
+              echo "Tag $GITHUB_REF_NAME does not match Cargo.toml version $VERSION"
+              exit 1
+            fi
+          else
+            VERSION="$CURRENT"
+            RELEASE=none
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "release=$RELEASE" >> "$GITHUB_OUTPUT"
+
+  check:
     strategy:
       fail-fast: false
       matrix:
@@ -30,21 +80,47 @@ jobs:
         if: runner.os == 'Linux'
         run: cargo clippy --all-targets --no-default-features --features system-ort -- -D warnings && cargo test --no-default-features --features system-ort
 
-  e2e:
+  build:
+    needs: version
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, ubuntu-24.04-arm, macos-latest, windows-latest]
+        include:
+          - asset: dictate-linux-x86_64
+            os: ubuntu-24.04
+            target: x86_64-unknown-linux-gnu
+            flags: --no-default-features --features system-ort
+          - asset: dictate-linux-aarch64
+            os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            flags: ""
+          - asset: dictate-macos-aarch64
+            os: macos-latest
+            target: aarch64-apple-darwin
+            flags: ""
+          - asset: dictate-windows-x86_64
+            os: windows-latest
+            target: x86_64-pc-windows-msvc
+            flags: ""
     runs-on: ${{ matrix.os }}
     env:
       DICTATE_MODEL_DIR: ${{ github.workspace }}/.model
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+      - name: Set the release version
+        shell: bash
+        run: sh scripts/set-version.sh "${{ needs.version.outputs.version }}"
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
       - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
+        with:
+          key: release-${{ matrix.asset }}
       - uses: actions/cache@v4
         with:
           path: .model
@@ -57,11 +133,248 @@ jobs:
         with:
           path: fluid-speech-mini-onnx
           key: fluid-speech-mini-onnx-fc59262
-      - name: Download model
-        run: cargo run --release -- download
-      - name: Download Live model
-        run: cargo run --release -- download --live
-      - name: Download Fluid Speech Mini model
-        run: cargo run --release -- download --fluid
-      - name: Transcribe real clip
-        run: cargo test --release -- --ignored --nocapture
+      - name: Download ONNX Runtime (Linux x86_64)
+        if: matrix.asset == 'dictate-linux-x86_64'
+        run: |
+          set -eu
+          URL="https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz"
+          EXPECTED="cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57"
+          curl -fsSL -o /tmp/ort.tgz "$URL"
+          ACTUAL="$(shasum -a 256 /tmp/ort.tgz | awk '{print $1}')"
+          if [ "$ACTUAL" != "$EXPECTED" ]; then
+            echo "SHA256 mismatch for $URL: expected $EXPECTED, got $ACTUAL"
+            exit 1
+          fi
+          mkdir -p /tmp/ort
+          tar -xzf /tmp/ort.tgz -C /tmp/ort
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.flags }}
+      - name: Smoke test (Unix)
+        if: runner.os != 'Windows'
+        run: ./target/${{ matrix.target }}/release/dictate help
+      - name: Smoke test (Windows)
+        if: runner.os == 'Windows'
+        run: .\target\${{ matrix.target }}\release\dictate.exe help
+      - name: Download models
+        shell: bash
+        run: |
+          set -eu
+          BIN=./target/${{ matrix.target }}/release/dictate
+          "$BIN" download
+          "$BIN" download --live
+          "$BIN" download --fluid
+      - name: Show linked libraries (Linux bundled builds)
+        if: runner.os == 'Linux' && matrix.asset != 'dictate-linux-x86_64'
+        run: ldd target/${{ matrix.target }}/release/dictate
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -eu
+          ASSET="${{ matrix.asset }}"
+          TARGET="${{ matrix.target }}"
+          mkdir -p "$ASSET"
+          cp "target/$TARGET/release/dictate" "$ASSET/"
+          cp README.md LICENSE "$ASSET/"
+          echo "Bundled runtime libraries:"
+          found=0
+          for f in "target/$TARGET/release/"*.dll "target/$TARGET/release/"*.dylib "target/$TARGET/release/"*.so*; do
+            [ -e "$f" ] || continue
+            cp "$f" "$ASSET/"
+            echo "  $(basename "$f")"
+            found=1
+          done
+          if [ "$found" = 0 ]; then
+            echo "  (none)"
+          fi
+          if [ "$ASSET" = "dictate-linux-x86_64" ]; then
+            cp /tmp/ort/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so.1.31.0 "$ASSET/libonnxruntime.so"
+            cp /tmp/ort/onnxruntime-linux-x64-1.31.0/LICENSE "$ASSET/LICENSE-onnxruntime"
+            echo "  libonnxruntime.so (from Microsoft onnxruntime-linux-x64-1.31.0)"
+            echo "  LICENSE-onnxruntime (MIT, Microsoft)"
+          fi
+          tar -czf "$ASSET.tar.gz" "$ASSET"
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $asset = "${{ matrix.asset }}"
+          $target = "${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $asset | Out-Null
+          Copy-Item "target\$target\release\dictate.exe" "$asset\"
+          Copy-Item "README.md" "$asset\"
+          Copy-Item "LICENSE" "$asset\"
+          Write-Output "Bundled runtime libraries:"
+          $libs = Get-ChildItem "target\$target\release" -File | Where-Object { $_.Name -match '\.(dll|dylib|so(\..*)?)$' }
+          if ($libs) {
+            foreach ($lib in $libs) {
+              Copy-Item $lib.FullName "$asset\"
+              Write-Output ("  " + $lib.Name)
+            }
+          } else {
+            Write-Output "  (none)"
+          }
+          Compress-Archive -Path $asset -DestinationPath "$asset.zip"
+      - name: Write checksum (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          shasum -a 256 "${{ matrix.asset }}.tar.gz" > "${{ matrix.asset }}.tar.gz.sha256"
+          cat "${{ matrix.asset }}.tar.gz.sha256"
+      - name: Write checksum (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $archive = "${{ matrix.asset }}.zip"
+          $hash = (Get-FileHash $archive -Algorithm SHA256).Hash.ToLower()
+          "$hash  $archive" | Out-File -Encoding ascii "$archive.sha256"
+          Get-Content "$archive.sha256"
+      - name: Check packaged binary transcribes (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          set -eu
+          ASSET="${{ matrix.asset }}"
+          rm -rf e2e-check
+          mkdir e2e-check
+          tar -xzf "$ASSET.tar.gz" -C e2e-check
+          if [ "$ASSET" = "dictate-linux-x86_64" ]; then
+            unset ORT_DYLIB_PATH
+          fi
+          OUT="$(./e2e-check/"$ASSET"/dictate transcribe tests/fixtures/jfk.wav)"
+          echo "$OUT"
+          echo "$OUT" | tr '[:upper:]' '[:lower:]' | grep -q "ask not what your country" || {
+            echo "transcription check failed: expected 'ask not what your country' in stdout"
+            exit 1
+          }
+      - name: Check packaged binary transcribes (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          $target = "${{ matrix.target }}"
+          Remove-Item -Recurse -Force e2e-check -ErrorAction SilentlyContinue
+          New-Item -ItemType Directory -Path e2e-check | Out-Null
+          Expand-Archive -Path "${{ matrix.asset }}.zip" -DestinationPath e2e-check
+          $out = & ".\e2e-check\${{ matrix.asset }}\dictate.exe" transcribe tests/fixtures/jfk.wav
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          echo $out
+          $lower = ($out | Out-String).ToLower()
+          if ($lower -notmatch "ask not what your country") { Write-Error "transcription check failed: expected 'ask not what your country' in stdout"; exit 1 }
+      - name: Transcribe real clips with every model
+        shell: bash
+        run: |
+          set -eu
+          if [ "${{ matrix.asset }}" = "dictate-linux-x86_64" ]; then
+            export ORT_DYLIB_PATH=/tmp/ort/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so.1.31.0
+          fi
+          cargo test --release --locked --target ${{ matrix.target }} ${{ matrix.flags }} -- --ignored --nocapture
+      - uses: actions/upload-artifact@v4
+        if: needs.version.outputs.release != 'none' && runner.os != 'Windows'
+        with:
+          retention-days: 1
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}.tar.gz
+            ${{ matrix.asset }}.tar.gz.sha256
+      - uses: actions/upload-artifact@v4
+        if: needs.version.outputs.release != 'none' && runner.os == 'Windows'
+        with:
+          retention-days: 1
+          name: ${{ matrix.asset }}
+          path: |
+            ${{ matrix.asset }}.zip
+            ${{ matrix.asset }}.zip.sha256
+
+  release:
+    permissions:
+      contents: write
+      actions: write
+    needs: [version, check, build]
+    if: needs.version.outputs.release != 'none'
+    runs-on: ubuntu-latest
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        if: needs.version.outputs.release == 'main'
+        with:
+          ref: ${{ needs.version.outputs.sha }}
+          fetch-depth: 0
+      - name: Commit, tag, and push the release version
+        id: tag
+        if: needs.version.outputs.release == 'main'
+        run: |
+          set -eu
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          sh scripts/set-version.sh "$VERSION"
+          git commit -qam "chore: release v$VERSION [skip ci]"
+          git tag "v$VERSION"
+          if git push --atomic origin HEAD:refs/heads/main "refs/tags/v$VERSION"; then
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # main moved while building. A newer push cancels this run and releases these
+          # commits too, but [skip ci] commits never run ci, so release on top of those.
+          git fetch -q origin main
+          RUNS_CI=false
+          for c in $(git rev-list "${{ needs.version.outputs.sha }}..origin/main"); do
+            if ! git log -1 --format=%B "$c" | grep -qiE '\[(skip ci|ci skip|no ci|skip actions|actions skip)\]'; then
+              RUNS_CI=true
+            fi
+          done
+          if [ "$RUNS_CI" = true ]; then
+            echo "::notice::main has newer commits; their release will include these."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git rebase -q origin/main
+          git tag -f "v$VERSION"
+          git push --atomic origin HEAD:refs/heads/main "refs/tags/v$VERSION"
+          echo "publish=true" >> "$GITHUB_OUTPUT"
+      - uses: actions/download-artifact@v4
+        if: steps.tag.outputs.publish != 'false'
+        with:
+          merge-multiple: true
+          path: dist
+      - name: List artifacts
+        if: steps.tag.outputs.publish != 'false'
+        run: ls -la dist
+      - uses: softprops/action-gh-release@v2
+        if: steps.tag.outputs.publish != 'false'
+        with:
+          tag_name: v${{ env.VERSION }}
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+            dist/*.zip
+            dist/*.zip.sha256
+          generate_release_notes: true
+          body: |
+            ## Which file do I download?
+
+            | Your system | File |
+            |---|---|
+            | Linux, x86_64 (most PCs) | `dictate-linux-x86_64.tar.gz` (works on any x86_64 CPU, no ONNX Runtime install needed) |
+            | Linux, aarch64 | `dictate-linux-aarch64.tar.gz` |
+            | macOS, Apple Silicon | `dictate-macos-aarch64.tar.gz` |
+            | Windows, x86_64 | `dictate-windows-x86_64.zip` |
+
+            There is no Intel macOS build (ONNX Runtime ships no prebuilt library for it).
+
+            The Linux binaries need glibc 2.39+ (Ubuntu 24.04+, Fedora 40+, Arch).
+
+            ## First run
+
+            1. Unpack the archive.
+            2. `dictate download` — downloads the speech model (~660 MB).
+            3. `dictate daemon` — keeps the model loaded; see the README for hotkeys and key binds.
+
+            Verify downloads with `shasum -a 256 -c <file>.sha256` (Linux/macOS).
+
+      - name: Remove temporary artifacts after publishing the release
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8
+        with:
+          script: |
+            const {owner, repo} = context.repo;
+            const artifacts = await github.paginate(github.rest.actions.listWorkflowRunArtifacts, {
+              owner, repo, run_id: context.runId, per_page: 100
+            });
+            for (const artifact of artifacts) {
+              core.info(`Delete published build handoff ${artifact.name} (${artifact.id})`);
+              await github.rest.actions.deleteArtifact({owner, repo, artifact_id: artifact.id});
+            }

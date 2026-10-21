@@ -3,7 +3,7 @@ name: Storage cleanup
 # No checkout: workflow_run has write access, so never execute pull-request code.
 on:
   workflow_run:
-    workflows: ["ci", "release"]
+    workflows: ["ci"]
     types: [completed]
   schedule:
     - cron: '23 7 * * *'
