@@ -1,0 +1,20 @@
+LibriSpeech test-clean excerpts used by Dictate's model benchmark
+====================================================================
+
+Corpus: LibriSpeech test-clean: fixed six-speaker subset
+Source: OpenSLR LibriSpeech, https://www.openslr.org/12/
+Hugging Face dataset: openslr/librispeech_asr (config clean, split test)
+Pinned dataset revision: 71cacbfb7e2354c4226d01e70d77d5fca3d04ba1
+Selected rows: 0, 2, 250, 254, 501, 502, 750, 751, 1000, 1001, 1502, 1503
+License: CC-BY-4.0 (Creative Commons Attribution 4.0 International)
+https://creativecommons.org/licenses/by/4.0/
+
+LibriSpeech is based on public-domain LibriVox audio books and was introduced
+in "LibriSpeech: An ASR corpus based on public domain audio books" by Vassil
+Panayotov, Guoguo Chen, Daniel Povey and Sanjeev Khudanpur (ICASSP 2015).
+
+The selected audio and reference transcripts remain subject to CC BY 4.0.
+The manifest pins each source FLAC SHA-256 and the canonical 16 kHz mono PCM16
+WAV SHA-256. Selection is two 3-12 second clips from each of six speakers
+(three male, three female), at fixed dataset rows; it is a small read-English
+sample and is not a conversational, accented, or noisy-speech benchmark.

@@ -544,13 +544,15 @@ pub struct FluidModel {
 }
 
 impl FluidModel {
-    /// Load the model from `dir` with the shared ONNX Runtime environment.
-    pub fn load(dir: &Path) -> anyhow::Result<Self> {
+    /// Load the model with an explicit intra-op thread count. Production
+    /// reaches this through [`Asr::load_fluid`](crate::asr::Asr::load_fluid),
+    /// which supplies the app default; the benchmark needs the same four
+    /// sessions with a measured 1/2-thread setting.
+    pub(crate) fn load_with_threads(dir: &Path, threads: usize) -> anyhow::Result<Self> {
         let config = Config::load(&dir.join("config.json"))?;
         let filters = NpyF32::load(&dir.join("mel_filters.npy"))?;
         let tokenizer = Tokenizer::load(&dir.join("tokenizer.json"), &config)?;
         let env = crate::asr::shared_environment()?;
-        let threads = crate::asr::intra_threads();
         let frontend = open_session(&env, &dir.join("frontend.onnx"), threads)?;
         let encoder = open_session(&env, &dir.join("encoder.onnx"), threads)?;
         let decoder = open_session(&env, &dir.join("decoder.onnx"), 1)?;

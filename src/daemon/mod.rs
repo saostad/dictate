@@ -168,7 +168,20 @@ pub(crate) enum Job {
     /// End of a Live recording: the moment Stop was handled, so the worker
     /// can log latency after release.
     LiveEnd { stop_time: Instant },
-    /// Discard a pauses/Live recording; already-typed text stays.
+    /// Begin a Moonshine recording: discard a stream left open by a failed
+    /// or cancelled recording and reset the per-recording cursor/stats. The
+    /// first chunk then opens a fresh native stream lazily.
+    MoonshineStart,
+    /// 16 kHz audio for Live dictation with Moonshine.
+    MoonshineChunk(Vec<f32>),
+    /// End of a Moonshine recording: duration and the moment Stop was
+    /// handled. The worker stops the stream, types the final phrase, then
+    /// acks `WorkerDone`.
+    MoonshineEnd {
+        total_seconds: f32,
+        stop_time: Instant,
+    },
+    /// Discard a pauses/Live/Moonshine recording; already-typed text stays.
     Cancel,
     /// Swap in a freshly loaded Whole/Pauses speech model (a Settings-page
     /// mode or speech-model switch); drops the Live model, then acks
@@ -177,6 +190,9 @@ pub(crate) enum Job {
     /// Swap in a freshly loaded Live model (a Settings-page switch to live);
     /// drops the Whole/Pauses model, then acks [`UserEvent::ModeSwapped`].
     SwapLive(crate::live::Live),
+    /// Swap in the Moonshine runtime/model (a switch to moonshine); drops the
+    /// other models, then acks [`UserEvent::ModeSwapped`].
+    SwapMoonshine(crate::moonshine::Moonshine),
 }
 
 impl std::fmt::Debug for Job {
@@ -188,9 +204,13 @@ impl std::fmt::Debug for Job {
             Job::End { .. } => "End",
             Job::LiveChunk(_) => "LiveChunk",
             Job::LiveEnd { .. } => "LiveEnd",
+            Job::MoonshineStart => "MoonshineStart",
+            Job::MoonshineChunk(_) => "MoonshineChunk",
+            Job::MoonshineEnd { .. } => "MoonshineEnd",
             Job::Cancel => "Cancel",
             Job::SwapAsr(_) => "SwapAsr",
             Job::SwapLive(_) => "SwapLive",
+            Job::SwapMoonshine(_) => "SwapMoonshine",
         };
         write!(f, "{name}")
     }
@@ -212,6 +232,10 @@ enum FeederSession {
         thread: Option<std::thread::JoinHandle<Option<crate::vad::Vad>>>,
     },
     Live {
+        control_tx: mpsc::Sender<FeederCmd>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    },
+    Moonshine {
         control_tx: mpsc::Sender<FeederCmd>,
         thread: Option<std::thread::JoinHandle<()>>,
     },
@@ -250,6 +274,12 @@ pub(crate) enum UserEvent {
     /// Background mode-switch progress changed; repaint the Settings window
     /// if it is open.
     SettingsRefresh,
+    #[cfg(target_os = "linux")]
+    WaylandShortcut(u64, crate::wayland_shortcut::Event),
+    #[cfg(target_os = "linux")]
+    WaylandShortcutInstalled(String, Result<PathBuf, String>),
+    #[cfg(target_os = "linux")]
+    SetShortcut(String, mpsc::Sender<String>),
 }
 
 /// Progress of a background model switch, shared between the loader thread and
@@ -290,23 +320,8 @@ fn lock_progress(progress: &Mutex<SwitchProgress>) -> MutexGuard<'_, SwitchProgr
         .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
-/// What a Settings-page model switch changes: the dictation mode or the
-/// Whole/Pauses speech model.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum SwitchTarget {
-    Mode(crate::config::Mode),
-    SpeechModel(crate::config::SpeechModel),
-}
-
-impl SwitchTarget {
-    /// The speech model being switched to, if this is a speech-model switch.
-    fn speech_model(self) -> Option<crate::config::SpeechModel> {
-        match self {
-            SwitchTarget::Mode(_) => None,
-            SwitchTarget::SpeechModel(model) => Some(model),
-        }
-    }
-}
+/// A validated mode/model pair, committed only after the worker swaps models.
+pub(crate) type SwitchTarget = crate::config::Selection;
 
 /// A model switch running on a background thread (the event loop stays
 /// responsive). While one is in flight the tray label reads Loading and start
@@ -481,7 +496,25 @@ fn repair_autostart() {
 /// Load the model, bind the socket (Unix), serve commands.
 fn run_daemon_inner() -> anyhow::Result<()> {
     let (file_settings, settings_problem) = crate::config::load();
+    if settings_problem.is_none() {
+        match crate::config::migrate_selection(&file_settings) {
+            Ok(Some(backup)) => dlog!(
+                "Migrated mode/model settings; previous config: {}",
+                backup.display()
+            ),
+            Ok(None) => {}
+            Err(err) => dlog!("Could not migrate mode/model settings: {err:#}"),
+        }
+    }
     crate::config::init_effective(&file_settings);
+    // Must run before the worker or any other thread starts: Moonshine's
+    // single-thread flag is read by the native runtime when it creates its
+    // ONNX Runtime sessions, and the pinned C API has no per-session knob.
+    // Auto uses Moonshine's single-thread mode; Whisper keeps its own exact
+    // 1/2 API setting.
+    crate::moonshine::configure_threads(crate::moonshine::Threads::for_setting(
+        crate::config::inference_threads(),
+    ));
     if let Some(problem) = settings_problem {
         let message = format!("{problem} Using defaults.");
         dlog!("error: {message}");
@@ -566,20 +599,24 @@ fn run_daemon_inner() -> anyhow::Result<()> {
         event_loop.create_proxy(),
     );
     setup_hotkey(&event_loop, hotkey, &mut app);
-    event_loop
+    let result = event_loop
         .run_app(&mut app)
-        .context("The daemon event loop failed")?;
+        .context("The daemon event loop failed");
+    #[cfg(target_os = "linux")]
+    if let Some(portal) = app.wayland_portal.take() {
+        portal.shutdown();
+    }
     #[cfg(unix)]
     socket::remove_socket_file(&socket_file);
-    Ok(())
+    result
 }
 
-/// Models owned by the transcription worker. Only the startup mode's model
-/// is loaded; the Whole/Pauses model loads lazily if the tray later switches
-/// from live to pauses (the only cross-family switch without a restart).
+/// Models owned by the transcription worker. Only the selected engine is
+/// resident; a successful Settings/tray switch replaces it with the new one.
 struct WorkerModels {
     asr: Option<crate::asr::Asr>,
     live: Option<crate::live::Live>,
+    moonshine: Option<crate::moonshine::Session<crate::moonshine::Moonshine>>,
 }
 
 /// Load the model the startup mode needs. Live mode checks the model files
@@ -590,6 +627,42 @@ fn load_daemon_models(
     mode: crate::config::Mode,
     progress: &Mutex<SwitchProgress>,
 ) -> anyhow::Result<(WorkerModels, bool)> {
+    if mode == crate::config::Mode::Moonshine {
+        if let Err(err) = crate::model::check_moonshine_ready() {
+            let body = format!("{err:#} Using Whole recording.");
+            dlog!("error: dictate: Moonshine is not ready: {body}");
+            crate::notify::show(
+                crate::notify::Kind::Error,
+                "dictate: Moonshine is not ready",
+                &body,
+            );
+            return load_asr_models(true);
+        }
+        let dir = crate::model::moonshine_model_dir_checked()?;
+        let threads = crate::moonshine::Threads::for_setting(crate::config::inference_threads());
+        match crate::moonshine::Moonshine::load(&dir, threads) {
+            Ok(moonshine) => {
+                return Ok((
+                    WorkerModels {
+                        asr: None,
+                        live: None,
+                        moonshine: Some(crate::moonshine::Session::new(moonshine)),
+                    },
+                    false,
+                ));
+            }
+            Err(err) => {
+                let body = format!("{err:#}. Using Whole recording.");
+                dlog!("error: dictate: Moonshine failed to load: {body}");
+                crate::notify::show(
+                    crate::notify::Kind::Error,
+                    "dictate: Moonshine failed to load",
+                    &body,
+                );
+                return load_asr_models(true);
+            }
+        }
+    }
     if mode != crate::config::Mode::Live {
         return load_asr_models(false);
     }
@@ -626,6 +699,7 @@ fn load_daemon_models(
         WorkerModels {
             asr: None,
             live: Some(live),
+            moonshine: None,
         },
         false,
     ))
@@ -639,12 +713,13 @@ fn load_asr_models(live_fallback: bool) -> anyhow::Result<(WorkerModels, bool)> 
         WorkerModels {
             asr: Some(asr),
             live: None,
+            moonshine: None,
         },
         live_fallback,
     ))
 }
 
-/// Register the global trigger (except on Wayland) and keep its manager alive
+/// Register the global trigger and keep its manager/session alive
 /// in the app. Never fatal: the socket commands always keep working.
 fn setup_hotkey(
     event_loop: &EventLoop<UserEvent>,
@@ -653,9 +728,8 @@ fn setup_hotkey(
 ) {
     app.hotkey_display = config.display.clone();
     if crate::hotkey::wayland_session() {
-        dlog!(
-            "Wayland session: global hotkeys are not available to apps. Bind \"dictate toggle\" (or start/stop) in your compositor; see README."
-        );
+        #[cfg(target_os = "linux")]
+        app.start_wayland_shortcut(&config.display);
         return;
     }
     // Forward HotKey events now, so a later switch to a key trigger works
@@ -776,6 +850,17 @@ struct DaemonApp {
     /// page shows generic text then). Queried when the window opens and on
     /// Refresh, never per frame.
     hyprland_binds: Option<Vec<String>>,
+    /// Portal status is distinct from the configured/preferred shortcut.
+    wayland_shortcut_status: Option<String>,
+    shortcut_busy: bool,
+    #[cfg(target_os = "linux")]
+    wayland_portal: Option<crate::wayland_shortcut::Portal>,
+    #[cfg(target_os = "linux")]
+    wayland_generation: u64,
+    #[cfg(target_os = "linux")]
+    wayland_portal_ready: bool,
+    #[cfg(target_os = "linux")]
+    pending_wayland_shortcut: Option<String>,
     menu_proxy: EventLoopProxy<UserEvent>,
     /// Held so the registration stays alive; dropping it would unregister.
     /// Never read, hence the underscore.
@@ -822,16 +907,26 @@ impl DaemonApp {
             autostart_cache: None,
             autostart_error: None,
             hyprland_binds: None,
+            wayland_shortcut_status: None,
+            shortcut_busy: false,
+            #[cfg(target_os = "linux")]
+            wayland_portal: None,
+            #[cfg(target_os = "linux")]
+            wayland_generation: 0,
+            #[cfg(target_os = "linux")]
+            wayland_portal_ready: false,
+            #[cfg(target_os = "linux")]
+            pending_wayland_shortcut: None,
             menu_proxy,
             _hotkey_manager: None,
         }
     }
 
-    /// Dictation mode for the next recording: live maps to whole when the
-    /// startup checks failed it for this session.
+    /// Dictation mode for the next recording: a streaming mode whose startup
+    /// checks failed maps to whole for this session.
     fn current_mode(&self) -> crate::config::Mode {
         let mode = dictation_mode();
-        if mode == crate::config::Mode::Live && self.live_fallback {
+        if mode.is_streaming() && self.live_fallback {
             crate::config::Mode::Whole
         } else {
             mode
@@ -921,15 +1016,20 @@ impl DaemonApp {
     /// Settings window is recording a shortcut, presses are ignored so
     /// trying the current shortcut doesn't start dictation.
     fn handle_trigger(&mut self, state: HotKeyState) {
-        if self
-            .settings_window
-            .as_ref()
-            .is_some_and(|window| window.capture.recording)
+        if self.shortcut_busy
+            || self
+                .settings_window
+                .as_ref()
+                .is_some_and(|window| window.capture.recording)
         {
+            self.press_started = None;
             return;
         }
         match state {
             HotKeyState::Pressed => {
+                if self.press_started.is_some() {
+                    return;
+                }
                 self.press_started = Some(Instant::now());
                 if let Some(cmd) = crate::hotkey::hotkey_action(
                     self.state,
@@ -942,11 +1042,10 @@ impl DaemonApp {
                 }
             }
             HotKeyState::Released => {
-                let held_ms = self
-                    .press_started
-                    .map(|started| started.elapsed().as_millis() as u64)
-                    .unwrap_or(0);
-                self.press_started = None;
+                let Some(started) = self.press_started.take() else {
+                    return;
+                };
+                let held_ms = started.elapsed().as_millis() as u64;
                 if let Some(cmd) = crate::hotkey::hotkey_action(
                     self.state,
                     HotKeyState::Released,
@@ -982,7 +1081,8 @@ impl DaemonApp {
         if let Some(tray) = &self.tray
             && let Err(err) = tray.sync_state(
                 self.state,
-                self.settings.mode,
+                crate::config::effective_selection(&self.settings),
+                self.settings.inference_threads,
                 self.mode_switch.is_some(),
                 self.tray_mic().as_deref(),
             )
@@ -1025,6 +1125,8 @@ impl DaemonApp {
                 self.hyprland_binds = None;
             }
         }
+        #[cfg(target_os = "linux")]
+        self.update_wayland_shortcut_status();
     }
 
     /// Switch the selected microphone from the Settings page: save + confirm.
@@ -1086,6 +1188,13 @@ impl DaemonApp {
                 }
             }
             Some(crate::tray::TrayAction::Quit) => event_loop.exit(),
+            Some(crate::tray::TrayAction::SelectMode(mode)) => self.switch_mode(mode),
+            Some(crate::tray::TrayAction::SelectSpeechModel(model)) => {
+                self.switch_speech_model(model)
+            }
+            Some(crate::tray::TrayAction::SelectInferenceThreads(threads)) => {
+                self.switch_inference_threads(threads)
+            }
         }
         self.refresh_settings();
     }
@@ -1097,6 +1206,40 @@ impl DaemonApp {
         crate::config::refresh_sounds(new);
         self.report_save_error(crate::config::save(&self.settings));
         Self::confirm_settings_change(&crate::tray::SettingsChange::Sounds(new), false);
+        self.sync_tray();
+    }
+
+    /// Change the small-engine inference threads. The setting is saved and
+    /// applied to the effective config now; loaded Whisper/Moonshine models
+    /// pick it up on their next load, so the Settings page asks for a restart.
+    fn switch_inference_threads(&mut self, threads: crate::config::InferenceThreads) {
+        if threads == self.settings.inference_threads {
+            return;
+        }
+        if let Some(pinned) = std::env::var("DICTATE_INFERENCE_THREADS")
+            .ok()
+            .as_deref()
+            .and_then(crate::config::InferenceThreads::parse)
+            && pinned != threads
+        {
+            let message = format!(
+                "DICTATE_INFERENCE_THREADS={} overrides this setting",
+                pinned.as_str()
+            );
+            dlog!(
+                "Inference thread switch to {} refused: {message}",
+                threads.as_str()
+            );
+            crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
+            return;
+        }
+        self.settings.inference_threads = threads;
+        crate::config::refresh_inference_threads(threads);
+        self.report_save_error(crate::config::save(&self.settings));
+        Self::confirm_settings_change(
+            &crate::tray::SettingsChange::InferenceThreads(threads),
+            false,
+        );
         self.sync_tray();
     }
 
@@ -1112,111 +1255,67 @@ impl DaemonApp {
         self.sync_tray();
     }
 
-    /// Switch the dictation mode from the Settings page. Whole and pauses
-    /// share one speech model, so switching between them with it loaded is
-    /// instant; anything else loads the needed model on a background thread
-    /// (Live always benchmarks too) and completes on `ModeSwapped`. Picking
-    /// Live with its model missing downloads it first, on the same thread.
-    /// Refused while recording or transcribing, and while a switch is already
-    /// running (only one download at a time).
-    fn switch_mode(&mut self, target: crate::config::Mode) {
-        if self.state != State::Idle {
-            dlog!(
-                "Mode switch to {} refused: finish the current dictation first",
-                target.as_str()
-            );
+    fn switch_mode(&mut self, mode: crate::config::DictationMode) {
+        let current = crate::config::effective_selection(&self.settings);
+        match crate::config::Selection::new(mode, current.model) {
+            Ok(target) => self.switch_selection(target),
+            Err(message) => crate::notify::show(crate::notify::Kind::Info, "dictate", &message),
+        }
+    }
+
+    fn switch_speech_model(&mut self, model: crate::config::ModelChoice) {
+        let target = crate::config::effective_selection(&self.settings).with_model(model);
+        self.switch_selection(target);
+    }
+
+    /// Switch the complete selection atomically. An incompatible mode is
+    /// rejected; choosing a model supplies a compatible mode before loading.
+    fn switch_selection(&mut self, target: SwitchTarget) {
+        if self.state != State::Idle || self.mode_switch.is_some() {
             crate::notify::show(
                 crate::notify::Kind::Info,
                 "dictate",
-                "Finish the current dictation first",
+                "Finish the current dictation or model switch first",
             );
             return;
         }
-        if let Some(switch) = &self.mode_switch {
-            let message = if switch.downloading {
-                "Already downloading"
-            } else {
-                "Model loading…"
-            };
-            dlog!("Mode switch to {} refused: {message}", target.as_str());
-            crate::notify::show(crate::notify::Kind::Info, "dictate", message);
+        if let Err(message) = crate::config::Selection::new(target.mode, target.model) {
+            crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
             return;
         }
-        if target == self.settings.mode {
-            return;
-        }
-        if target != crate::config::Mode::Live
-            && self.loaded_asr_model == Some(crate::config::speech_model())
-        {
-            self.complete_switch(SwitchTarget::Mode(target));
-            return;
-        }
-        self.begin_switch(SwitchTarget::Mode(target));
-    }
-
-    /// Switch the Whole/Pauses speech model from the Settings page. The new
-    /// model loads (and, for Fluid, downloads when missing) on a background
-    /// thread, then swaps into the worker and completes on `ModeSwapped`.
-    /// Live uses its own model, so there the choice is only saved.
-    /// Refused while recording or transcribing, and while a switch is already
-    /// running (only one download at a time).
-    fn switch_speech_model(&mut self, model: crate::config::SpeechModel) {
-        if self.state != State::Idle {
-            dlog!(
-                "Speech model switch to {} refused: finish the current dictation first",
-                model.as_str()
+        if !target.model.available() {
+            crate::notify::show(
+                crate::notify::Kind::Error,
+                "dictate",
+                "Moonshine's runtime is available only on Linux x86_64/arm64",
             );
+            return;
+        }
+        let mut proposed = self.settings.clone();
+        target.apply(&mut proposed);
+        if crate::config::effective_selection(&proposed) != target {
             crate::notify::show(
                 crate::notify::Kind::Info,
                 "dictate",
-                "Finish the current dictation first",
+                "DICTATE_MODE or DICTATE_SPEECH_MODEL overrides this selection",
             );
             return;
         }
-        if let Some(switch) = &self.mode_switch {
-            let message = if switch.downloading {
-                "Already downloading"
-            } else {
-                "Model loading…"
-            };
-            dlog!(
-                "Speech model switch to {} refused: {message}",
-                model.as_str()
-            );
-            crate::notify::show(crate::notify::Kind::Info, "dictate", message);
+        if target == crate::config::effective_selection(&self.settings) && !self.live_fallback {
             return;
         }
-        if model == self.settings.model {
-            return;
-        }
-        if let Some(pinned) = std::env::var("DICTATE_SPEECH_MODEL")
-            .ok()
-            .as_deref()
-            .and_then(crate::config::SpeechModel::parse)
-            && pinned != model
+        if !self.current_mode().is_streaming()
+            && target.model.batch_model().is_some()
+            && self.loaded_asr_model == target.model.batch_model()
+            && !switch_needs_download(target)
         {
-            let message = format!(
-                "DICTATE_SPEECH_MODEL={} overrides this setting",
-                pinned.as_str()
-            );
-            dlog!(
-                "Speech model switch to {} refused: {message}",
-                model.as_str()
-            );
-            crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
+            self.complete_switch(target);
             return;
         }
-        if self.current_mode() != crate::config::Mode::Live && self.loaded_asr_model == Some(model)
-        {
-            self.complete_switch(SwitchTarget::SpeechModel(model));
-            return;
-        }
-        self.begin_switch(SwitchTarget::SpeechModel(model));
+        self.begin_switch(target);
     }
 
-    /// Start a background model switch: optionally download the target's
-    /// missing files, then load it and hand it to the worker (or, for a
-    /// speech-model switch while Live is active, only save it).
+    /// Load the selected engine off-thread, then ask the worker to swap it in.
     fn begin_switch(&mut self, target: SwitchTarget) {
         let download_first = switch_needs_download(target);
         lock_progress(&self.switch_progress).percent = 0;
@@ -1226,7 +1325,6 @@ impl DaemonApp {
         });
         self.sync_tray();
         let previous = self.settings.mode;
-        let in_live = self.current_mode() == crate::config::Mode::Live;
         let to_worker = self.to_worker.clone();
         let proxy = self.menu_proxy.clone();
         let progress = Arc::clone(&self.switch_progress);
@@ -1235,7 +1333,6 @@ impl DaemonApp {
                 run_model_switch_loader(
                     target,
                     previous,
-                    in_live,
                     download_first,
                     &to_worker,
                     &proxy,
@@ -1259,34 +1356,20 @@ impl DaemonApp {
     /// settings, save, and confirm. The previous setting is untouched on
     /// every failure path, so reaching here means the switch landed.
     fn complete_switch(&mut self, target: SwitchTarget) {
-        match target {
-            SwitchTarget::Mode(mode) => {
-                self.settings.mode = mode;
-                crate::config::refresh_mode(mode);
-                self.loaded_asr_model = if mode == crate::config::Mode::Live {
-                    None
-                } else {
-                    Some(crate::config::speech_model())
-                };
-                self.live_fallback = false;
-                self.report_save_error(crate::config::save(&self.settings));
-                Self::confirm_settings_change(&crate::tray::SettingsChange::Mode(mode), true);
-            }
-            SwitchTarget::SpeechModel(model) => {
-                self.settings.model = model;
-                crate::config::refresh_speech_model(model);
-                self.loaded_asr_model = if self.current_mode() == crate::config::Mode::Live {
-                    None
-                } else {
-                    Some(model)
-                };
-                self.report_save_error(crate::config::save(&self.settings));
-                Self::confirm_settings_change(
-                    &crate::tray::SettingsChange::SpeechModel(model),
-                    true,
-                );
-            }
-        }
+        let previous = crate::config::effective_selection(&self.settings);
+        target.apply(&mut self.settings);
+        crate::config::refresh_selection(self.settings.mode, self.settings.model);
+        self.loaded_asr_model = target.model.batch_model();
+        self.live_fallback = false;
+        self.report_save_error(crate::config::save(&self.settings));
+        let change = if previous.model != target.model && previous.mode != target.mode {
+            crate::tray::SettingsChange::Selection(target)
+        } else if previous.model != target.model {
+            crate::tray::SettingsChange::SpeechModel(target.model)
+        } else {
+            crate::tray::SettingsChange::Mode(target.mode)
+        };
+        Self::confirm_settings_change(&change, true);
         self.mode_switch = None;
         self.sync_tray();
     }
@@ -1345,11 +1428,156 @@ impl DaemonApp {
         Ok(())
     }
 
+    #[cfg(target_os = "linux")]
+    fn start_wayland_shortcut(&mut self, preferred: &str) {
+        self.wayland_generation = self.wayland_generation.wrapping_add(1);
+        let generation = self.wayland_generation;
+        self.wayland_portal_ready = false;
+        self.wayland_shortcut_status = Some("Connecting to the desktop shortcut service…".into());
+        self.press_started = None;
+        let proxy = self.menu_proxy.clone();
+        // The new worker waits for the old session to close, off the UI thread.
+        let previous = self.wayland_portal.take();
+        self.wayland_portal = Some(crate::wayland_shortcut::Portal::start(
+            preferred.to_string(),
+            previous,
+            move |event| {
+                let _ = proxy.send_event(UserEvent::WaylandShortcut(generation, event));
+            },
+        ));
+    }
+
+    #[cfg(target_os = "linux")]
+    fn update_wayland_shortcut_status(&mut self) {
+        if !self.wayland_portal_ready || !crate::hotkey::hyprland_session() {
+            return;
+        }
+        self.wayland_shortcut_status = Some(
+            match crate::wayland_shortcut::hyprland::active(&self.hotkey_display) {
+                Ok(true) => format!(
+                    "Active: {} · tap to toggle, hold to talk",
+                    self.hotkey_display
+                ),
+                Ok(false) => {
+                    "Desktop service connected. Choose Enable shortcut to bind the selected keys."
+                        .into()
+                }
+                Err(err) => format!("Desktop service connected. {err:#}"),
+            },
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    fn handle_wayland_shortcut(&mut self, event: crate::wayland_shortcut::Event) {
+        use crate::wayland_shortcut::Event;
+        match event {
+            Event::Ready(trigger) => {
+                self.wayland_portal_ready = true;
+                if !crate::hotkey::hyprland_session()
+                    && let Some(display) = self.pending_wayland_shortcut.take()
+                {
+                    self.shortcut_busy = false;
+                    self.finish_hotkey_switch(&display);
+                }
+                self.wayland_shortcut_status = Some(match trigger {
+                    Some(trigger) => format!("Desktop shortcut: {trigger} · tap to toggle, hold to talk"),
+                    None => "Desktop action registered; assign its keys in your desktop's Keyboard Shortcuts settings.".into(),
+                });
+                self.update_wayland_shortcut_status();
+                dlog!(
+                    "Wayland shortcut: {}",
+                    self.wayland_shortcut_status.as_deref().unwrap_or_default()
+                );
+            }
+            Event::Unavailable(message) => {
+                self.wayland_portal_ready = false;
+                // Losing the release signal must not leave a hold recording
+                // running indefinitely. A completed tap remains controllable
+                // through the tray or socket.
+                if self.press_started.is_some() && !self.tap_armed && self.state == State::Recording
+                {
+                    drop(self.handle_command(Command::Cancel));
+                }
+                self.press_started = None;
+                self.tap_armed = false;
+                if !crate::hotkey::hyprland_session() || self.pending_wayland_shortcut.is_none() {
+                    self.shortcut_busy = false;
+                    self.pending_wayland_shortcut = None;
+                }
+                self.wayland_shortcut_status = Some(message.clone());
+                dlog!("Wayland shortcut: {message}");
+            }
+            Event::Notice(message) => {
+                dlog!("Wayland shortcut: {message}");
+                self.last_shortcut_error = Some(message);
+            }
+            Event::Trigger(state) => {
+                if self.wayland_portal_ready {
+                    self.handle_trigger(state);
+                }
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn switch_wayland_shortcut(&mut self, display: &str) {
+        if let Err(err) = crate::wayland_shortcut::hyprland::shortcut(display) {
+            self.shortcut_failed(display, &format!("{err:#}"));
+            return;
+        }
+        self.last_shortcut_error = None;
+        if !self.wayland_portal_ready {
+            self.pending_wayland_shortcut = Some(display.to_string());
+            self.shortcut_busy = true;
+            self.start_wayland_shortcut(display);
+            // On Hyprland enabling the physical key is a separate step after
+            // the action is registered; do not save an unbound selection.
+            if crate::hotkey::hyprland_session() {
+                self.pending_wayland_shortcut = None;
+                self.shortcut_busy = false;
+                self.last_shortcut_error = Some(
+                    "Connecting to the shortcut service. Choose Enable shortcut once connected."
+                        .into(),
+                );
+            }
+            return;
+        }
+        if crate::hotkey::hyprland_session() {
+            self.shortcut_busy = true;
+            self.pending_wayland_shortcut = Some(display.to_string());
+            self.wayland_shortcut_status =
+                Some("Checking and applying the Hyprland shortcut…".into());
+            let display = display.to_string();
+            let proxy = self.menu_proxy.clone();
+            std::thread::spawn(move || {
+                let result = crate::wayland_shortcut::hyprland::install(&display)
+                    .map_err(|err| format!("{err:#}"));
+                let _ = proxy.send_event(UserEvent::WaylandShortcutInstalled(display, result));
+            });
+        } else {
+            self.pending_wayland_shortcut = Some(display.to_string());
+            self.shortcut_busy = true;
+            self.start_wayland_shortcut(display);
+        }
+    }
+
     /// Switch the global shortcut to `display`: the new trigger is made
     /// working first (so a failure keeps the old one), then the old one is
     /// removed and the settings saved. Failures notify and keep the old
     /// shortcut checked.
     fn switch_hotkey(&mut self, display: &str) {
+        if self.state != State::Idle || self.shortcut_busy {
+            self.shortcut_failed(
+                display,
+                "Finish the current recording or shortcut setup before changing shortcuts.",
+            );
+            return;
+        }
+        #[cfg(target_os = "linux")]
+        if crate::hotkey::wayland_session() {
+            self.switch_wayland_shortcut(display);
+            return;
+        }
         if display == self.hotkey_display {
             self.last_shortcut_error = None;
             return;
@@ -1535,6 +1763,8 @@ impl DaemonApp {
             wayland: crate::hotkey::wayland_session(),
             hyprland: crate::hotkey::hyprland_session(),
             dictate_binds: self.hyprland_binds.as_deref(),
+            shortcut_status: self.wayland_shortcut_status.as_deref(),
+            shortcut_busy: self.shortcut_busy || self.state != State::Idle,
             autostart_on: self.autostart_cache,
             autostart_error: self.autostart_error.as_deref(),
             shortcut_error: self.last_shortcut_error.as_deref(),
@@ -1601,7 +1831,15 @@ impl DaemonApp {
             PageAction::RefreshBinds => self.refresh_hyprland_binds(),
             PageAction::SelectMode(mode) => self.switch_mode(mode),
             PageAction::SelectSpeechModel(model) => self.switch_speech_model(model),
+            PageAction::SelectInferenceThreads(threads) => self.switch_inference_threads(threads),
             PageAction::SelectShortcut(display) => self.switch_hotkey(&display),
+            PageAction::ConfigureShortcut =>
+            {
+                #[cfg(target_os = "linux")]
+                if let Some(portal) = &self.wayland_portal {
+                    portal.configure();
+                }
+            }
             PageAction::ToggleSounds => self.flip_sounds(),
             PageAction::ToggleNotifications => self.flip_notifications(),
             PageAction::SetAutostart(on) => self.apply_autostart(on),
@@ -1687,6 +1925,10 @@ impl DaemonApp {
                 match self.current_mode() {
                     crate::config::Mode::Pauses => self.start_pauses_feeder(&started),
                     crate::config::Mode::Live => self.start_live_feeder(&started),
+                    crate::config::Mode::Moonshine => {
+                        self.begin_moonshine_recording();
+                        self.start_moonshine_feeder(&started);
+                    }
                     crate::config::Mode::Whole => {}
                 }
                 self.recorder = Some(started);
@@ -1736,6 +1978,31 @@ impl DaemonApp {
             live_feeder_loop(buffer, sample_rate, control_rx, to_worker)
         });
         self.feeder = Some(FeederSession::Live {
+            control_tx,
+            thread: Some(thread),
+        });
+    }
+
+    /// Tell the worker a new Moonshine recording is starting, so it discards
+    /// any stale stream/cursor before the feeder's first chunk arrives.
+    fn begin_moonshine_recording(&self) {
+        if self.to_worker.send(Job::MoonshineStart).is_err() {
+            // The command path reports a dead worker itself.
+            dlog!("error: Could not tell the worker that a Moonshine recording started");
+        }
+    }
+
+    /// Spawn the Moonshine feeder (16 kHz audio, no VAD). The worker owns the
+    /// stateful native stream; this thread only resamples and forwards audio.
+    fn start_moonshine_feeder(&mut self, started: &crate::mic::Recorder) {
+        let buffer = started.buffer_handle();
+        let sample_rate = started.sample_rate();
+        let (control_tx, control_rx) = mpsc::channel::<FeederCmd>();
+        let to_worker = self.to_worker.clone();
+        let thread = std::thread::spawn(move || {
+            moonshine_feeder_loop(buffer, sample_rate, control_rx, to_worker)
+        });
+        self.feeder = Some(FeederSession::Moonshine {
             control_tx,
             thread: Some(thread),
         });
@@ -1884,6 +2151,20 @@ impl DaemonApp {
                     // The worker is gone; `handle_command` reports that itself.
                 }
             }
+            FeederSession::Moonshine {
+                control_tx,
+                mut thread,
+            } => {
+                let signalled = control_tx.send(cmd).is_ok();
+                if let Some(handle) = thread.take()
+                    && handle.join().is_err()
+                {
+                    dlog!("error: the Moonshine feeder thread panicked");
+                }
+                if !signalled && self.to_worker.send(Job::Cancel).is_err() {
+                    // The worker is gone; `handle_command` reports that itself.
+                }
+            }
         }
     }
 
@@ -1912,7 +2193,8 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
             self.refresh_microphones();
             match crate::tray::build_tray(
                 self.state,
-                self.settings.mode,
+                crate::config::effective_selection(&self.settings),
+                self.settings.inference_threads,
                 self.tray_mic().as_deref(),
                 self.menu_proxy.clone(),
             ) {
@@ -2015,6 +2297,40 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
             UserEvent::Menu(event) => self.handle_menu(event, event_loop),
             UserEvent::OpenSettings => self.open_settings(event_loop),
             UserEvent::SettingsRefresh => self.refresh_settings(),
+            #[cfg(target_os = "linux")]
+            UserEvent::WaylandShortcut(generation, event) => {
+                if generation == self.wayland_generation {
+                    self.handle_wayland_shortcut(event);
+                    self.refresh_settings();
+                }
+            }
+            #[cfg(target_os = "linux")]
+            UserEvent::WaylandShortcutInstalled(display, result) => {
+                self.shortcut_busy = false;
+                self.pending_wayland_shortcut = None;
+                match result {
+                    Ok(backup) => {
+                        dlog!(
+                            "Hyprland shortcut configured; previous config backed up to {}",
+                            backup.display()
+                        );
+                        self.finish_hotkey_switch(&display);
+                    }
+                    Err(err) => self.shortcut_failed(&display, &err),
+                }
+                self.refresh_hyprland_binds();
+                self.refresh_settings();
+            }
+            #[cfg(target_os = "linux")]
+            UserEvent::SetShortcut(display, reply) => {
+                self.switch_hotkey(&display);
+                let message = self.last_shortcut_error.as_ref().map_or_else(
+                    || "ok shortcut setup requested".to_string(),
+                    |error| format!("err {error}"),
+                );
+                let _ = reply.send(message);
+                self.refresh_settings();
+            }
         }
     }
 }
@@ -2031,70 +2347,40 @@ fn milestones_reached(percent: u64) -> usize {
 }
 
 /// Body of a model-download progress notification, e.g.
-/// `Downloading Live model… 50%` or `Downloading Fluid Speech Mini… 50%`.
+/// `Downloading Nemotron Streaming… 50%` or `Downloading Fluid Speech Mini… 50%`.
 fn download_progress_body(target: SwitchTarget, percent: u64) -> String {
     format!("Downloading {}… {percent}%", model_download_name(target))
 }
 
-/// Human name of the model a switch downloads: the Live model or Fluid
-/// Speech Mini (only those two need a download).
+/// Human name of the selected engine whose assets a switch downloads.
 fn model_download_name(target: SwitchTarget) -> &'static str {
-    match target {
-        SwitchTarget::SpeechModel(model) => model.display_name(),
-        SwitchTarget::Mode(_) => "Live model",
-    }
+    target.model.display_name()
 }
 
-/// Whether a switch must download the target's model before loading it. Live
-/// and Fluid have their own files; the Standard model is part of
-/// `dictate download`.
 fn switch_needs_download(target: SwitchTarget) -> bool {
-    match target {
-        SwitchTarget::Mode(crate::config::Mode::Live) => {
-            crate::model::live_model_dir_checked().is_err()
-        }
-        SwitchTarget::Mode(crate::config::Mode::Whole | crate::config::Mode::Pauses) => {
-            match crate::config::speech_model() {
-                crate::config::SpeechModel::Standard => false,
-                crate::config::SpeechModel::Fluid => {
-                    crate::model::fluid_model_dir_checked().is_err()
-                }
-            }
-        }
-        SwitchTarget::SpeechModel(crate::config::SpeechModel::Standard) => false,
-        SwitchTarget::SpeechModel(crate::config::SpeechModel::Fluid) => {
-            crate::model::fluid_model_dir_checked().is_err()
-        }
-    }
+    use crate::config::{DictationMode, ModelChoice};
+    let model_missing = match target.model {
+        ModelChoice::Parakeet => crate::model::model_dir_checked().is_err(),
+        ModelChoice::Fluid => crate::model::fluid_model_dir_checked().is_err(),
+        ModelChoice::Whisper => crate::model::whisper_model_dir_checked().is_err(),
+        ModelChoice::Nemotron => crate::model::live_model_dir_checked().is_err(),
+        ModelChoice::Moonshine => crate::model::check_moonshine_ready().is_err(),
+    };
+    model_missing
+        || (target.mode == DictationMode::Pauses && crate::model::vad_model_path_checked().is_err())
 }
 
-/// Background model load for a Settings-page switch: optionally downloads the
-/// target's model first (with progress notifications), loads it (Live always
-/// benchmarks too) and hands it to the transcription worker for the swap. A
-/// speech-model switch while Live runs only saves the choice, since Live has
-/// its own model. Exactly one terminal outcome: a `Job::Swap*` sent to the
-/// worker (which acks `UserEvent::ModeSwapped`), a `UserEvent::ModeSwapped`
-/// sent directly, or a `UserEvent::ModeSwitchFailed` after logging + notifying
-/// the specific failure. The previous setting is kept on every failure;
-/// nothing is saved.
+/// Load a validated selection off-thread. Failed downloads, loads and speed
+/// checks preserve the old settings. Only a successful worker swap is acked.
 fn run_model_switch_loader(
     target: SwitchTarget,
     previous: crate::config::Mode,
-    in_live: bool,
     download_first: bool,
     to_worker: &mpsc::Sender<Job>,
     proxy: &EventLoopProxy<UserEvent>,
     progress: &Mutex<SwitchProgress>,
 ) {
     if download_first && download_for_switch(target, proxy, progress).is_err() {
-        return;
-    }
-    // Live keeps its own model while the Whole/Pauses choice changes: only
-    // the saved setting needs to land.
-    if in_live && target.speech_model().is_some() {
-        if proxy.send_event(UserEvent::ModeSwapped).is_err() {
-            // The event loop is closed; the daemon is shutting down.
-        }
         return;
     }
     let swap = match load_switch_model(target, previous, proxy, progress) {
@@ -2142,22 +2428,18 @@ fn download_for_switch(
             send_settings_refresh(proxy);
         }
     };
-    let result = match target {
-        SwitchTarget::Mode(crate::config::Mode::Live) => {
-            crate::model::download_live_files_with_progress(&mut on_progress)
+    use crate::config::ModelChoice;
+    let result = match target.model {
+        ModelChoice::Nemotron => crate::model::download_live_files_with_progress(&mut on_progress),
+        ModelChoice::Moonshine => {
+            crate::model::download_moonshine_files_with_progress(&mut on_progress)
         }
-        SwitchTarget::SpeechModel(crate::config::SpeechModel::Fluid) => {
-            crate::model::download_fluid_files_with_progress(&mut on_progress)
+        ModelChoice::Fluid => crate::model::download_fluid_files_with_progress(&mut on_progress)
+            .and_then(|()| crate::model::download_vad()),
+        ModelChoice::Whisper => {
+            crate::model::download_whisper_files_with_progress(&mut on_progress)
         }
-        SwitchTarget::Mode(crate::config::Mode::Whole | crate::config::Mode::Pauses) => {
-            match crate::config::speech_model() {
-                crate::config::SpeechModel::Fluid => {
-                    crate::model::download_fluid_files_with_progress(&mut on_progress)
-                }
-                crate::config::SpeechModel::Standard => crate::model::download(),
-            }
-        }
-        SwitchTarget::SpeechModel(crate::config::SpeechModel::Standard) => crate::model::download(),
+        ModelChoice::Parakeet => crate::model::download(),
     };
     match result {
         Ok(()) => {
@@ -2180,7 +2462,7 @@ fn download_for_switch(
     }
 }
 
-/// Load the target's model for a switch, as the swap job to send. Live always
+/// Load the target's model for a switch, as the swap job to send. Nemotron
 /// runs the speed gate; failures are already logged + notified.
 fn load_switch_model(
     target: SwitchTarget,
@@ -2188,14 +2470,20 @@ fn load_switch_model(
     proxy: &EventLoopProxy<UserEvent>,
     progress: &Mutex<SwitchProgress>,
 ) -> Result<Job, ()> {
-    match target {
-        SwitchTarget::Mode(crate::config::Mode::Live) => {
+    match target.model {
+        crate::config::ModelChoice::Nemotron => {
             load_live_for_switch(previous, proxy, progress).map(Job::SwapLive)
         }
-        SwitchTarget::Mode(crate::config::Mode::Whole | crate::config::Mode::Pauses) => {
-            load_asr_for_switch(crate::config::speech_model()).map(Job::SwapAsr)
+        crate::config::ModelChoice::Moonshine => {
+            load_moonshine_for_switch().map(Job::SwapMoonshine)
         }
-        SwitchTarget::SpeechModel(model) => load_asr_for_switch(model).map(Job::SwapAsr),
+        _ => load_asr_for_switch(
+            target
+                .model
+                .batch_model()
+                .expect("validated batch selection"),
+        )
+        .map(Job::SwapAsr),
     }
 }
 
@@ -2208,6 +2496,8 @@ fn load_asr_for_switch(model: crate::config::SpeechModel) -> Result<crate::asr::
         }
         crate::config::SpeechModel::Fluid => crate::model::fluid_model_dir_checked()
             .and_then(|dir| crate::asr::Asr::load_fluid(&dir)),
+        crate::config::SpeechModel::Whisper => crate::model::whisper_model_dir_checked()
+            .and_then(|dir| crate::asr::Asr::load_whisper(&dir)),
     };
     match loaded {
         Ok(asr) => Ok(asr),
@@ -2218,8 +2508,24 @@ fn load_asr_for_switch(model: crate::config::SpeechModel) -> Result<crate::asr::
     }
 }
 
-/// Load the Live model for a switch to live mode and run the speed gate. Too
-/// slow: the too-slow notification, staying on the previous mode.
+/// Load Moonshine for Live dictation.
+fn load_moonshine_for_switch() -> Result<crate::moonshine::Moonshine, ()> {
+    let loaded = crate::model::check_moonshine_ready().and_then(|()| {
+        let dir = crate::model::moonshine_model_dir_checked()?;
+        let threads = crate::moonshine::Threads::for_setting(crate::config::inference_threads());
+        crate::moonshine::Moonshine::load(&dir, threads)
+    });
+    match loaded {
+        Ok(model) => Ok(model),
+        Err(err) => {
+            switch_load_failed(err);
+            Err(())
+        }
+    }
+}
+
+/// Load Nemotron for Live dictation and run its speed gate. Too slow: show
+/// the too-slow notification and keep the previous selection.
 fn load_live_for_switch(
     previous: crate::config::Mode,
     proxy: &EventLoopProxy<UserEvent>,
@@ -2507,6 +2813,105 @@ fn live_feeder_loop(
     }
 }
 
+/// Moonshine feeder thread: while Recording, wake every 100 ms, drain new
+/// device-rate samples, resample to 16 kHz with one stateful resampler and
+/// send each piece to the worker's stream. On `Stop` the tail plus
+/// `MoonshineEnd` go out; on `Cancel` a single `Cancel` goes out, so the
+/// worker drops the provisional line instead of finalizing it.
+fn moonshine_feeder_loop(
+    buffer: std::sync::Arc<std::sync::Mutex<Vec<f32>>>,
+    sample_rate: u32,
+    control_rx: mpsc::Receiver<FeederCmd>,
+    to_worker: mpsc::Sender<Job>,
+) {
+    let mut resampler = if sample_rate == crate::audio::TARGET_SAMPLE_RATE {
+        None
+    } else {
+        match crate::audio::StreamResampler::new(sample_rate) {
+            Ok(resampler) => Some(resampler),
+            Err(err) => {
+                feeder_failed(&to_worker, err);
+                return;
+            }
+        }
+    };
+    let mut total_device_samples: u64 = 0;
+    loop {
+        match control_rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(FeederCmd::Stop) => {
+                let new = crate::mic::take_buffer(&buffer);
+                total_device_samples += new.len() as u64;
+                let tail = match push_live_audio(&mut resampler, &new) {
+                    Ok(tail) => tail,
+                    Err(err) => {
+                        feeder_failed(&to_worker, err);
+                        break;
+                    }
+                };
+                send_moonshine_chunk(&to_worker, tail);
+                if let Some(resampler) = resampler.as_mut() {
+                    match resampler.finish() {
+                        Ok(flushed) => send_moonshine_chunk(&to_worker, flushed),
+                        Err(err) => {
+                            feeder_failed(&to_worker, err);
+                            break;
+                        }
+                    }
+                }
+                let total_seconds = total_device_samples as f32 / sample_rate.max(1) as f32;
+                if to_worker
+                    .send(Job::MoonshineEnd {
+                        total_seconds,
+                        stop_time: Instant::now(),
+                    })
+                    .is_err()
+                {
+                    // The worker is gone; the event loop reports that itself.
+                }
+                break;
+            }
+            Ok(FeederCmd::Cancel) => {
+                if to_worker.send(Job::Cancel).is_err() {
+                    // The worker is gone; the event loop reports that itself.
+                }
+                break;
+            }
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                let new = crate::mic::take_buffer(&buffer);
+                if new.is_empty() {
+                    continue;
+                }
+                total_device_samples += new.len() as u64;
+                match push_live_audio(&mut resampler, &new) {
+                    Ok(ready) => send_moonshine_chunk(&to_worker, ready),
+                    Err(err) => {
+                        feeder_failed(&to_worker, err);
+                        break;
+                    }
+                }
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                // The event loop went away without Stop/Cancel; unblock the
+                // worker rather than leave it Transcribing forever.
+                if to_worker.send(Job::Cancel).is_err() {
+                    // The worker is gone too.
+                }
+                break;
+            }
+        }
+    }
+}
+
+/// Queue 16 kHz audio for the Moonshine stream (empty pieces are skipped).
+fn send_moonshine_chunk(to_worker: &mpsc::Sender<Job>, samples_16k: Vec<f32>) {
+    if samples_16k.is_empty() {
+        return;
+    }
+    if to_worker.send(Job::MoonshineChunk(samples_16k)).is_err() {
+        // The worker is gone; the event loop reports that itself.
+    }
+}
+
 /// Resample device-rate audio to 16 kHz (`None` resampler: already 16 kHz).
 fn push_live_audio(
     resampler: &mut Option<crate::audio::StreamResampler>,
@@ -2710,6 +3115,50 @@ impl LiveRun {
     }
 }
 
+/// Per-recording Moonshine timing/statistics in the worker. The native stream,
+/// transcriber and append-only line cursor live in the session held by
+/// [`WorkerModels::moonshine`]; this only tracks the summary and the
+/// one-notification-per-recording failure flag.
+#[derive(Default)]
+struct MoonshineRun {
+    chunks: usize,
+    total_ms: u128,
+    typed_chars: usize,
+    last_partial: Option<String>,
+    failed: bool,
+}
+
+impl MoonshineRun {
+    fn reset(&mut self) {
+        self.chunks = 0;
+        self.total_ms = 0;
+        self.typed_chars = 0;
+        self.last_partial = None;
+        self.failed = false;
+    }
+
+    /// Mark the recording failed and notify once. Later chunks of the same
+    /// recording are ignored, so a persistent native error cannot produce a
+    /// notification every 100 ms; the next `MoonshineStart` clears the flag.
+    fn fail(&mut self, err: anyhow::Error) {
+        if !self.mark_failed() {
+            dlog!("moonshine: ignoring further audio after the first error");
+            return;
+        }
+        report_moonshine_failure(err);
+    }
+
+    /// Enter the failed state, returning true only for the first failure of a
+    /// recording. Kept separate so the one-notification rule is testable.
+    fn mark_failed(&mut self) -> bool {
+        if self.failed {
+            return false;
+        }
+        self.failed = true;
+        true
+    }
+}
+
 /// The Whole/Pauses speech model, loading it on first need (the tray can
 /// switch a live daemon to pauses without a restart).
 fn ensure_asr(models: &mut WorkerModels) -> anyhow::Result<&mut crate::asr::Asr> {
@@ -2767,8 +3216,9 @@ fn transcribe_worker(
     let mut pending_punct: Option<char> = None;
     let mut segments: usize = 0;
     let mut failures: usize = 0;
-    // Per-recording live state.
+    // Per-recording live and Moonshine state.
     let mut live = LiveRun::new();
+    let mut moonshine = MoonshineRun::default();
     let worker_done =
         |proxy: &EventLoopProxy<UserEvent>| proxy.send_event(UserEvent::WorkerDone).is_err();
     'worker: loop {
@@ -2821,22 +3271,25 @@ fn transcribe_worker(
                     }
                 };
                 let start = Instant::now();
-                let (kept_texts, boundary) =
-                    match asr.transcribe_segment_pieces(&segment.context, &segment.audio) {
-                        Ok(pieces) => pieces,
-                        Err(err) => {
-                            dlog!("error: {err:#}");
-                            crate::notify::show(
-                                crate::notify::Kind::Error,
-                                "dictate: transcription failed",
-                                &format!("{err:#}"),
-                            );
-                            failures += 1;
-                            continue;
-                        }
-                    };
+                let piece = match asr.transcribe_segment_pieces(
+                    &segment.context,
+                    &segment.audio,
+                    segment.start,
+                ) {
+                    Ok(piece) => piece,
+                    Err(err) => {
+                        dlog!("error: {err:#}");
+                        crate::notify::show(
+                            crate::notify::Kind::Error,
+                            "dictate: transcription failed",
+                            &format!("{err:#}"),
+                        );
+                        failures += 1;
+                        continue;
+                    }
+                };
                 let transcribe_ms = start.elapsed().as_millis();
-                if kept_texts.is_empty() {
+                if piece.words.is_empty() {
                     continue;
                 }
                 // A `Cancel` that arrived mid-transcription discards this
@@ -2857,12 +3310,13 @@ fn transcribe_worker(
                     }
                     continue;
                 }
-                let tail_start = typed_words.len().saturating_sub(2);
+                let tail_start = typed_words.len().saturating_sub(8);
                 let (to_type, new_pending) = crate::asr::join_piece(
                     &typed_words[tail_start..],
                     pending_punct,
-                    boundary,
-                    &kept_texts,
+                    piece.boundary,
+                    &piece.words,
+                    crate::asr::JoinMode::from_disjoint(piece.disjoint),
                 );
                 if to_type.is_empty() {
                     // Deduped to nothing with no boundary: drop the old
@@ -2881,7 +3335,13 @@ fn transcribe_worker(
                         crate::asr::append_typed_words(&mut typed_words, &to_type);
                         pending_punct = new_pending;
                         dlog!(
-                            "segment {seq}: {seconds:.1} s audio (context {context_s:.1} s), transcribed in {transcribe_ms} ms, typed {} chars in {type_ms} ms",
+                            "segment {seq}: {seconds:.1} s audio (context {context_s:.1} s, {}, {}), transcribed in {transcribe_ms} ms, typed {} chars in {type_ms} ms",
+                            segment.start.label(),
+                            if piece.disjoint {
+                                "disjoint decode"
+                            } else {
+                                "context decode"
+                            },
                             to_type.chars().count()
                         );
                     }
@@ -2895,6 +3355,121 @@ fn transcribe_worker(
                             &crate::notify::typing_failure_body(&format!("{err:#}"), &to_type),
                         );
                     }
+                }
+            }
+            Job::MoonshineStart => {
+                // A new recording must never inherit a stale stream, cursor or
+                // failure state from a cancelled/failed predecessor.
+                moonshine.reset();
+                if let Some(session) = models.moonshine.as_mut() {
+                    session.cancel();
+                }
+            }
+            Job::MoonshineChunk(samples) => {
+                // After the first error in a recording, drain the remaining
+                // chunks without calling the native API again: otherwise a
+                // persistent error would notify every 100 ms.
+                if moonshine.failed {
+                    continue;
+                }
+                let Some(session) = models.moonshine.as_mut() else {
+                    moonshine.fail(anyhow::anyhow!(
+                        "Internal error: Moonshine audio arrived without a Moonshine model"
+                    ));
+                    continue;
+                };
+                let start = Instant::now();
+                let update = match session.feed(&samples) {
+                    Ok(update) => update,
+                    Err(err) => {
+                        // Session already discarded the stream and cursor.
+                        moonshine.fail(err);
+                        continue;
+                    }
+                };
+                moonshine.chunks += 1;
+                moonshine.total_ms += start.elapsed().as_millis();
+                // A Cancel that arrived during feed wins over text returned by
+                // this chunk: drop it before anything reaches the page.
+                if pop_cancel(&mut queue, &rx) {
+                    moonshine.reset();
+                    session.cancel();
+                    if worker_done(&proxy) {
+                        break 'worker;
+                    }
+                    continue 'worker;
+                }
+                if update.partial != moonshine.last_partial {
+                    if let Some(partial) = update.partial.as_deref() {
+                        dlog!("moonshine partial: {partial}");
+                    }
+                    moonshine.last_partial = update.partial;
+                }
+                if !update.completed.is_empty() {
+                    type_moonshine_text(&update.completed, &mut moonshine, typer.as_mut());
+                }
+            }
+            Job::MoonshineEnd {
+                total_seconds,
+                stop_time,
+            } => {
+                let Some(session) = models.moonshine.as_mut() else {
+                    dlog!("error: Internal error: Moonshine recording ended without a model");
+                    moonshine.reset();
+                    if worker_done(&proxy) {
+                        break;
+                    }
+                    continue;
+                };
+                let start = Instant::now();
+                let finished = session.finish();
+                moonshine.total_ms += start.elapsed().as_millis();
+                let update = match finished {
+                    Ok(update) => update,
+                    Err(err) => {
+                        // Session already discarded the stream and cursor.
+                        moonshine.fail(err);
+                        moonshine.reset();
+                        if worker_done(&proxy) {
+                            break;
+                        }
+                        continue;
+                    }
+                };
+                // Finalization can be slow on an old CPU; a Cancel that
+                // arrived meanwhile must discard this final text too.
+                if pop_cancel(&mut queue, &rx) {
+                    moonshine.reset();
+                    if worker_done(&proxy) {
+                        break 'worker;
+                    }
+                    continue 'worker;
+                }
+                // After any failure (transcription or typing) this recording is
+                // already reported once; do not attempt to type its tail or
+                // notify again at stop.
+                if !moonshine.failed && !update.completed.is_empty() {
+                    type_moonshine_text(&update.completed, &mut moonshine, typer.as_mut());
+                }
+                let avg_ms = if moonshine.chunks > 0 {
+                    moonshine.total_ms / moonshine.chunks as u128
+                } else {
+                    0
+                };
+                if moonshine.typed_chars > 0 {
+                    dlog!(
+                        "moonshine: {} chunks, avg {} ms/chunk, typed {} chars, done {} ms after stop",
+                        moonshine.chunks,
+                        avg_ms,
+                        moonshine.typed_chars,
+                        stop_time.elapsed().as_millis()
+                    );
+                } else if !moonshine.failed {
+                    report_empty_recording(total_seconds);
+                }
+                moonshine.reset();
+                if worker_done(&proxy) {
+                    break;
                 }
             }
             Job::End {
@@ -3050,6 +3625,10 @@ fn transcribe_worker(
                 if let Some(live_model) = models.live.as_mut() {
                     live_model.reset();
                 }
+                moonshine.reset();
+                if let Some(session) = models.moonshine.as_mut() {
+                    session.cancel();
+                }
                 if worker_done(&proxy) {
                     break;
                 }
@@ -3057,6 +3636,8 @@ fn transcribe_worker(
             Job::SwapAsr(model) => {
                 models.asr = Some(model);
                 models.live = None;
+                models.moonshine = None;
+                moonshine.reset();
                 if proxy.send_event(UserEvent::ModeSwapped).is_err() {
                     break;
                 }
@@ -3064,11 +3645,71 @@ fn transcribe_worker(
             Job::SwapLive(model) => {
                 models.live = Some(model);
                 models.asr = None;
+                models.moonshine = None;
+                moonshine.reset();
+                if proxy.send_event(UserEvent::ModeSwapped).is_err() {
+                    break;
+                }
+            }
+            Job::SwapMoonshine(model) => {
+                // Dropping the old session closes any stream it still holds.
+                models.moonshine = Some(crate::moonshine::Session::new(model));
+                models.asr = None;
+                models.live = None;
+                moonshine.reset();
                 if proxy.send_event(UserEvent::ModeSwapped).is_err() {
                     break;
                 }
             }
         }
+    }
+}
+
+/// Type text committed by Moonshine and count it. A typing failure keeps the
+/// text on stderr and counts nothing, like the other modes.
+fn type_moonshine_text(
+    text: &str,
+    run: &mut MoonshineRun,
+    typer: Result<&mut crate::typer::Typer, &mut anyhow::Error>,
+) {
+    if run.failed {
+        // The recording already reported its one failure.
+        return;
+    }
+    let typed = match typer {
+        Ok(typer) => typer.type_text(text),
+        Err(err) => Err(anyhow::anyhow!("{err:#}")),
+    };
+    match typed {
+        Ok(()) => run.typed_chars += text.chars().count(),
+        Err(err) => {
+            run.failed = true;
+            live_type_failed(text, err);
+        }
+    }
+}
+
+/// Log + notify one Moonshine failure (never a silent loss).
+fn report_moonshine_failure(err: anyhow::Error) {
+    dlog!("error: {err:#}");
+    crate::notify::show(
+        crate::notify::Kind::Error,
+        "dictate: transcription failed",
+        &format!("{err:#}"),
+    );
+}
+
+/// Log + notify an empty/too-short recording for a streaming mode.
+fn report_empty_recording(total_seconds: f32) {
+    if total_seconds * 1000.0 < crate::mic::MIN_RECORDING_SAMPLES as f32 / 16_000.0 * 1000.0 {
+        let ms = (total_seconds * 1000.0) as u64;
+        let message = format!("Recording too short ({ms} ms); nothing to transcribe.");
+        dlog!("{message}");
+        crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
+    } else {
+        let message = crate::asr::no_speech_message(total_seconds);
+        dlog!("{message}");
+        crate::notify::show(crate::notify::Kind::Info, "dictate", &message);
     }
 }
 
@@ -3323,6 +3964,23 @@ mod tests {
     }
 
     #[test]
+    fn moonshine_reports_only_the_first_failure_until_reset() {
+        let mut run = MoonshineRun {
+            chunks: 3,
+            typed_chars: 7,
+            ..MoonshineRun::default()
+        };
+        assert!(run.mark_failed());
+        assert!(!run.mark_failed());
+        assert!(run.failed);
+        run.reset();
+        assert!(!run.failed);
+        assert_eq!(run.chunks, 0);
+        assert_eq!(run.typed_chars, 0);
+        assert!(run.mark_failed(), "a new recording reports again");
+    }
+
+    #[test]
     fn daemon_log_path_appends_file_name() {
         assert_eq!(
             daemon_log_path_for(Path::new("/data")),
@@ -3366,20 +4024,28 @@ mod tests {
 
     #[test]
     fn download_progress_body_names_the_milestone() {
-        let live = SwitchTarget::Mode(crate::config::Mode::Live);
+        let live = crate::config::Selection::new(
+            crate::config::DictationMode::Live,
+            crate::config::ModelChoice::Nemotron,
+        )
+        .unwrap();
         assert_eq!(
             download_progress_body(live, 25),
-            "Downloading Live model… 25%"
+            "Downloading Nemotron Streaming… 25%"
         );
         assert_eq!(
             download_progress_body(live, 50),
-            "Downloading Live model… 50%"
+            "Downloading Nemotron Streaming… 50%"
         );
         assert_eq!(
             download_progress_body(live, 75),
-            "Downloading Live model… 75%"
+            "Downloading Nemotron Streaming… 75%"
         );
-        let fluid = SwitchTarget::SpeechModel(crate::config::SpeechModel::Fluid);
+        let fluid = crate::config::Selection::new(
+            crate::config::DictationMode::Whole,
+            crate::config::ModelChoice::Fluid,
+        )
+        .unwrap();
         assert_eq!(
             download_progress_body(fluid, 50),
             "Downloading Fluid Speech Mini… 50%"

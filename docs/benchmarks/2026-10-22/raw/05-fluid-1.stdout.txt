@@ -1,0 +1,356 @@
+{
+  "engine": "fluid",
+  "engine_errors": [],
+  "engine_label": "Fluid Speech Mini int8",
+  "generated_unix_ms": 1792703972801,
+  "jfk": {
+    "audio_seconds": 11.0,
+    "path": "/home/saeid/projects/dictate/tests/fixtures/jfk.wav",
+    "runs": [
+      {
+        "decode_ms": 3949,
+        "rtf": 0.359,
+        "run": 1,
+        "status": "ok",
+        "transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
+      },
+      {
+        "decode_ms": 3842,
+        "rtf": 0.3492727272727273,
+        "run": 2,
+        "status": "ok",
+        "transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
+      },
+      {
+        "decode_ms": 3864,
+        "rtf": 0.3512727272727273,
+        "run": 3,
+        "status": "ok",
+        "transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
+      },
+      {
+        "decode_ms": 3879,
+        "rtf": 0.35263636363636364,
+        "run": 4,
+        "status": "ok",
+        "transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
+      },
+      {
+        "decode_ms": 3880,
+        "rtf": 0.3527272727272727,
+        "run": 5,
+        "status": "ok",
+        "transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
+      }
+    ]
+  },
+  "kind": "dictate-engine-benchmark",
+  "load": {
+    "first_chunk_ms": null,
+    "first_decode_ms": 3915,
+    "model_load_ms": 385,
+    "warmup_total_ms": 3915,
+    "warmup_transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
+  },
+  "memory": {
+    "after_load": {
+      "peak_rss_bytes": 242991104,
+      "rss_bytes": 222171136
+    },
+    "at_end": {
+      "peak_rss_bytes": 545480704,
+      "rss_bytes": 478478336
+    },
+    "units": "bytes; Linux /proc/self/status VmRSS and VmHWM for the whole process, including runtime and scratch, never weights-only RAM"
+  },
+  "options": {
+    "corpus": "/home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json",
+    "engine": "fluid",
+    "jfk": "/home/saeid/projects/dictate/tests/fixtures/jfk.wav",
+    "model_dir": "/home/saeid/.cache/dictate-verification-2026-10-22/models",
+    "paced_runs": 3,
+    "quick": false,
+    "runs": 5,
+    "threads": "1"
+  },
+  "paced": null,
+  "preload": {
+    "corpus_audio_seconds": 81.345,
+    "corpus_clips": 12,
+    "corpus_manifest": "/home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json",
+    "jfk_path": "/home/saeid/projects/dictate/tests/fixtures/jfk.wav",
+    "jfk_seconds": 11.0,
+    "ms": 46
+  },
+  "quality": {
+    "corpus": {
+      "audio_seconds": 81.345,
+      "clips": 12,
+      "dataset": "openslr/librispeech_asr",
+      "license": "CC-BY-4.0",
+      "name": "LibriSpeech test-clean: fixed six-speaker subset",
+      "path": "/home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json",
+      "revision": "71cacbfb7e2354c4226d01e70d77d5fca3d04ba1",
+      "selection": "Two 3-12 second clips per speaker, three male and three female speakers, first qualifying rows at fixed offsets 0,250,500,750,1000,1500. Small read-English sample, not conversational/accents benchmark.",
+      "source_url": "https://www.openslr.org/12/"
+    },
+    "runs": [
+      {
+        "clip_id": "6930-75918-0000",
+        "dataset_row": 0,
+        "decode_ms": 2498,
+        "duration_seconds": 3.505,
+        "reference": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS",
+        "rtf": 0.7126961483594865,
+        "speaker_gender": "M",
+        "speaker_id": 6930,
+        "status": "ok",
+        "transcript": "Concorde returned to its place amidst the tents,"
+      },
+      {
+        "clip_id": "6930-75918-0002",
+        "dataset_row": 2,
+        "decode_ms": 2868,
+        "duration_seconds": 5.025,
+        "reference": "CONGRATULATIONS WERE POURED IN UPON THE PRINCESS EVERYWHERE DURING HER JOURNEY",
+        "rtf": 0.5707462686567164,
+        "speaker_gender": "M",
+        "speaker_id": 6930,
+        "status": "ok",
+        "transcript": "Congratulations were poured in upon the princess everywhere during her journey,"
+      },
+      {
+        "clip_id": "260-123288-0018",
+        "dataset_row": 250,
+        "decode_ms": 2376,
+        "duration_seconds": 3.245,
+        "reference": "THE RAFT BEARS ON STILL TO THE SOUTH EAST",
+        "rtf": 0.7322033898305085,
+        "speaker_gender": "M",
+        "speaker_id": 260,
+        "status": "ok",
+        "transcript": "the raft bears on still to the south east,"
+      },
+      {
+        "clip_id": "260-123288-0022",
+        "dataset_row": 254,
+        "decode_ms": 2491,
+        "duration_seconds": 3.705,
+        "reference": "THEY SEEM TO BE WE ARE LOST BUT I AM NOT SURE",
+        "rtf": 0.6723346828609986,
+        "speaker_gender": "M",
+        "speaker_id": 260,
+        "status": "ok",
+        "transcript": "They seem to be we are lost, but I am not sure."
+      },
+      {
+        "clip_id": "2961-960-0004",
+        "dataset_row": 501,
+        "decode_ms": 3431,
+        "duration_seconds": 8.22,
+        "reference": "THERE IS NO DANGER OF THE MODERN COMMENTATORS ON THE TIMAEUS FALLING INTO THE ABSURDITIES OF THE NEO PLATONISTS",
+        "rtf": 0.4173965936739659,
+        "speaker_gender": "F",
+        "speaker_id": 2961,
+        "status": "ok",
+        "transcript": "There is no danger of the modern commentators on the Timaeus falling into the absurdities of the Neoplatonists."
+      },
+      {
+        "clip_id": "2961-960-0005",
+        "dataset_row": 502,
+        "decode_ms": 3719,
+        "duration_seconds": 10.355,
+        "reference": "IN THE PRESENT DAY WE ARE WELL AWARE THAT AN ANCIENT PHILOSOPHER IS TO BE INTERPRETED FROM HIMSELF AND BY THE CONTEMPORARY HISTORY OF THOUGHT",
+        "rtf": 0.35915016900048286,
+        "speaker_gender": "F",
+        "speaker_id": 2961,
+        "status": "ok",
+        "transcript": "In the present day we are well aware that an ancient philosopher is to be interpreted from himself and by the contemporary history of thought."
+      },
+      {
+        "clip_id": "1995-1826-0000",
+        "dataset_row": 750,
+        "decode_ms": 3611,
+        "duration_seconds": 9.485,
+        "reference": "IN THE DEBATE BETWEEN THE SENIOR SOCIETIES HER DEFENCE OF THE FIFTEENTH AMENDMENT HAD BEEN NOT ONLY A NOTABLE BIT OF REASONING BUT DELIVERED WITH REAL ENTHUSIASM",
+        "rtf": 0.38070637849235633,
+        "speaker_gender": "F",
+        "speaker_id": 1995,
+        "status": "ok",
+        "transcript": "In the debate between the senior societies, her defense of the fifteenth Amendment had been not only a notable bit of reasoning, but delivered with real enthusiasm."
+      },
+      {
+        "clip_id": "1995-1826-0001",
+        "dataset_row": 751,
+        "decode_ms": 3742,
+        "duration_seconds": 10.17,
+        "reference": "THE SOUTH SHE HAD NOT THOUGHT OF SERIOUSLY AND YET KNOWING OF ITS DELIGHTFUL HOSPITALITY AND MILD CLIMATE SHE WAS NOT AVERSE TO CHARLESTON OR NEW ORLEANS",
+        "rtf": 0.367944936086529,
+        "speaker_gender": "F",
+        "speaker_id": 1995,
+        "status": "ok",
+        "transcript": "The South she had not thought of seriously, and yet, knowing of its delightful hospitality and mild climate, she was not averse to Charleston or New Orleans."
+      },
+      {
+        "clip_id": "8455-210777-0028",
+        "dataset_row": 1000,
+        "decode_ms": 3244,
+        "duration_seconds": 7.735,
+        "reference": "JACK WOULD BECOME EVA'S HAPPY HUSBAND AND WOULD REMAIN AMIDST THE HURRIED DUTIES OF THE EAGER WORLD",
+        "rtf": 0.4193923723335488,
+        "speaker_gender": "M",
+        "speaker_id": 8455,
+        "status": "ok",
+        "transcript": "Jack would become Eva's happy husband, and would remain amidst the hurried duties of the eager world."
+      },
+      {
+        "clip_id": "8455-210777-0029",
+        "dataset_row": 1001,
+        "decode_ms": 2339,
+        "duration_seconds": 3.085,
+        "reference": "THINKING OF ALL THIS I WENT TO SLEEP",
+        "rtf": 0.7581847649918962,
+        "speaker_gender": "M",
+        "speaker_id": 8455,
+        "status": "ok",
+        "transcript": "Thinking of all this, I went to sleep."
+      },
+      {
+        "clip_id": "4507-16021-0033",
+        "dataset_row": 1502,
+        "decode_ms": 2792,
+        "duration_seconds": 5.545,
+        "reference": "DO WE REALLY KNOW THE MOUNTAIN WELL WHEN WE ARE NOT ACQUAINTED WITH THE CAVERN",
+        "rtf": 0.5035166816952209,
+        "speaker_gender": "F",
+        "speaker_id": 4507,
+        "status": "ok",
+        "transcript": "Do we really know the mountain well when we are not acquainted with the cavern?"
+      },
+      {
+        "clip_id": "4507-16021-0034",
+        "dataset_row": 1503,
+        "decode_ms": 3935,
+        "duration_seconds": 11.27,
+        "reference": "THEY CONSTITUTE TWO DIFFERENT ORDERS OF FACTS WHICH CORRESPOND TO EACH OTHER WHICH ARE ALWAYS INTERLACED AND WHICH OFTEN BRING FORTH RESULTS",
+        "rtf": 0.34915705412599823,
+        "speaker_gender": "F",
+        "speaker_id": 4507,
+        "status": "ok",
+        "transcript": "They constitute two different orders of facts which correspond to each other, which are always interlaced, and which often bring forth results."
+      }
+    ]
+  },
+  "runtime": {
+    "executable": "/home/saeid/projects/dictate/target/release/dictate",
+    "extra_model_dirs": [],
+    "model_bytes": 300146787,
+    "model_dir": "/home/saeid/.cache/dictate-verification-2026-10-22/models/fluid-speech-mini-onnx",
+    "model_files": [
+      {
+        "bytes": 508,
+        "path": "/home/saeid/.cache/dictate-verification-2026-10-22/models/fluid-speech-mini-onnx/config.json"
+      },
+      {
+        "bytes": 24461296,
+        "path": "/home/saeid/.cache/dictate-verification-2026-10-22/models/fluid-speech-mini-onnx/decoder.onnx"
+      },
+      {
+        "bytes": 426102,
+        "path": "/home/saeid/.cache/dictate-verification-2026-10-22/models/fluid-speech-mini-onnx/encoder.onnx"
+      },
+      {
+        "bytes": 253429760,
+        "path": "/home/saeid/.cache/dictate-verification-2026-10-22/models/fluid-speech-mini-onnx/encoder.onnx.data"
+      },
+      {
+        "bytes": 8697130,
+        "path": "/home/saeid/.cache/dictate-verification-2026-10-22/models/fluid-speech-mini-onnx/frontend.onnx"
+      },
+      {
+        "bytes": 11840320,
+        "path": "/home/saeid/.cache/dictate-verification-2026-10-22/models/fluid-speech-mini-onnx/joint.onnx"
+      },
+      {
+        "bytes": 131712,
+        "path": "/home/saeid/.cache/dictate-verification-2026-10-22/models/fluid-speech-mini-onnx/mel_filters.npy"
+      },
+      {
+        "bytes": 1159959,
+        "path": "/home/saeid/.cache/dictate-verification-2026-10-22/models/fluid-speech-mini-onnx/tokenizer.json"
+      }
+    ],
+    "package_version": "0.8.1"
+  },
+  "schema_version": 1,
+  "status": "ok",
+  "stress": [
+    {
+      "case_id": "silence-5s",
+      "decode_ms": 2656,
+      "duration_seconds": 5.0,
+      "kind": "silence",
+      "label": "five seconds of digital silence; any words are false words",
+      "rtf": 0.5312,
+      "status": "ok",
+      "synthetic": true,
+      "transcript": ""
+    },
+    {
+      "case_id": "noise-5s",
+      "decode_ms": 2665,
+      "duration_seconds": 5.0,
+      "kind": "noise",
+      "label": "five seconds of deterministic low-level noise (uniform +/-0.01); any words are false words",
+      "rtf": 0.533,
+      "status": "ok",
+      "synthetic": true,
+      "transcript": ""
+    },
+    {
+      "case_id": "jfk-short-3s",
+      "decode_ms": 2321,
+      "duration_seconds": 3.0,
+      "kind": "short_speech",
+      "label": "first three seconds of the public-domain JFK reference (synthetic truncation)",
+      "rtf": 0.7736666666666666,
+      "status": "ok",
+      "synthetic": true,
+      "transcript": "And so my fellow Americans."
+    },
+    {
+      "case_id": "jfk-repeated-4x",
+      "decode_ms": 13390,
+      "duration_seconds": 44.75,
+      "kind": "long_repeated_speech",
+      "label": "the JFK reference repeated four times with 0.25 s gaps (synthetic; not included in corpus WER)",
+      "rtf": 0.29921787709497205,
+      "status": "ok",
+      "synthetic": true,
+      "transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country. And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country. And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country. And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
+    }
+  ],
+  "threads": {
+    "effective": 1,
+    "policy": "explicit native intra-op thread count",
+    "requested": "1"
+  },
+  "whole_vs_paused_jfk": {
+    "errors": [],
+    "note": "single paired warm JFK trial; these are raw values, not a statistical distribution",
+    "paused_decode_ms": 9913,
+    "paused_failures": 0,
+    "paused_segments": 4,
+    "paused_total_ms": 9959,
+    "paused_transcript": "And so my fellow Americans ask not what your country can do for you, ask what you can do for your country.",
+    "paused_vad_ms": 44.02703300000001,
+    "status": "ok",
+    "trials": 1,
+    "vad_fresh_load": true,
+    "vad_load_in_paused_total": false,
+    "vad_load_ms": 33,
+    "whole_ms": 3886,
+    "whole_status": "ok",
+    "whole_transcript": "And so, my fellow Americans, ask not what your country can do for you, ask what you can do for your country."
+  }
+}

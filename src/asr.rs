@@ -6,6 +6,7 @@ use parakeet_rs::ort::environment::Environment;
 use parakeet_rs::{ExecutionConfig, ParakeetTDT, TimestampMode, Transcriber};
 
 use crate::config::SpeechModel;
+use crate::segment::SegmentStart;
 
 /// The loaded Whole/Pauses recognizer. Both engines expose the same two
 /// operations, so every call site keeps calling [`Asr::transcribe`] and
@@ -13,6 +14,7 @@ use crate::config::SpeechModel;
 enum Engine {
     Parakeet(ParakeetTDT),
     Fluid(crate::fluid::FluidModel),
+    Whisper(crate::whisper::Whisper),
 }
 
 pub struct Asr {
@@ -103,6 +105,36 @@ pub struct Word {
     pub end: f32,
 }
 
+/// One decoded streaming piece ready for [`join_piece`].
+pub(crate) struct Piece {
+    pub(crate) words: Vec<String>,
+    pub(crate) boundary: Option<char>,
+    /// True when the decode covered only the new segment (no repeated left
+    /// context), so the join must not treat matching words as overlap.
+    pub(crate) disjoint: bool,
+}
+
+/// How a streaming piece joins already-typed text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum JoinMode {
+    /// Context decode trimmed at the boundary: the narrow 1-2 word overlap
+    /// dedupe applies (all engines when left context is present).
+    Overlap,
+    /// Decoded alone (the first segment or a timing fallback): the audio is
+    /// disjoint, so repeated words are speech. Spacing and punctuation only.
+    Disjoint,
+}
+
+impl JoinMode {
+    pub(crate) fn from_disjoint(disjoint: bool) -> Self {
+        if disjoint {
+            Self::Disjoint
+        } else {
+            Self::Overlap
+        }
+    }
+}
+
 /// Keep the words decoded at/after the context boundary: a word belongs to
 /// the segment when its midpoint is at or past `context_s` (seconds).
 pub(crate) fn keep_words_after(words: &[Word], context_s: f32) -> Vec<Word> {
@@ -155,14 +187,21 @@ pub(crate) fn boundary_punct_before(words: &[Word], context_s: f32) -> Option<ch
 /// Join one streaming piece onto already-typed text.
 ///
 /// `prev_tail_words` are the last up to 2 typed words (for overlap dedupe).
-/// `pending_punct` is the previous piece's held trailing punctuation: it is
-/// superseded by the boundary (typed instead, or dropped when there is none)
-/// and only reaches the page at `End`, so this function takes it to make the
-/// replacement explicit and then ignores it. `context_boundary_punct` is the
-/// punctuation from the context decode on the last context word before the
-/// boundary; punctuation leading the kept words supersedes it (the fresher
-/// decode). `kept_words` are the current piece's decoded word texts (at/after
-/// the boundary).
+/// `pending_punct` is the previous piece's held trailing punctuation.
+/// `context_boundary_punct` is the punctuation from the context decode on the
+/// last context word before the boundary; punctuation leading the kept words
+/// supersedes it (the fresher decode). `kept_words` are the current piece's
+/// decoded word texts (at/after the boundary). `mode` selects the overlap
+/// policy:
+///
+/// - [`JoinMode::Overlap`]: the piece was decoded with left context, so the
+///   narrow 1-2 word dedupe applies and `pending_punct` is superseded by the
+///   boundary (typed instead, or dropped when the context decode has none).
+/// - [`JoinMode::Disjoint`]: the piece was decoded alone (the first segment or
+///   a timing fallback), so repeated words are real speech: no dedupe, and the
+///   previous piece's pending punctuation is typed because no context decode
+///   will replace it. A sentence-ending pending mark wins over a leading
+///   comma/colon.
 ///
 /// Returns the text to type (boundary punctuation plus spacing included) and
 /// the new pending trailing punctuation (held for the next boundary or `End`).
@@ -173,19 +212,29 @@ pub(crate) fn join_piece(
     pending_punct: Option<char>,
     context_boundary_punct: Option<char>,
     kept_words: &[String],
+    mode: JoinMode,
 ) -> (String, Option<char>) {
-    let _ = pending_punct;
     let mut kept: Vec<String> = kept_words.to_vec();
-    let mut boundary = context_boundary_punct;
+    let mut boundary = match mode {
+        JoinMode::Overlap => context_boundary_punct,
+        JoinMode::Disjoint => None,
+    };
     // Leading punctuation (standalone tokens and prefixes) is the boundary:
     // the context decode placed it at/after the cut.
     strip_leading_punct(&mut kept, &mut boundary);
-    // Overlap dedupe: drop the first 1-2 kept words when they equal the last
-    // 1-2 typed words (case and punctuation-insensitive).
-    dedupe_overlap(prev_tail_words, &mut kept);
-    // Dedupe can expose a new leading punctuation token; it is a boundary
-    // too (and never typed with a space before it).
-    strip_leading_punct(&mut kept, &mut boundary);
+    match mode {
+        JoinMode::Overlap => {
+            // Overlap dedupe: drop the first 1-2 kept words when they equal the
+            // last 1-2 typed words (case and punctuation-insensitive).
+            dedupe_overlap(prev_tail_words, &mut kept);
+            // Dedupe can expose a new leading punctuation token; it is a
+            // boundary too (and never typed with a space before it).
+            strip_leading_punct(&mut kept, &mut boundary);
+        }
+        JoinMode::Disjoint => {
+            boundary = disjoint_boundary(pending_punct, boundary, context_boundary_punct);
+        }
+    }
     // Hold back the new trailing punctuation.
     let mut new_pending = None;
     if let Some(last) = kept.last_mut()
@@ -219,6 +268,35 @@ pub(crate) fn join_piece(
     }
 }
 
+/// Boundary for a disjoint piece: keep the previous piece's held punctuation,
+/// because the fresh decode never saw that audio. A sentence-ending mark is
+/// not replaced by a leading clause comma/colon; otherwise the fresher leading
+/// punctuation wins. `context` is a fallback for a timing fallback that still
+/// decoded the context for punctuation.
+fn disjoint_boundary(
+    pending: Option<char>,
+    leading: Option<char>,
+    context: Option<char>,
+) -> Option<char> {
+    match (pending, leading) {
+        (Some(pending), Some(leading)) => {
+            Some(if is_sentence_end(pending) && !is_sentence_end(leading) {
+                pending
+            } else {
+                leading
+            })
+        }
+        (Some(pending), None) => Some(pending),
+        (None, Some(leading)) => Some(leading),
+        (None, None) => context,
+    }
+}
+
+/// Whether punctuation ends a sentence rather than a clause.
+fn is_sentence_end(punct: char) -> bool {
+    matches!(punct, '.' | '!' | '?')
+}
+
 /// Move leading punctuation (standalone tokens and prefixes) into the
 /// boundary; the last one wins. Boundary punctuation is ASCII, so the byte
 /// split below always lands on a char boundary.
@@ -240,7 +318,8 @@ fn strip_leading_punct(kept: &mut Vec<String>, boundary: &mut Option<char>) {
 
 /// Drop the first 1-2 kept words when they repeat the last typed words.
 /// Comparison is lowercase with punctuation removed; empty normalizations
-/// never match.
+/// never match. This narrow overlap is the established behavior for
+/// Parakeet/Fluid; it does not remove repeated phrases inside new audio.
 fn dedupe_overlap(prev_tail_words: &[String], kept: &mut Vec<String>) {
     fn norm(word: &str) -> String {
         word.chars()
@@ -301,7 +380,14 @@ pub(crate) fn intra_threads() -> usize {
 impl Asr {
     /// Load the standard (NVIDIA Parakeet) model from `dir`.
     pub fn load(dir: &Path) -> anyhow::Result<Self> {
-        let threads = intra_threads();
+        Self::load_with_threads(dir, intra_threads())
+    }
+
+    /// Load the standard model with an explicit intra-op thread count. The
+    /// default [`Asr::load`] path and all production call sites are unchanged;
+    /// the benchmark uses this to measure 1 and 2 threads through the real
+    /// constructor parameter.
+    pub(crate) fn load_with_threads(dir: &Path, threads: usize) -> anyhow::Result<Self> {
         let model = load_inner(dir, threads)
             .with_context(|| format!("Loading speech model from {} failed", dir.display()))?;
         eprintln!("using {threads} threads");
@@ -312,25 +398,50 @@ impl Asr {
 
     /// Load Fluid Speech Mini from `dir`.
     pub fn load_fluid(dir: &Path) -> anyhow::Result<Self> {
-        let model = crate::fluid::FluidModel::load(dir)
+        Self::load_fluid_with_threads(dir, intra_threads())
+    }
+
+    /// Load Fluid Speech Mini with an explicit thread count. Production keeps
+    /// using [`Asr::load_fluid`]; the benchmark needs the same constructor
+    /// with a measured 1/2-thread setting.
+    pub(crate) fn load_fluid_with_threads(dir: &Path, threads: usize) -> anyhow::Result<Self> {
+        let model = crate::fluid::FluidModel::load_with_threads(dir, threads)
             .with_context(|| {
                 format!(
                     "Loading Fluid Speech Mini from {} failed. If this keeps happening, delete that folder and run \"dictate download --fluid\" again",
                     dir.display()
                 )
             })?;
-        eprintln!("using {} threads", intra_threads());
+        eprintln!("using {threads} threads");
         Ok(Self {
             engine: Engine::Fluid(model),
         })
     }
 
-    /// Load the speech model selected in the settings (`model = "standard"` or
-    /// `"fluid"`, with `DICTATE_SPEECH_MODEL` winning).
+    /// Load Whisper Tiny English from `dir` with the configured small-model
+    /// thread count.
+    pub fn load_whisper(dir: &Path) -> anyhow::Result<Self> {
+        Self::load_whisper_with_threads(dir, crate::config::small_model_threads())
+    }
+
+    /// Load Whisper Tiny English with an explicit thread count. whisper.cpp
+    /// receives it through `FullParams::set_n_threads` on every decode.
+    pub(crate) fn load_whisper_with_threads(dir: &Path, threads: usize) -> anyhow::Result<Self> {
+        let path = crate::model::whisper_model_path_in(dir);
+        let model = crate::whisper::Whisper::load(&path, threads)
+            .with_context(|| format!("Loading Whisper model from {} failed", path.display()))?;
+        Ok(Self {
+            engine: Engine::Whisper(model),
+        })
+    }
+
+    /// Load the speech model selected in the settings (`model = "standard"`,
+    /// `"fluid"` or `"whisper"`, with `DICTATE_SPEECH_MODEL` winning).
     pub fn load_configured() -> anyhow::Result<Self> {
         match crate::config::speech_model() {
             SpeechModel::Standard => Self::load(&crate::model::model_dir_checked()?),
             SpeechModel::Fluid => Self::load_fluid(&crate::model::fluid_model_dir_checked()?),
+            SpeechModel::Whisper => Self::load_whisper(&crate::model::whisper_model_dir_checked()?),
         }
     }
 
@@ -341,6 +452,7 @@ impl Asr {
                 Ok(result.text.trim().to_string())
             }
             Engine::Fluid(model) => Ok(model.transcribe(samples)?.trim().to_string()),
+            Engine::Whisper(model) => model.transcribe(samples),
         }
     }
 
@@ -365,28 +477,47 @@ impl Asr {
                     .collect())
             }
             Engine::Fluid(model) => model.transcribe_words(samples),
+            Engine::Whisper(_) => {
+                anyhow::bail!("Whisper Tiny English does not expose word timestamps")
+            }
         }
     }
 
-    /// Transcribe one streaming segment, returning the kept word texts plus
-    /// the boundary punctuation from the context decode. Segments after the
-    /// first are decoded with left `context` audio for accuracy at the cut,
-    /// then trimmed to the words at/after the context boundary; the boundary
-    /// is the trailing punctuation on the last context word before it. The
-    /// first segment (empty context) decodes alone via plain transcribe, split
-    /// into words. Empty results are `(empty, None)` and skipped silently.
+    /// Transcribe one streaming segment, returning the kept words, the
+    /// boundary punctuation and whether the piece is disjoint from the
+    /// previous one. Segments after the first are decoded with left `context`
+    /// audio for accuracy at the cut, then trimmed to the words at/after the
+    /// context boundary; the boundary is the trailing punctuation on the last
+    /// context word before it. Whisper follows the same rule and reports a
+    /// segment-only decode as disjoint (the first segment, or its timing
+    /// fallback). `start` is the segment's provenance for logs and benchmark
+    /// boundaries; it does not change the decode. The first segment (empty
+    /// context) decodes alone via plain transcribe, split into words. Empty
+    /// results hold no words and are skipped silently.
     pub(crate) fn transcribe_segment_pieces(
         &mut self,
         context: &[f32],
         segment: &[f32],
-    ) -> anyhow::Result<(Vec<String>, Option<char>)> {
+        start: SegmentStart,
+    ) -> anyhow::Result<Piece> {
+        if let Engine::Whisper(model) = &mut self.engine {
+            return model.transcribe_pieces(context, segment, start.in_known_silence());
+        }
         if context.is_empty() {
             let text = self.transcribe(segment)?;
             if is_empty_transcript(&text) {
-                return Ok((Vec::new(), None));
+                return Ok(Piece {
+                    words: Vec::new(),
+                    boundary: None,
+                    disjoint: false,
+                });
             }
             let words = text.split_whitespace().map(str::to_string).collect();
-            return Ok((words, None));
+            return Ok(Piece {
+                words,
+                boundary: None,
+                disjoint: false,
+            });
         }
         let mut audio = Vec::with_capacity(context.len() + segment.len());
         audio.extend_from_slice(context);
@@ -396,7 +527,11 @@ impl Asr {
         let boundary = boundary_punct_before(&words, context_s);
         let kept = keep_words_after(&words, context_s);
         let texts = kept.into_iter().map(|word| word.text).collect();
-        Ok((texts, boundary))
+        Ok(Piece {
+            words: texts,
+            boundary,
+            disjoint: false,
+        })
     }
 }
 
@@ -525,9 +660,16 @@ mod tests {
 
     #[test]
     fn join_piece_first_piece_holds_trailing_punctuation() {
-        let (text, pending) = join_piece(&[], None, None, &texts(&["And", "so"]));
+        let (text, pending) =
+            join_piece(&[], None, None, &texts(&["And", "so"]), JoinMode::Overlap);
         assert_eq!((text.as_str(), pending), ("And so", None));
-        let (text, pending) = join_piece(&[], None, None, &texts(&["hello", "you."]));
+        let (text, pending) = join_piece(
+            &[],
+            None,
+            None,
+            &texts(&["hello", "you."]),
+            JoinMode::Overlap,
+        );
         assert_eq!((text.as_str(), pending), ("hello you", Some('.')));
     }
 
@@ -537,7 +679,7 @@ mod tests {
         // pending `.` plus a leading `,` both reached the page.
         let prev = texts(&["for", "you"]);
         let kept = texts(&[",", "ask", "what"]);
-        let (text, pending) = join_piece(&prev, Some('.'), Some(','), &kept);
+        let (text, pending) = join_piece(&prev, Some('.'), Some(','), &kept, JoinMode::Overlap);
         assert_eq!((text.as_str(), pending), (", ask what", None));
     }
 
@@ -547,7 +689,7 @@ mod tests {
         // join must keep it rather than drop or garble it).
         let prev = texts(&["for", "you"]);
         let kept = texts(&["and", "what"]);
-        let (text, pending) = join_piece(&prev, Some(','), Some(','), &kept);
+        let (text, pending) = join_piece(&prev, Some(','), Some(','), &kept, JoinMode::Overlap);
         assert_eq!((text.as_str(), pending), (", and what", None));
     }
 
@@ -557,7 +699,7 @@ mod tests {
         // repeats the typed `you`).
         let prev = texts(&["for", "you"]);
         let kept = texts(&["you,", "and", "what"]);
-        let (text, pending) = join_piece(&prev, Some('.'), Some('.'), &kept);
+        let (text, pending) = join_piece(&prev, Some('.'), Some('.'), &kept, JoinMode::Overlap);
         assert_eq!((text.as_str(), pending), (". and what", None));
     }
 
@@ -567,16 +709,104 @@ mod tests {
         // the context decode has no punctuation, so none is typed).
         let prev = texts(&["your", "country"]);
         let kept = texts(&["can", "do"]);
-        let (text, pending) = join_piece(&prev, Some('.'), None, &kept);
+        let (text, pending) = join_piece(&prev, Some('.'), None, &kept, JoinMode::Overlap);
         assert_eq!((text.as_str(), pending), (" can do", None));
+    }
+
+    #[test]
+    fn join_piece_keeps_a_short_spoken_repetition() {
+        let (text, _) = join_piece(
+            &[],
+            None,
+            None,
+            &texts(&["no", "no", "thanks"]),
+            JoinMode::Overlap,
+        );
+        assert_eq!(text, "no no thanks");
+    }
+
+    #[test]
+    fn join_piece_keeps_a_deliberate_repeated_phrase() {
+        // The speaker really said "I agree with you" again. Repetition is
+        // speech: only the narrow 1-2 word overlap at the cut is removed, not
+        // an adjacent phrase inside the new audio.
+        let prev = texts(&["I", "agree", "with", "you"]);
+        let kept = texts(&["I", "agree", "with", "you", "again"]);
+        let (text, pending) = join_piece(&prev, None, None, &kept, JoinMode::Overlap);
+        assert_eq!((text.as_str(), pending), (" I agree with you again", None));
+
+        let prev = texts(&["And", "so", "my", "fellow", "Americans"]);
+        let kept = texts(&[
+            "And",
+            "so",
+            "my",
+            "fellow",
+            "Americans.",
+            "Ask",
+            "not",
+            "what",
+        ]);
+        let (text, pending) = join_piece(&prev, Some('.'), None, &kept, JoinMode::Overlap);
+        assert_eq!(
+            (text.as_str(), pending),
+            (" And so my fellow Americans. Ask not what", None)
+        );
     }
 
     #[test]
     fn join_piece_dedupes_two_word_overlap() {
         let prev = texts(&["can", "do"]);
         let kept = texts(&["Can", "do", "for"]);
-        let (text, pending) = join_piece(&prev, None, None, &kept);
+        let (text, pending) = join_piece(&prev, None, None, &kept, JoinMode::Overlap);
         assert_eq!((text.as_str(), pending), (" for", None));
+    }
+
+    #[test]
+    fn join_piece_disjoint_keeps_a_deliberate_repeated_word() {
+        // A segment-only decode: the speaker really said "can" at the start
+        // of the new phrase, so it must not be deduped.
+        let prev = texts(&["we", "can"]);
+        let kept = texts(&["can", "you", "hear"]);
+        let (text, pending) = join_piece(&prev, None, None, &kept, JoinMode::Disjoint);
+        assert_eq!((text.as_str(), pending), (" can you hear", None));
+    }
+
+    #[test]
+    fn join_piece_disjoint_keeps_a_deliberate_repeated_phrase() {
+        let prev = texts(&["I", "agree", "with", "you"]);
+        let kept = texts(&["I", "agree", "with", "you", "again"]);
+        let (text, pending) = join_piece(&prev, None, None, &kept, JoinMode::Disjoint);
+        assert_eq!((text.as_str(), pending), (" I agree with you again", None));
+    }
+
+    #[test]
+    fn join_piece_disjoint_types_the_previous_pending_punctuation() {
+        // A segment-only decode has no context decode to replace the previous
+        // piece's held period, so it must reach the page here.
+        let prev = texts(&["for", "you"]);
+        let kept = texts(&["And", "so"]);
+        let (text, pending) = join_piece(&prev, Some('.'), None, &kept, JoinMode::Disjoint);
+        assert_eq!((text.as_str(), pending), (". And so", None));
+    }
+
+    #[test]
+    fn join_piece_disjoint_does_not_duplicate_or_lose_punctuation() {
+        // A sentence already ended; a fresh decode's leading comma must not
+        // replace the period or reach the page as ".,".
+        let prev = texts(&["for", "you"]);
+        let kept = texts(&[",", "and", "so"]);
+        let (text, pending) = join_piece(&prev, Some('.'), None, &kept, JoinMode::Disjoint);
+        assert_eq!((text.as_str(), pending), (". and so", None));
+        // No previous punctuation: the leading comma is the boundary.
+        let (text, pending) = join_piece(&prev, None, None, &kept, JoinMode::Disjoint);
+        assert_eq!((text.as_str(), pending), (", and so", None));
+        // Same clause mark on both sides is typed once.
+        let (text, pending) = join_piece(&prev, Some(','), None, &kept, JoinMode::Disjoint);
+        assert_eq!((text.as_str(), pending), (", and so", None));
+        // Trailing punctuation stays held for the next boundary or End.
+        let kept = texts(&["and", "so."]);
+        let (text, pending) = join_piece(&prev, Some('.'), None, &kept, JoinMode::Disjoint);
+        assert_eq!((text.as_str(), pending), (". and so", Some('.')));
     }
 
     #[test]
@@ -584,9 +814,15 @@ mod tests {
         // No lowercasing: the context decode already capitalizes correctly
         // (lowercasing turned "Americans" into "americans" mid-sentence).
         let prev = texts(&["my", "fellow"]);
-        let (text, _) = join_piece(&prev, None, Some(','), &texts(&["Americans", "ask"]));
+        let (text, _) = join_piece(
+            &prev,
+            None,
+            Some(','),
+            &texts(&["Americans", "ask"]),
+            JoinMode::Overlap,
+        );
         assert_eq!(text, ", Americans ask");
-        let (text, _) = join_piece(&prev, None, Some('.'), &texts(&["Ask"]));
+        let (text, _) = join_piece(&prev, None, Some('.'), &texts(&["Ask"]), JoinMode::Overlap);
         assert_eq!(text, ". Ask");
     }
 
@@ -595,14 +831,21 @@ mod tests {
         // `for you` + `, ask`: the kept comma sits past the boundary, so it
         // is the boundary instead of being stripped (it used to be lost).
         let prev = texts(&["for", "you"]);
-        let (text, pending) = join_piece(&prev, None, None, &texts(&[",", "ask"]));
+        let (text, pending) =
+            join_piece(&prev, None, None, &texts(&[",", "ask"]), JoinMode::Overlap);
         assert_eq!((text.as_str(), pending), (", ask", None));
         // The kept punctuation is the fresher decode, so it wins over the
         // context boundary.
-        let (text, _) = join_piece(&prev, None, Some('.'), &texts(&[",", "ask"]));
+        let (text, _) = join_piece(
+            &prev,
+            None,
+            Some('.'),
+            &texts(&[",", "ask"]),
+            JoinMode::Overlap,
+        );
         assert_eq!(text, ", ask");
         // Prefix form.
-        let (text, _) = join_piece(&prev, None, None, &texts(&[",ask"]));
+        let (text, _) = join_piece(&prev, None, None, &texts(&[",ask"]), JoinMode::Overlap);
         assert_eq!(text, ", ask");
     }
 
@@ -611,14 +854,26 @@ mod tests {
         // Dedupe dropping "you" exposes a standalone `,`: it becomes the
         // boundary (`, and`), never a space-separated `you , and`.
         let prev = texts(&["for", "you"]);
-        let (text, pending) = join_piece(&prev, None, Some('.'), &texts(&["you", ",", "and"]));
+        let (text, pending) = join_piece(
+            &prev,
+            None,
+            Some('.'),
+            &texts(&["you", ",", "and"]),
+            JoinMode::Overlap,
+        );
         assert_eq!((text.as_str(), pending), (", and", None));
     }
 
     #[test]
     fn join_piece_deduped_to_empty_types_boundary_only() {
         let prev = texts(&["for", "you"]);
-        let (text, pending) = join_piece(&prev, Some('.'), Some(','), &texts(&["you"]));
+        let (text, pending) = join_piece(
+            &prev,
+            Some('.'),
+            Some(','),
+            &texts(&["you"]),
+            JoinMode::Overlap,
+        );
         assert_eq!((text.as_str(), pending), (",", None));
     }
 

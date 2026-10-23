@@ -273,6 +273,19 @@ fn handle_connection_inner(
         // `dictate daemon`. Close it with no reply and no log.
         return Ok(());
     }
+    #[cfg(target_os = "linux")]
+    if let Some(display) = line.trim().strip_prefix("shortcut ") {
+        let (reply_tx, reply_rx) = mpsc::channel();
+        proxy
+            .send_event(UserEvent::SetShortcut(display.to_string(), reply_tx))
+            .map_err(|_| anyhow::anyhow!("The daemon event loop closed"))?;
+        let reply = reply_rx
+            .recv_timeout(Duration::from_secs(2))
+            .unwrap_or_else(|_| "err daemon did not answer".into());
+        let mut stream = stream;
+        writeln!(stream, "{reply}")?;
+        return Ok(());
+    }
     let reply = if is_settings_request(&line) {
         open_settings_via(proxy)
     } else {

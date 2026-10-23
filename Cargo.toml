@@ -20,17 +20,22 @@ egui = { version = "0.37.0", features = ["default_fonts"] }
 egui-winit = { version = "0.37.0", default-features = false, features = ["clipboard", "links", "wayland", "x11"] }
 egui_glow = { version = "0.37.0", features = ["winit"] }
 enigo = { version = "0.6.1", features = ["wayland", "x11rb"] }
+flate2 = "1.1.10"
 global-hotkey = "0.8.0"
 glutin = "0.32"
 glutin-winit = "0.5.0"
 hound = "3.5.1"
+libloading = "0.9.0"
 notify-rust = "4.18.2"
 parakeet-rs = { version = "0.4.1", default-features = false, features = ["cpu", "api-28"] }
 realfft = "3.5.0"
 rubato = "5.0.1"
 serde_json = "1.0.154"
+sha2 = "0.10.9"
+tar = "0.4.46"
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
 ureq = "3.4.2"
+whisper-rs = "0.16.0"
 winit = "0.30.13"
 
 [features]
@@ -43,6 +48,10 @@ cpal = { version = "0.18.2", features = ["pulseaudio"] }
 wayland-client = "0.31.15"
 wayland-protocols-misc = { version = "0.3.12", features = ["client"] }
 tempfile = "3.27.0"
+zbus = "5.19.0"
+async-io = "2.6.0"
+async-channel = "2.5.0"
+futures-lite = "2.6.1"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-core-foundation = { version = "0.3.2", default-features = false, features = ["CFMachPort", "CFRunLoop"] }

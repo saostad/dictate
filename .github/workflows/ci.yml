@@ -133,6 +133,17 @@ jobs:
         with:
           path: fluid-speech-mini-onnx
           key: fluid-speech-mini-onnx-fc59262
+      - uses: actions/cache@v4
+        with:
+          path: whisper-tiny-en
+          key: whisper-tiny-en-q8_0-5bc2b3860aa151a4
+      - uses: actions/cache@v4
+        if: runner.os == 'Linux'
+        with:
+          path: |
+            moonshine-tiny-streaming-en
+            moonshine-runtime-0.1.5
+          key: moonshine-tiny-streaming-en-v0.1.5-quantized-26-08-21-${{ matrix.asset }}
       - name: Download ONNX Runtime (Linux x86_64)
         if: matrix.asset == 'dictate-linux-x86_64'
         run: |
@@ -163,6 +174,10 @@ jobs:
           "$BIN" download
           "$BIN" download --live
           "$BIN" download --fluid
+          "$BIN" download --whisper
+          if [ "$RUNNER_OS" = "Linux" ]; then
+            "$BIN" download --moonshine
+          fi
       - name: Show linked libraries (Linux bundled builds)
         if: runner.os == 'Linux' && matrix.asset != 'dictate-linux-x86_64'
         run: ldd target/${{ matrix.target }}/release/dictate
@@ -174,7 +189,7 @@ jobs:
           TARGET="${{ matrix.target }}"
           mkdir -p "$ASSET"
           cp "target/$TARGET/release/dictate" "$ASSET/"
-          cp README.md LICENSE "$ASSET/"
+          cp README.md LICENSE THIRD_PARTY_LICENSES.md "$ASSET/"
           echo "Bundled runtime libraries:"
           found=0
           for f in "target/$TARGET/release/"*.dll "target/$TARGET/release/"*.dylib "target/$TARGET/release/"*.so*; do
@@ -202,6 +217,7 @@ jobs:
           Copy-Item "target\$target\release\dictate.exe" "$asset\"
           Copy-Item "README.md" "$asset\"
           Copy-Item "LICENSE" "$asset\"
+          Copy-Item "THIRD_PARTY_LICENSES.md" "$asset\"
           Write-Output "Bundled runtime libraries:"
           $libs = Get-ChildItem "target\$target\release" -File | Where-Object { $_.Name -match '\.(dll|dylib|so(\..*)?)$' }
           if ($libs) {

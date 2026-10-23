@@ -6,10 +6,10 @@
 //! `UserEvent::Menu` via a winit proxy, like hotkeys.
 
 use anyhow::Context;
-use tray_icon::menu::{Menu, MenuId, MenuItem, PredefinedMenuItem};
+use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-use crate::config::Mode;
+use crate::config::{DictationMode, InferenceThreads, Mode, ModelChoice, Selection};
 use crate::daemon::State;
 
 /// Icon edge length in pixels.
@@ -80,6 +80,12 @@ pub(crate) fn toggle_text(state: State) -> &'static str {
     }
 }
 
+/// Whether the mode/model/thread choices may be clicked. The daemon refuses
+/// every switch while a recording runs or a model load/download is in flight.
+fn choice_enabled(state: State, loading: bool) -> bool {
+    state == State::Idle && !loading
+}
+
 /// Tooltip text for `state`, `mode` and the microphone in use: the status
 /// (with the mic) plus the mode name, so hovering the icon shows both.
 pub(crate) fn tooltip_text(state: State, mode: Mode, mic: Option<&str>) -> String {
@@ -102,8 +108,10 @@ pub(crate) fn system_default_label(default_name: Option<&str>) -> String {
 pub(crate) enum SettingsChange {
     Sounds(bool),
     Notifications(bool),
-    Mode(Mode),
-    SpeechModel(crate::config::SpeechModel),
+    Mode(DictationMode),
+    SpeechModel(ModelChoice),
+    Selection(Selection),
+    InferenceThreads(crate::config::InferenceThreads),
     Shortcut(String),
     Microphone { id: String, name: String },
 }
@@ -119,6 +127,14 @@ impl SettingsChange {
             SettingsChange::Mode(mode) => format!("Mode: {}", mode.display_name()),
             SettingsChange::SpeechModel(model) => {
                 format!("Speech model: {}", model.display_name())
+            }
+            SettingsChange::Selection(selection) => format!(
+                "Speech model: {} · Mode: {}",
+                selection.model.display_name(),
+                selection.mode.display_name()
+            ),
+            SettingsChange::InferenceThreads(threads) => {
+                format!("Inference threads: {}", threads.display_name())
             }
             SettingsChange::Shortcut(display) => format!(
                 "Shortcut: {}",
@@ -136,6 +152,14 @@ impl SettingsChange {
             SettingsChange::Mode(mode) => format!("settings: mode = {}", mode.as_str()),
             SettingsChange::SpeechModel(model) => {
                 format!("settings: model = {}", model.as_str())
+            }
+            SettingsChange::Selection(selection) => format!(
+                "settings: mode = {}, model = {}",
+                selection.mode.as_str(),
+                selection.model.as_str()
+            ),
+            SettingsChange::InferenceThreads(threads) => {
+                format!("settings: inference_threads = {}", threads.as_str())
             }
             SettingsChange::Shortcut(display) => format!("settings: hotkey = {display}"),
             SettingsChange::Microphone { id, .. } => {
@@ -161,7 +185,66 @@ pub(crate) enum TrayAction {
     Cancel,
     Settings,
     Quit,
+    SelectMode(DictationMode),
+    SelectSpeechModel(ModelChoice),
+    SelectInferenceThreads(InferenceThreads),
 }
+
+/// Everything selectable from the tray's mode, speech-model and inference
+/// thread submenus, with stable menu ids.
+pub(crate) const MODE_MENU: [(DictationMode, &str, &str); 3] = [
+    (
+        DictationMode::Whole,
+        "dictate-mode-whole",
+        "Whole recording",
+    ),
+    (
+        DictationMode::Pauses,
+        "dictate-mode-pauses",
+        "Type at pauses",
+    ),
+    (DictationMode::Live, "dictate-mode-live", "Live"),
+];
+pub(crate) const MODEL_MENU: [(ModelChoice, &str, &str); 5] = [
+    (
+        ModelChoice::Parakeet,
+        "dictate-model-standard",
+        ModelChoice::Parakeet.display_name(),
+    ),
+    (
+        ModelChoice::Fluid,
+        "dictate-model-fluid",
+        ModelChoice::Fluid.display_name(),
+    ),
+    (
+        ModelChoice::Whisper,
+        "dictate-model-whisper",
+        ModelChoice::Whisper.display_name(),
+    ),
+    (
+        ModelChoice::Nemotron,
+        "dictate-model-nemotron",
+        ModelChoice::Nemotron.display_name(),
+    ),
+    (
+        ModelChoice::Moonshine,
+        "dictate-model-moonshine",
+        ModelChoice::Moonshine.display_name(),
+    ),
+];
+pub(crate) const THREADS_MENU: [(InferenceThreads, &str, &str); 3] = [
+    (
+        InferenceThreads::Auto,
+        "dictate-threads-auto",
+        "Auto (1–2 by engine)",
+    ),
+    (InferenceThreads::One, "dictate-threads-1", "1 thread"),
+    (
+        InferenceThreads::Two,
+        "dictate-threads-2",
+        "2 threads (Moonshine: default)",
+    ),
+];
 
 /// The tray icon and every menu item the daemon updates or matches.
 pub(crate) struct Tray {
@@ -171,13 +254,17 @@ pub(crate) struct Tray {
     cancel: MenuItem,
     settings: MenuItem,
     quit: MenuItem,
+    mode_items: Vec<(DictationMode, CheckMenuItem)>,
+    model_items: Vec<(ModelChoice, CheckMenuItem)>,
+    thread_items: Vec<(InferenceThreads, CheckMenuItem)>,
 }
 
 /// Build the tray icon with its short menu, and forward menu clicks to the
 /// event loop. Must run on the main thread after the loop started.
 pub(crate) fn build_tray(
     state: State,
-    mode: Mode,
+    selected: Selection,
+    threads: InferenceThreads,
     mic: Option<&str>,
     proxy: winit::event_loop::EventLoopProxy<crate::daemon::UserEvent>,
 ) -> anyhow::Result<Tray> {
@@ -197,11 +284,53 @@ pub(crate) fn build_tray(
     );
     let settings = MenuItem::with_id("dictate-settings", "Settings…", true, None);
     let quit = MenuItem::with_id("dictate-quit", "Quit dictate", true, None);
+    let mode_menu = Submenu::new("Dictation mode", true);
+    let mut mode_items = Vec::new();
+    for (value, id, label) in MODE_MENU {
+        let item = CheckMenuItem::with_id(
+            id,
+            label,
+            selected.model.supports(value),
+            selected.mode == value,
+            None,
+        );
+        mode_menu
+            .append(&item)
+            .context("Could not build the tray menu")?;
+        mode_items.push((value, item));
+    }
+    let model_menu = Submenu::new("Speech model", true);
+    let mut model_items = Vec::new();
+    for (value, id, label) in MODEL_MENU {
+        let item =
+            CheckMenuItem::with_id(id, label, value.available(), selected.model == value, None);
+        model_menu
+            .append(&item)
+            .context("Could not build the tray menu")?;
+        model_items.push((value, item));
+    }
+    let threads_menu = Submenu::new("Inference threads", true);
+    let mut thread_items = Vec::new();
+    for (value, id, label) in THREADS_MENU {
+        let item = CheckMenuItem::with_id(id, label, true, threads == value, None);
+        threads_menu
+            .append(&item)
+            .context("Could not build the tray menu")?;
+        thread_items.push((value, item));
+    }
     menu.append(&status)
         .context("Could not build the tray menu")?;
     menu.append(&toggle)
         .context("Could not build the tray menu")?;
     menu.append(&cancel)
+        .context("Could not build the tray menu")?;
+    menu.append(&PredefinedMenuItem::separator())
+        .context("Could not build the tray menu")?;
+    menu.append(&mode_menu)
+        .context("Could not build the tray menu")?;
+    menu.append(&model_menu)
+        .context("Could not build the tray menu")?;
+    menu.append(&threads_menu)
         .context("Could not build the tray menu")?;
     menu.append(&PredefinedMenuItem::separator())
         .context("Could not build the tray menu")?;
@@ -221,7 +350,7 @@ pub(crate) fn build_tray(
     let builder = builder.with_title(TRAY_ID);
     let icon = builder
         .with_menu(Box::new(menu))
-        .with_tooltip(tooltip_text(state, mode, mic))
+        .with_tooltip(tooltip_text(state, selected.runtime_mode(), mic))
         .with_icon(icon)
         .build()
         .map_err(|err| anyhow::anyhow!("Could not create tray icon: {err}"))?;
@@ -240,6 +369,9 @@ pub(crate) fn build_tray(
         cancel,
         settings,
         quit,
+        mode_items,
+        model_items,
+        thread_items,
     })
 }
 
@@ -251,7 +383,8 @@ impl Tray {
     pub(crate) fn sync_state(
         &self,
         state: State,
-        mode: Mode,
+        selected: Selection,
+        threads: InferenceThreads,
         loading: bool,
         mic: Option<&str>,
     ) -> anyhow::Result<()> {
@@ -262,7 +395,7 @@ impl Tray {
             .set_icon(Some(icon))
             .map_err(|err| anyhow::anyhow!("Could not update the tray icon: {err}"))?;
         self.icon
-            .set_tooltip(Some(tooltip_text(state, mode, mic)))
+            .set_tooltip(Some(tooltip_text(state, selected.runtime_mode(), mic)))
             .map_err(|err| anyhow::anyhow!("Could not update the tray tooltip: {err}"))?;
         if loading {
             self.status.set_text(LOADING_TEXT);
@@ -270,8 +403,25 @@ impl Tray {
             self.status.set_text(status_text(state, mic));
         }
         self.toggle.set_text(toggle_text(state));
-        self.toggle.set_enabled(state != State::Transcribing);
+        // A switch is refused while recording/transcribing or while another
+        // model load/download is running; mirror that in the menu instead of
+        // accepting a click that would only notify "finish first".
+        let can_switch = choice_enabled(state, loading);
+        self.toggle
+            .set_enabled(state != State::Transcribing && !loading);
         self.cancel.set_enabled(state == State::Recording);
+        for (value, item) in &self.mode_items {
+            item.set_checked(*value == selected.mode);
+            item.set_enabled(can_switch && selected.model.supports(*value));
+        }
+        for (value, item) in &self.model_items {
+            item.set_checked(*value == selected.model);
+            item.set_enabled(can_switch && value.available());
+        }
+        for (value, item) in &self.thread_items {
+            item.set_checked(*value == threads);
+            item.set_enabled(can_switch);
+        }
         Ok(())
     }
 
@@ -288,6 +438,21 @@ impl Tray {
         }
         if *id == *self.quit.id() {
             return Some(TrayAction::Quit);
+        }
+        for (mode, item) in &self.mode_items {
+            if *id == *item.id() {
+                return Some(TrayAction::SelectMode(*mode));
+            }
+        }
+        for (model, item) in &self.model_items {
+            if *id == *item.id() {
+                return Some(TrayAction::SelectSpeechModel(*model));
+            }
+        }
+        for (threads, item) in &self.thread_items {
+            if *id == *item.id() {
+                return Some(TrayAction::SelectInferenceThreads(*threads));
+            }
         }
         None
     }
@@ -437,6 +602,14 @@ mod tests {
     }
 
     #[test]
+    fn choices_are_enabled_only_when_idle_and_not_loading() {
+        assert!(choice_enabled(State::Idle, false));
+        assert!(!choice_enabled(State::Idle, true));
+        assert!(!choice_enabled(State::Recording, false));
+        assert!(!choice_enabled(State::Transcribing, false));
+    }
+
+    #[test]
     fn settings_change_confirmation_texts() {
         // The confirmation shows the per-OS label; the log keeps the raw value.
         #[cfg(target_os = "macos")]
@@ -465,27 +638,27 @@ mod tests {
                 "settings: notifications = false",
             ),
             (
-                SettingsChange::Mode(Mode::Whole),
-                "Mode: Whole",
+                SettingsChange::Mode(DictationMode::Whole),
+                "Mode: Whole recording",
                 "settings: mode = whole",
             ),
             (
-                SettingsChange::Mode(Mode::Pauses),
-                "Mode: Pauses",
+                SettingsChange::Mode(DictationMode::Pauses),
+                "Mode: Type at pauses",
                 "settings: mode = pauses",
             ),
             (
-                SettingsChange::Mode(Mode::Live),
+                SettingsChange::Mode(DictationMode::Live),
                 "Mode: Live",
                 "settings: mode = live",
             ),
             (
-                SettingsChange::SpeechModel(crate::config::SpeechModel::Standard),
-                "Speech model: Standard",
+                SettingsChange::SpeechModel(ModelChoice::Parakeet),
+                "Speech model: Parakeet TDT 0.6B v2",
                 "settings: model = standard",
             ),
             (
-                SettingsChange::SpeechModel(crate::config::SpeechModel::Fluid),
+                SettingsChange::SpeechModel(ModelChoice::Fluid),
                 "Speech model: Fluid Speech Mini",
                 "settings: model = fluid",
             ),

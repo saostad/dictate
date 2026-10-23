@@ -1,3 +1,6 @@
 /target
 .model/
 nemotron-streaming-en-0.6b-int8/
+__pycache__/
+/benchmark-results/
+/tests/fixtures/audio/

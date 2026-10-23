@@ -1,0 +1,41 @@
+# standard-default (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine standard --threads default --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models
+
+# standard-1 (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine standard --threads 1 --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models
+
+# standard-2 (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine standard --threads 2 --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models
+
+# fluid-default (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine fluid --threads default --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models
+
+# fluid-1 (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine fluid --threads 1 --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models
+
+# fluid-2 (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine fluid --threads 2 --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models
+
+# whisper-default (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine whisper --threads default --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models
+
+# whisper-1 (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine whisper --threads 1 --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models
+
+# whisper-2 (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine whisper --threads 2 --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models
+
+# live-default (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine live --threads default --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models
+
+# live-1 (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine live --threads 1 --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models
+
+# live-2 (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine live --threads 2 --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models
+
+# moonshine-1 (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine moonshine --threads 1 --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models
+
+# moonshine-runtime-default (ok)
+/usr/bin/python3 /home/saeid/projects/dictate/scripts/no-network.py /home/saeid/projects/dictate/target/release/dictate benchmark --engine moonshine --threads runtime-default --corpus /home/saeid/.cache/dictate-benchmarks/2026-10-22/benchmark-corpus.json --jfk /home/saeid/projects/dictate/tests/fixtures/jfk.wav --runs 5 --paced-runs 3 --model-dir /home/saeid/.cache/dictate-verification-2026-10-22/models

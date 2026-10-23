@@ -1,0 +1,21 @@
+# Build whisper.cpp (through whisper-rs-sys) for the x86_64 baseline rather
+# than this build machine's CPU. GGML_NATIVE=OFF alone is not enough: ggml
+# still enables AVX/AVX2/FMA/F16C by default on x86_64, which SIGILLs on
+# Sandy Bridge and earlier CPUs. whisper-rs-sys forwards every GGML_* / CMAKE_*
+# / WHISPER_* environment variable to CMake as a cache definition.
+#
+# These are build-time settings only. Override any of them in the shell when
+# building a binary for a different CPU class. At runtime, the only process
+# environment change is Moonshine's documented single-thread flag, set or
+# cleared once during startup before any worker threads exist (see
+# src/moonshine.rs).
+[env]
+GGML_NATIVE = "OFF"
+GGML_SSE42 = "OFF"
+GGML_AVX = "OFF"
+GGML_AVX2 = "OFF"
+GGML_AVX512 = "OFF"
+GGML_FMA = "OFF"
+GGML_F16C = "OFF"
+# Use whisper-rs-sys's checked-in bindings instead of requiring libclang.
+WHISPER_DONT_GENERATE_BINDINGS = "1"

@@ -1,0 +1,162 @@
+{
+  "schema_version": 1,
+  "name": "LibriSpeech test-clean: fixed six-speaker subset",
+  "source": {
+    "url": "https://www.openslr.org/12/",
+    "dataset": "openslr/librispeech_asr",
+    "revision": "71cacbfb7e2354c4226d01e70d77d5fca3d04ba1",
+    "license": "CC-BY-4.0",
+    "selection": "Two 3\u201312 second clips per speaker, three male and three female speakers, first qualifying rows at fixed offsets 0,250,500,750,1000,1500. Small read-English sample, not conversational/accents benchmark.",
+    "dataset_config": "clean",
+    "dataset_split": "test",
+    "rows": [
+      0,
+      2,
+      250,
+      254,
+      501,
+      502,
+      750,
+      751,
+      1000,
+      1001,
+      1502,
+      1503
+    ],
+    "selection_note": "Fixed rows chosen from offsets 0,250,500,750,1000,1500: the first two 3-12 second clips per speaker. This is a small read-English sample, not a conversational or accent benchmark."
+  },
+  "clips": [
+    {
+      "id": "6930-75918-0000",
+      "file": "audio/6930-75918-0000.wav",
+      "reference": "CONCORD RETURNED TO ITS PLACE AMIDST THE TENTS",
+      "duration_seconds": 3.505,
+      "speaker_id": 6930,
+      "speaker_gender": "M",
+      "dataset_row": 0,
+      "source_flac_sha256": "9ce35224156f071ab58eb7feb8a5ceae600f6f9f353da2a6cbf797b6b1ac8a23",
+      "wav_sha256": "103c3f15eb3715ebc6243d142244128a3ac39b6bfae315baa6b8dc4a8be14aa8"
+    },
+    {
+      "id": "6930-75918-0002",
+      "file": "audio/6930-75918-0002.wav",
+      "reference": "CONGRATULATIONS WERE POURED IN UPON THE PRINCESS EVERYWHERE DURING HER JOURNEY",
+      "duration_seconds": 5.025,
+      "speaker_id": 6930,
+      "speaker_gender": "M",
+      "dataset_row": 2,
+      "source_flac_sha256": "74ecfd628f49dca71995972c075fcc9904df804d49a4eb5b11fb712b3584f789",
+      "wav_sha256": "ca418189ed1db4ce1bf5e6940d51a9ce870d4d52f3ef9019ccdbb2189d1a0a9c"
+    },
+    {
+      "id": "260-123288-0018",
+      "file": "audio/260-123288-0018.wav",
+      "reference": "THE RAFT BEARS ON STILL TO THE SOUTH EAST",
+      "duration_seconds": 3.245,
+      "speaker_id": 260,
+      "speaker_gender": "M",
+      "dataset_row": 250,
+      "source_flac_sha256": "0ed15058018063a7fc8c7707fc24686919c0dfbfe8cc21276e5d121a4ff9f7d9",
+      "wav_sha256": "c1a68a9ae9a28289218aca63ae14d10aacdb6dfd091b5463d1faa8135f609062"
+    },
+    {
+      "id": "260-123288-0022",
+      "file": "audio/260-123288-0022.wav",
+      "reference": "THEY SEEM TO BE WE ARE LOST BUT I AM NOT SURE",
+      "duration_seconds": 3.705,
+      "speaker_id": 260,
+      "speaker_gender": "M",
+      "dataset_row": 254,
+      "source_flac_sha256": "3b04340678b02c90df05b8548b051e9380580d100d6bfe5141c25b2cd69f3a0c",
+      "wav_sha256": "616633e7e8b731e2893be43067ecbea98ab2157fde037ab5c7e1bfe5600c4077"
+    },
+    {
+      "id": "2961-960-0004",
+      "file": "audio/2961-960-0004.wav",
+      "reference": "THERE IS NO DANGER OF THE MODERN COMMENTATORS ON THE TIMAEUS FALLING INTO THE ABSURDITIES OF THE NEO PLATONISTS",
+      "duration_seconds": 8.22,
+      "speaker_id": 2961,
+      "speaker_gender": "F",
+      "dataset_row": 501,
+      "source_flac_sha256": "c815b1d8d37cd643047430c39f790067c75ee3adb93fdfbbe3da493f71d44615",
+      "wav_sha256": "5161cf90f0fc842d1b5f473ac5b172641aa2678515998a4f315588f874707520"
+    },
+    {
+      "id": "2961-960-0005",
+      "file": "audio/2961-960-0005.wav",
+      "reference": "IN THE PRESENT DAY WE ARE WELL AWARE THAT AN ANCIENT PHILOSOPHER IS TO BE INTERPRETED FROM HIMSELF AND BY THE CONTEMPORARY HISTORY OF THOUGHT",
+      "duration_seconds": 10.355,
+      "speaker_id": 2961,
+      "speaker_gender": "F",
+      "dataset_row": 502,
+      "source_flac_sha256": "0d0c423dc55c236b5f55ca2fc4ab87b39b85d5d2a34585573afe6038ebf3a091",
+      "wav_sha256": "8cab8ee80366cb73901bb26b5af4103cca895c2644317cc1dcb817cd2df282bf"
+    },
+    {
+      "id": "1995-1826-0000",
+      "file": "audio/1995-1826-0000.wav",
+      "reference": "IN THE DEBATE BETWEEN THE SENIOR SOCIETIES HER DEFENCE OF THE FIFTEENTH AMENDMENT HAD BEEN NOT ONLY A NOTABLE BIT OF REASONING BUT DELIVERED WITH REAL ENTHUSIASM",
+      "duration_seconds": 9.485,
+      "speaker_id": 1995,
+      "speaker_gender": "F",
+      "dataset_row": 750,
+      "source_flac_sha256": "74596627a026feb72e3acba17ee9268f120ee25e9f4afb935bb2f3d3ba779e57",
+      "wav_sha256": "03ac3f6a371c4ef5fd518588c0df859e6de2b82ca1cbe464533d53be303f5e5a"
+    },
+    {
+      "id": "1995-1826-0001",
+      "file": "audio/1995-1826-0001.wav",
+      "reference": "THE SOUTH SHE HAD NOT THOUGHT OF SERIOUSLY AND YET KNOWING OF ITS DELIGHTFUL HOSPITALITY AND MILD CLIMATE SHE WAS NOT AVERSE TO CHARLESTON OR NEW ORLEANS",
+      "duration_seconds": 10.17,
+      "speaker_id": 1995,
+      "speaker_gender": "F",
+      "dataset_row": 751,
+      "source_flac_sha256": "56d8ebeb4138c7cc33c7f468aec078a3d76694b8759b1e860d876288f475e8ee",
+      "wav_sha256": "660488d1124a2d3ecdc76133799b6b1006c65e83af5952a9acb91bfb82b991dc"
+    },
+    {
+      "id": "8455-210777-0028",
+      "file": "audio/8455-210777-0028.wav",
+      "reference": "JACK WOULD BECOME EVA'S HAPPY HUSBAND AND WOULD REMAIN AMIDST THE HURRIED DUTIES OF THE EAGER WORLD",
+      "duration_seconds": 7.735,
+      "speaker_id": 8455,
+      "speaker_gender": "M",
+      "dataset_row": 1000,
+      "source_flac_sha256": "61e1697bdc0de5142e0cd76c4a14ed38086b66b9a0ab7722bd1c02aa3cebd261",
+      "wav_sha256": "9f4ec23f805b2f9f67671a780864c8ea4d40d678da2edd65f8f24e799c085641"
+    },
+    {
+      "id": "8455-210777-0029",
+      "file": "audio/8455-210777-0029.wav",
+      "reference": "THINKING OF ALL THIS I WENT TO SLEEP",
+      "duration_seconds": 3.085,
+      "speaker_id": 8455,
+      "speaker_gender": "M",
+      "dataset_row": 1001,
+      "source_flac_sha256": "289ad7e37196db91419a006a00b121b4ccb7eba5980b02be4941e174c3d201c4",
+      "wav_sha256": "a8c9b3fcfa4d8d491bdc73c337611a82f9a0e43e558c1243e3dfb9f639714969"
+    },
+    {
+      "id": "4507-16021-0033",
+      "file": "audio/4507-16021-0033.wav",
+      "reference": "DO WE REALLY KNOW THE MOUNTAIN WELL WHEN WE ARE NOT ACQUAINTED WITH THE CAVERN",
+      "duration_seconds": 5.545,
+      "speaker_id": 4507,
+      "speaker_gender": "F",
+      "dataset_row": 1502,
+      "source_flac_sha256": "1a95f7d0613cb1b284ce711f82f46383f9f2e3969d63d356906b7e6ea5a15a62",
+      "wav_sha256": "95242d5933a7e9d4272b21008310cc888769f73e05a120bf771582a36540449a"
+    },
+    {
+      "id": "4507-16021-0034",
+      "file": "audio/4507-16021-0034.wav",
+      "reference": "THEY CONSTITUTE TWO DIFFERENT ORDERS OF FACTS WHICH CORRESPOND TO EACH OTHER WHICH ARE ALWAYS INTERLACED AND WHICH OFTEN BRING FORTH RESULTS",
+      "duration_seconds": 11.27,
+      "speaker_id": 4507,
+      "speaker_gender": "F",
+      "dataset_row": 1503,
+      "source_flac_sha256": "82d1c6989ed82652706793e5449d59106eb0cd0fcc9fc2d0b53fae601834d832",
+      "wav_sha256": "2bc8d7291a3f3a1dc60091d54718473d6fb46f3fd8e12f3aa4c70bdff681c38e"
+    }
+  ]
+}

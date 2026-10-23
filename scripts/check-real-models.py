@@ -2,11 +2,14 @@
 
 Usage: python3 scripts/check-real-models.py <dictate binary> [16-bit WAV]
 
-Needs the models downloaded first (dictate download, --live, --fluid).
-Runs the binary that ships, so CI checks it without compiling tests.
+Needs the models downloaded first (dictate download, --live, --fluid,
+--whisper). On Linux x86_64/arm64 it also checks Moonshine, so run
+`dictate download --moonshine` there. Runs the binary that ships, so CI checks
+it without compiling tests.
 """
 
 import os
+import platform
 import subprocess
 import sys
 import tempfile
@@ -19,23 +22,40 @@ FULL_SENTENCE = (
 )
 
 
-def run(binary, *args):
+def run(binary, *args, env=None):
+    process_env = os.environ.copy()
+    if env:
+        process_env.update(env)
     result = subprocess.run(
         [binary, "transcribe", *args],
         capture_output=True,
         text=True,
         encoding="utf-8",
         errors="replace",
+        env=process_env,
     )
     if result.returncode != 0:
         sys.exit(f"dictate transcribe {' '.join(args)} failed:\n{result.stderr}")
     return result.stdout, result.stderr
 
 
+def words(text):
+    return " ".join(
+        part
+        for part in "".join(c.lower() if c.isalnum() else " " for c in text).split()
+        if part
+    )
+
+
 def expect_sentence(name, stdout):
-    if EXPECTED not in stdout.lower():
+    if EXPECTED not in words(stdout):
         sys.exit(f"unexpected {name} transcription: {stdout}")
     print(f"ok: {name}: {stdout.strip()}")
+
+
+def expect_clean(name, stdout):
+    if "[_" in stdout or "<|" in stdout:
+        sys.exit(f"{name} leaked a special token: {stdout}")
 
 
 def read_mono(path):
@@ -102,18 +122,68 @@ def main():
         sys.exit(f"expected a live RTF line, stderr: {stderr}")
     print(rtf)
 
+    stdout, stderr = run(binary, "--whisper", wav)
+    expect_sentence("whisper", stdout)
+    expect_clean("whisper", stdout)
+    print("ok: whisper tiny English whole")
+
     # Device-rate path: the fixture at 48 kHz through the streaming daemon's feeder.
     mono, rate = read_mono(wav)
     with tempfile.TemporaryDirectory() as tmp:
         wav48 = os.path.join(tmp, "seg48.wav")
         write_wav(wav48, resample_linear(mono, rate, 48_000), 48_000)
+
         stdout, stderr = run(binary, "--segmented", wav48)
-    if normalize(stdout.strip()) != normalize(FULL_SENTENCE):
-        sys.exit(f"segmented transcription differs: {stdout}")
-    # The onset check only means something if the clip was actually split.
-    if "segment 1:" not in stderr or "segment 2:" not in stderr:
-        sys.exit(f"expected at least two segments, stderr: {stderr}")
-    print(f"ok: segmented at 48 kHz: {stdout.strip()}")
+        if normalize(stdout.strip()) != normalize(FULL_SENTENCE):
+            sys.exit(f"segmented transcription differs: {stdout}")
+        # The onset check only means something if the clip was actually split.
+        if "segment 1:" not in stderr or "segment 2:" not in stderr:
+            sys.exit(f"expected at least two segments, stderr: {stderr}")
+        print(f"ok: segmented at 48 kHz: {stdout.strip()}")
+
+        stdout, stderr = run(
+            binary,
+            "--segmented",
+            wav48,
+            env={"DICTATE_SPEECH_MODEL": "whisper"},
+        )
+        expect_sentence("whisper segmented", stdout)
+        expect_clean("whisper segmented", stdout)
+        if "segment 1:" not in stderr or "segment 2:" not in stderr:
+            sys.exit(f"expected Whisper to split at least two segments, stderr: {stderr}")
+        print(f"ok: whisper segmented at 48 kHz: {stdout.strip()}")
+
+    machine = platform.machine().lower()
+    moonshine_supported = sys.platform.startswith("linux") and machine in (
+        "x86_64",
+        "amd64",
+        "aarch64",
+        "arm64",
+    )
+    if moonshine_supported:
+        stdout, stderr = run(binary, "--moonshine", wav)
+        expect_sentence("moonshine", stdout)
+        expect_clean("moonshine", stdout)
+        if "moonshine:" not in stderr:
+            sys.exit(f"expected Moonshine streaming timing, stderr: {stderr}")
+        print(f"ok: moonshine streaming: {stdout.strip()}")
+    else:
+        print(f"skip: Moonshine runtime is not supported on {sys.platform}/{machine}")
+
+    # Both small engines must leave a silent clip alone instead of inventing
+    # text; this also exercises Moonshine stop/finalization with no speech.
+    with tempfile.TemporaryDirectory() as tmp:
+        silence = os.path.join(tmp, "silence.wav")
+        write_wav(silence, [0.0] * 16_000, 16_000)
+        for engine in ("whisper", "moonshine"):
+            if engine == "moonshine" and not moonshine_supported:
+                continue
+            stdout, stderr = run(binary, f"--{engine}", silence)
+            if stdout.strip():
+                sys.exit(f"{engine} invented text for silence: {stdout}")
+            if "No speech recognized" not in stderr:
+                sys.exit(f"expected a no-speech message from {engine}: {stderr}")
+            print(f"ok: {engine} silence")
 
 
 if __name__ == "__main__":

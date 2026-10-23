@@ -8,7 +8,9 @@ use std::str::FromStr;
 
 use global_hotkey::hotkey::HotKey;
 
-use crate::config::{Mode, Settings, SpeechModel};
+use crate::config::{
+    DictationMode as Mode, InferenceThreads, ModelChoice as SpeechModel, Settings,
+};
 use crate::daemon::{LiveSpeedCheck, SwitchTarget};
 use crate::mic::Mic;
 
@@ -30,33 +32,54 @@ pub(crate) const MODE_OPTIONS: [(Mode, &str, &str); 3] = [
     (
         Mode::Whole,
         "Whole recording",
-        "Most accurate. Text appears after you release the key.",
+        "Best for accuracy and slower computers; text appears when you stop.",
     ),
     (
         Mode::Pauses,
         "Type at pauses",
-        "Types each phrase when you pause. Faster on slow computers; may occasionally mishear the word after a pause.",
+        "Types when you pause; choose Parakeet or Fluid to avoid Whisper Tiny's extra delay.",
     ),
     (
         Mode::Live,
         "Live",
-        "Text appears as you speak. Needs a fast computer and a ~900 MB download.",
+        "Text appears while you speak; requires Nemotron or Moonshine.",
     ),
 ];
 
-/// Whole/Pauses speech models offered on the page, in order, with their radio
-/// label and one-line explanation.
-pub(crate) const SPEECH_MODEL_OPTIONS: [(SpeechModel, &str, &str); 2] = [
+/// All speech models offered on the page, with a radio label and choice guidance.
+pub(crate) const SPEECH_MODEL_OPTIONS: [(SpeechModel, &str, &str); 5] = [
     (
-        SpeechModel::Standard,
-        "Standard",
-        "Default. Fastest on older computers.",
+        SpeechModel::Parakeet,
+        SpeechModel::Parakeet.display_name(),
+        "Fastest transcription and best accuracy in our test; needs more RAM and AVX2.",
     ),
     (
         SpeechModel::Fluid,
-        "Fluid Speech Mini",
-        "Better when other people talk nearby. About 300 MB; slower.",
+        SpeechModel::Fluid.display_name(),
+        "Good accuracy with less RAM than Parakeet; a slower, balanced choice.",
     ),
+    (
+        SpeechModel::Whisper,
+        SpeechModel::Whisper.display_name(),
+        "For older CPUs without AVX2 or low RAM; loads fastest, with lower accuracy.",
+    ),
+    (
+        SpeechModel::Nemotron,
+        SpeechModel::Nemotron.display_name(),
+        "Accurate live text; best for fast CPUs with plenty of RAM.",
+    ),
+    (
+        SpeechModel::Moonshine,
+        SpeechModel::Moonshine.display_name(),
+        "Low-memory live dictation on Linux; faster final text, but lower accuracy.",
+    ),
+];
+
+/// Inference-thread choices for Whisper and Moonshine, in page order.
+pub(crate) const INFERENCE_THREAD_OPTIONS: [(InferenceThreads, &str); 3] = [
+    (InferenceThreads::Auto, "Auto (1–2 by engine)"),
+    (InferenceThreads::One, "1 thread"),
+    (InferenceThreads::Two, "2 threads (Moonshine: default)"),
 ];
 
 /// User intents from one page frame, applied by the daemon.
@@ -67,7 +90,9 @@ pub(crate) enum PageAction {
     RefreshBinds,
     SelectMode(Mode),
     SelectSpeechModel(SpeechModel),
+    SelectInferenceThreads(InferenceThreads),
     SelectShortcut(String),
+    ConfigureShortcut,
     ToggleSounds,
     ToggleNotifications,
     SetAutostart(bool),
@@ -100,6 +125,8 @@ pub(crate) struct PageView<'a> {
     pub autostart_on: Option<bool>,
     pub autostart_error: Option<&'a str>,
     pub shortcut_error: Option<&'a str>,
+    pub shortcut_status: Option<&'a str>,
+    pub shortcut_busy: bool,
     pub version: &'static str,
 }
 
@@ -112,21 +139,11 @@ pub(crate) fn recording_from_line(active_mic: Option<&str>) -> String {
     }
 }
 
-/// Status line while a mode switch loads in the background.
-pub(crate) fn mode_loading_line(target: Mode) -> String {
-    format!("Loading {} model…", target.display_name())
-}
-
-/// Status line while a switch's model downloads in the background.
+/// Status line while a selection's model downloads in the background.
 pub(crate) fn download_line(target: SwitchTarget, percent: u64) -> String {
-    let name = match target {
-        SwitchTarget::SpeechModel(model) => model.display_name(),
-        SwitchTarget::Mode(_) => "Live model",
-    };
-    format!("Downloading {name}… {percent}%")
+    format!("Downloading {}… {percent}%", target.model.display_name())
 }
 
-/// Status line while a speech-model switch loads in the background.
 pub(crate) fn speech_model_loading_line(model: SpeechModel) -> String {
     format!("Loading {}…", model.display_name())
 }
@@ -139,7 +156,7 @@ pub(crate) fn speed_check_line(check: LiveSpeedCheck) -> String {
         "too slow"
     };
     format!(
-        "Speed check: {} ms per 560 ms of audio ({verdict})",
+        "Nemotron speed check: {} ms per 560 ms of audio ({verdict})",
         check.ms
     )
 }
@@ -463,9 +480,9 @@ pub(crate) fn show_page(
             egui::ScrollArea::vertical().show(ui, |ui| {
                 microphone_section(ui, view, &mut actions);
                 section_gap(ui);
-                mode_section(ui, view, &mut actions);
-                section_gap(ui);
                 speech_model_section(ui, view, &mut actions);
+                section_gap(ui);
+                mode_section(ui, view, &mut actions);
                 section_gap(ui);
                 shortcut_section(ui, view, &mut actions, capture);
                 section_gap(ui);
@@ -539,49 +556,84 @@ fn microphone_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<Page
 
 fn mode_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
     heading(ui, "Dictation mode");
+    let selected = crate::config::effective_selection(view.settings);
+    let busy = view.shortcut_busy || view.switch_target.is_some();
     for (mode, label, explanation) in MODE_OPTIONS {
-        if ui.radio(view.settings.mode == mode, label).clicked() {
+        let supported = selected.model.supports(mode);
+        if ui
+            .add_enabled(
+                !busy && supported,
+                egui::RadioButton::new(selected.mode == mode, label),
+            )
+            .on_disabled_hover_text("Choose a compatible speech model first.")
+            .clicked()
+        {
             actions.push(PageAction::SelectMode(mode));
         }
         explain(ui, explanation);
     }
-    if let Some(SwitchTarget::Mode(mode)) = view.switch_target {
-        if view.downloading {
-            ui.label(download_line(
-                SwitchTarget::Mode(mode),
-                view.download_percent,
-            ));
-        } else {
-            ui.label(mode_loading_line(mode));
-        }
-    }
-    if view.checking_speed {
-        ui.label("Checking Live speed…");
-    }
-    if let Some(check) = view.last_speed_check {
-        ui.label(speed_check_line(check));
-    }
+    explain(
+        ui,
+        "Unavailable modes are disabled for the selected speech model.",
+    );
 }
 
 fn speech_model_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
     heading(ui, "Speech model");
+    explain(
+        ui,
+        "Guidance is based on our CPU benchmark; results vary with your computer and voice.",
+    );
+    let selected = crate::config::effective_selection(view.settings);
+    let busy = view.shortcut_busy || view.switch_target.is_some();
     for (model, label, explanation) in SPEECH_MODEL_OPTIONS {
-        if ui.radio(view.settings.model == model, label).clicked() {
+        if ui
+            .add_enabled(
+                !busy && model.available(),
+                egui::RadioButton::new(selected.model == model, label),
+            )
+            .on_disabled_hover_text(
+                "Finish dictating or loading first. Moonshine requires Linux x86_64/arm64.",
+            )
+            .clicked()
+        {
             actions.push(PageAction::SelectSpeechModel(model));
         }
         explain(ui, explanation);
     }
-    explain(ui, "Live always uses its own streaming model.");
-    if let Some(SwitchTarget::SpeechModel(model)) = view.switch_target {
+    explain(
+        ui,
+        "Choosing a model automatically selects a compatible mode when needed.",
+    );
+    if let Some(target) = view.switch_target {
         if view.downloading {
-            ui.label(download_line(
-                SwitchTarget::SpeechModel(model),
-                view.download_percent,
-            ));
+            ui.label(download_line(target, view.download_percent));
         } else {
-            ui.label(speech_model_loading_line(model));
+            ui.label(speech_model_loading_line(target.model));
         }
     }
+    if view.checking_speed {
+        ui.label("Checking Nemotron speed…");
+    }
+    if let Some(check) = view.last_speed_check {
+        ui.label(speed_check_line(check));
+    }
+    heading(ui, "Inference threads");
+    for (threads, label) in INFERENCE_THREAD_OPTIONS {
+        if ui
+            .add_enabled(
+                !busy,
+                egui::RadioButton::new(view.settings.inference_threads == threads, label),
+            )
+            .clicked()
+        {
+            actions.push(PageAction::SelectInferenceThreads(threads));
+        }
+    }
+    explain(
+        ui,
+        "Applies to Whisper and Moonshine. Auto: up to 2 threads for Whisper, single-thread for Moonshine. 1: one thread. 2: Whisper uses exactly 2; Moonshine uses its default threading, not exactly 2. Restart the daemon after changing this.",
+    );
 }
 
 fn shortcut_section(
@@ -591,10 +643,6 @@ fn shortcut_section(
     capture: &mut crate::settings_ui::ShortcutCapture,
 ) {
     heading(ui, "Shortcut");
-    if view.wayland {
-        wayland_shortcut_section(ui, view, actions);
-        return;
-    }
     let mac = cfg!(target_os = "macos");
     if capture.recording {
         // Read the frame input before any widget runs, so captured keys never
@@ -603,39 +651,47 @@ fn shortcut_section(
     }
     let presets = crate::hotkey::shortcut_presets(mac);
     let current = view.settings.hotkey.as_str();
-    ui.horizontal(|ui| {
-        egui::ComboBox::from_label("")
-            .selected_text(crate::hotkey::shortcut_label(current, mac))
-            .show_ui(ui, |ui| {
-                if !presets.contains(&current)
-                    && ui
-                        .selectable_label(true, crate::hotkey::shortcut_label(current, mac))
-                        .clicked()
-                {
-                    actions.push(PageAction::SelectShortcut(current.to_string()));
-                }
-                for preset in presets {
-                    if ui
-                        .selectable_label(
-                            *preset == current,
-                            crate::hotkey::shortcut_label(preset, mac),
-                        )
-                        .clicked()
+    if view.wayland && !view.hyprland {
+        explain(
+            ui,
+            "Preferred shortcut. Your desktop confirms the actual binding in its shortcut dialog.",
+        );
+    }
+    ui.add_enabled_ui(!view.shortcut_busy, |ui| {
+        ui.horizontal(|ui| {
+            egui::ComboBox::from_label("")
+                .selected_text(crate::hotkey::shortcut_label(current, mac))
+                .show_ui(ui, |ui| {
+                    if !presets.contains(&current)
+                        && ui
+                            .selectable_label(true, crate::hotkey::shortcut_label(current, mac))
+                            .clicked()
                     {
-                        actions.push(PageAction::SelectShortcut(preset.to_string()));
+                        actions.push(PageAction::SelectShortcut(current.to_string()));
                     }
-                }
-            });
-        let label = if capture.recording {
-            "Cancel"
-        } else {
-            "Record shortcut…"
-        };
-        if ui.button(label).clicked() {
-            capture.recording = !capture.recording;
-            capture.error = None;
-            capture.held = None;
-        }
+                    for preset in presets {
+                        if ui
+                            .selectable_label(
+                                *preset == current,
+                                crate::hotkey::shortcut_label(preset, mac),
+                            )
+                            .clicked()
+                        {
+                            actions.push(PageAction::SelectShortcut(preset.to_string()));
+                        }
+                    }
+                });
+            let label = if capture.recording {
+                "Cancel"
+            } else {
+                "Record shortcut…"
+            };
+            if ui.button(label).clicked() {
+                capture.recording = !capture.recording;
+                capture.error = None;
+                capture.held = None;
+            }
+        });
     });
     if capture.recording {
         ui.label("Press the new shortcut now (Esc to cancel).");
@@ -644,6 +700,9 @@ fn shortcut_section(
         }
     }
     explain(ui, "Tap to toggle dictation, hold to talk.");
+    if view.wayland {
+        wayland_shortcut_section(ui, view, actions);
+    }
     inline_error(ui, capture.error.as_deref().or(view.shortcut_error));
 }
 
@@ -1003,43 +1062,44 @@ fn modifier_only_value(held: crate::hotkey::ModifierSet, mac: bool) -> Result<St
     }
 }
 
-/// Shortcut section on Wayland, where the app can't register its own
-/// hotkey. On Hyprland the cached compositor binds are listed (re-queried
-/// with Refresh); everywhere else the generic explanation is shown. The
-/// configured in-app hotkey is never shown here: it isn't registered.
+/// Show the portal's actual status separately from the preferred key. On
+/// Hyprland, presets also install the compositor binding for that action.
 fn wayland_shortcut_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
-    if !view.hyprland {
-        generic_wayland_shortcut(ui);
-        return;
+    if let Some(status) = view.shortcut_status {
+        ui.label(status);
     }
-    match view.dictate_binds {
-        Some(binds) if !binds.is_empty() => {
-            ui.label("Your dictate shortcuts in Hyprland:");
-            for line in binds {
-                ui.label(line);
+    ui.add_enabled_ui(!view.shortcut_busy, |ui| {
+        if view.hyprland {
+            if ui.button("Enable shortcut / apply again").clicked() {
+                actions.push(PageAction::SelectShortcut(view.settings.hotkey.clone()));
+            }
+            explain(ui, "Selecting a preset applies it immediately. Dictate checks for conflicts and backs up your Hyprland config before saving its own shortcut block.");
+        } else if ui.button("Desktop shortcut settings…").clicked() {
+            actions.push(PageAction::ConfigureShortcut);
+        }
+    });
+    if view.hyprland {
+        match view.dictate_binds {
+            Some(binds) if !binds.is_empty() => {
+                ui.label("Dictate bindings found in Hyprland:");
+                for line in binds {
+                    ui.label(line);
+                }
+            }
+            Some(_) => {}
+            None => {
+                ui.label("Could not list compositor bindings.");
             }
         }
-        Some(_) => {
-            ui.label("No dictate shortcut is bound yet.");
-            ui.hyperlink_to("How to set it", crate::tray::README_USE_IT_URL);
-        }
-        None => generic_wayland_shortcut(ui),
     }
-    explain(
-        ui,
-        "Queried when the window opens; Refresh re-reads the binds.",
-    );
     if ui.button("Refresh").clicked() {
         actions.push(PageAction::RefreshBinds);
     }
-}
-
-/// Generic Wayland shortcut text (other compositors, or a failed query).
-fn generic_wayland_shortcut(ui: &mut egui::Ui) {
-    ui.label(
-        "Apps can't register global shortcuts on Wayland. Bind \"dictate toggle\" (or start/stop) in your compositor's keyboard settings:",
+    explain(
+        ui,
+        "Requires a desktop with the Global Shortcuts portal. You can also bind the local dictate toggle or start/stop commands manually.",
     );
-    ui.hyperlink_to("How to set it", crate::tray::README_USE_IT_URL);
+    ui.hyperlink_to("Manual setup", crate::tray::README_USE_IT_URL);
 }
 
 fn general_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
@@ -1085,6 +1145,7 @@ fn about_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageActio
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::Selection;
 
     #[test]
     fn mode_options_cover_every_mode_with_its_text() {
@@ -1093,17 +1154,17 @@ mod tests {
         assert_eq!(MODE_OPTIONS[0].1, "Whole recording");
         assert_eq!(
             MODE_OPTIONS[0].2,
-            "Most accurate. Text appears after you release the key."
+            "Best for accuracy and slower computers; text appears when you stop."
         );
         assert_eq!(MODE_OPTIONS[1].1, "Type at pauses");
         assert_eq!(
             MODE_OPTIONS[1].2,
-            "Types each phrase when you pause. Faster on slow computers; may occasionally mishear the word after a pause."
+            "Types when you pause; choose Parakeet or Fluid to avoid Whisper Tiny's extra delay."
         );
         assert_eq!(MODE_OPTIONS[2].1, "Live");
         assert_eq!(
             MODE_OPTIONS[2].2,
-            "Text appears as you speak. Needs a fast computer and a ~900 MB download."
+            "Text appears while you speak; requires Nemotron or Moonshine."
         );
     }
 
@@ -1125,27 +1186,67 @@ mod tests {
             .iter()
             .map(|(model, _, _)| *model)
             .collect();
-        assert_eq!(models, vec![SpeechModel::Standard, SpeechModel::Fluid]);
-        assert_eq!(SPEECH_MODEL_OPTIONS[0].1, "Standard");
+        assert_eq!(
+            models,
+            vec![
+                SpeechModel::Parakeet,
+                SpeechModel::Fluid,
+                SpeechModel::Whisper,
+                SpeechModel::Nemotron,
+                SpeechModel::Moonshine
+            ]
+        );
+        assert_eq!(SPEECH_MODEL_OPTIONS[0].1, "Parakeet TDT 0.6B v2");
         assert_eq!(
             SPEECH_MODEL_OPTIONS[0].2,
-            "Default. Fastest on older computers."
+            "Fastest transcription and best accuracy in our test; needs more RAM and AVX2."
         );
         assert_eq!(SPEECH_MODEL_OPTIONS[1].1, "Fluid Speech Mini");
         assert_eq!(
             SPEECH_MODEL_OPTIONS[1].2,
-            "Better when other people talk nearby. About 300 MB; slower."
+            "Good accuracy with less RAM than Parakeet; a slower, balanced choice."
+        );
+        assert_eq!(SPEECH_MODEL_OPTIONS[2].1, "Whisper Tiny English");
+        assert_eq!(
+            SPEECH_MODEL_OPTIONS[2].2,
+            "For older CPUs without AVX2 or low RAM; loads fastest, with lower accuracy."
         );
     }
 
     #[test]
+    fn inference_thread_options_cover_every_setting() {
+        let threads: Vec<InferenceThreads> = INFERENCE_THREAD_OPTIONS
+            .iter()
+            .map(|(threads, _)| *threads)
+            .collect();
+        assert_eq!(
+            threads,
+            vec![
+                InferenceThreads::Auto,
+                InferenceThreads::One,
+                InferenceThreads::Two
+            ]
+        );
+        assert_eq!(INFERENCE_THREAD_OPTIONS[0].1, "Auto (1–2 by engine)");
+    }
+
+    #[test]
     fn mode_status_lines() {
-        assert_eq!(mode_loading_line(Mode::Live), "Loading Live model…");
-        assert_eq!(mode_loading_line(Mode::Pauses), "Loading Pauses model…");
-        let live = SwitchTarget::Mode(Mode::Live);
-        assert_eq!(download_line(live, 25), "Downloading Live model… 25%");
-        assert_eq!(download_line(live, 100), "Downloading Live model… 100%");
-        let fluid = SwitchTarget::SpeechModel(SpeechModel::Fluid);
+        let live = Selection::new(Mode::Live, SpeechModel::Nemotron).unwrap();
+        assert_eq!(
+            download_line(live, 25),
+            "Downloading Nemotron Streaming… 25%"
+        );
+        assert_eq!(
+            download_line(live, 100),
+            "Downloading Nemotron Streaming… 100%"
+        );
+        let moonshine = Selection::new(Mode::Live, SpeechModel::Moonshine).unwrap();
+        assert_eq!(
+            download_line(moonshine, 50),
+            "Downloading Moonshine Tiny Streaming… 50%"
+        );
+        let fluid = Selection::new(Mode::Whole, SpeechModel::Fluid).unwrap();
         assert_eq!(
             download_line(fluid, 50),
             "Downloading Fluid Speech Mini… 50%"
@@ -1155,22 +1256,26 @@ mod tests {
             "Loading Fluid Speech Mini…"
         );
         assert_eq!(
-            speech_model_loading_line(SpeechModel::Standard),
-            "Loading Standard…"
+            speech_model_loading_line(SpeechModel::Parakeet),
+            "Loading Parakeet TDT 0.6B v2…"
+        );
+        assert_eq!(
+            speech_model_loading_line(SpeechModel::Whisper),
+            "Loading Whisper Tiny English…"
         );
         assert_eq!(
             speed_check_line(LiveSpeedCheck {
                 ms: 120,
                 fast: true
             }),
-            "Speed check: 120 ms per 560 ms of audio (fast enough)"
+            "Nemotron speed check: 120 ms per 560 ms of audio (fast enough)"
         );
         assert_eq!(
             speed_check_line(LiveSpeedCheck {
                 ms: 905,
                 fast: false
             }),
-            "Speed check: 905 ms per 560 ms of audio (too slow)"
+            "Nemotron speed check: 905 ms per 560 ms of audio (too slow)"
         );
     }
 
