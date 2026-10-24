@@ -134,9 +134,12 @@ Whisper has a separate CPU baseline; see
 ## Build
 
 The build compiles whisper.cpp through `whisper-rs`, so it needs **CMake** and
-a C++ compiler (C++17) in addition to the Rust toolchain. It does not need
-libclang: `.cargo/config.toml` uses the checked-in bindings. The same file
-builds ggml for the x86_64 baseline (AVX/AVX2/FMA/F16C off, no
+a C++ compiler (C++17) in addition to the Rust toolchain. By default
+`whisper-rs-sys` generates its bindings with bindgen, which needs libclang
+(install clang, or LLVM on Windows). On 64-bit Linux and macOS you can skip
+libclang by exporting `WHISPER_DONT_GENERATE_BINDINGS=1` to use the crate's
+checked-in bindings; do not do this on Windows, where those bindings do not
+match the MSVC ABI. `.cargo/config.toml` builds ggml for the x86_64 baseline (AVX/AVX2/FMA/F16C off, no
 `-march=native`); override the `GGML_*`/`WHISPER_*` variables in your shell
 when targeting a different CPU class.
 

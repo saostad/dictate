@@ -70,6 +70,13 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Use whisper-rs-sys's bundled bindings (non-Windows)
+        # The checked-in bindings were generated on 64-bit Linux and do not
+        # match the Windows MSVC ABI (c_long is 4 bytes there), so Windows
+        # generates its own bindings with bindgen and the runner's libclang.
+        if: runner.os != 'Windows'
+        shell: bash
+        run: echo "WHISPER_DONT_GENERATE_BINDINGS=1" >> "$GITHUB_ENV"
       - name: Check formatting
         run: cargo fmt --check
       - name: Lint
@@ -158,6 +165,13 @@ jobs:
           fi
           mkdir -p /tmp/ort
           tar -xzf /tmp/ort.tgz -C /tmp/ort
+      - name: Use whisper-rs-sys's bundled bindings (non-Windows)
+        # The checked-in bindings were generated on 64-bit Linux and do not
+        # match the Windows MSVC ABI (c_long is 4 bytes there), so Windows
+        # generates its own bindings with bindgen and the runner's libclang.
+        if: runner.os != 'Windows'
+        shell: bash
+        run: echo "WHISPER_DONT_GENERATE_BINDINGS=1" >> "$GITHUB_ENV"
       - name: Build
         run: cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.flags }}
       - name: Smoke test (Unix)

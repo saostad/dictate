@@ -17,5 +17,3 @@ GGML_AVX2 = "OFF"
 GGML_AVX512 = "OFF"
 GGML_FMA = "OFF"
 GGML_F16C = "OFF"
-# Use whisper-rs-sys's checked-in bindings instead of requiring libclang.
-WHISPER_DONT_GENERATE_BINDINGS = "1"
