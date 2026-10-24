@@ -19,6 +19,9 @@ use std::path::Path;
 use std::sync::Once;
 
 use anyhow::Context;
+use whisper_rs::whisper_rs_sys::{
+    ggml_log_level, ggml_log_level_GGML_LOG_LEVEL_WARN as GGML_LOG_WARNING,
+};
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperSegment,
 };
@@ -239,11 +242,10 @@ pub(crate) fn trim_context_tokens(
 /// is installed once, before the context is created.
 /// ggml log levels: NONE=0, DEBUG=1, INFO=2, WARN=3, ERROR=4, CONT=5.
 /// Pass warnings and errors (and their continuation lines) through, but keep
-/// whisper.cpp's INFO chatter out of the daemon log.
-const GGML_LOG_WARNING: u32 = 3;
-
+/// whisper.cpp's INFO chatter out of the daemon log. `ggml_log_level` is a C
+/// enum, so its Rust type is unsigned on Linux/macOS but signed on MSVC.
 unsafe extern "C" fn log_warnings_and_errors(
-    level: u32,
+    level: ggml_log_level,
     text: *const c_char,
     _user_data: *mut c_void,
 ) {
@@ -253,7 +255,7 @@ unsafe extern "C" fn log_warnings_and_errors(
     }
 }
 
-fn should_log_ggml(level: u32) -> bool {
+fn should_log_ggml(level: ggml_log_level) -> bool {
     level >= GGML_LOG_WARNING
 }
 
