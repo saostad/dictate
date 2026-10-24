@@ -35,7 +35,7 @@ sha2 = "0.10.9"
 tar = "0.4.46"
 tray-icon = { version = "0.26.1", default-features = false, features = ["ksni"] }
 ureq = "3.4.2"
-whisper-rs = "0.16.0"
+whisper-rs = { version = "0.16.0", features = ["raw-api"] }
 winit = "0.30.13"
 
 [features]
