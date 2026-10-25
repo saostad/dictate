@@ -408,7 +408,8 @@ includes all five engines and 14 thread configurations.
 ## Advanced: where settings are stored
 
 The Settings window manages settings for you (sound cues, notifications,
-mode, speech model, inference threads, microphone, shortcut). They live in
+mode, speech model, inference threads, free model memory, microphone,
+shortcut). They live in
 `config.toml` in the platform config directory:
 
 - Linux: `~/.config/dictate/config.toml`
@@ -433,6 +434,14 @@ mode = "live"
 model = "moonshine"
 inference_threads = "auto"
 ```
+
+The speech model loads when the daemon starts and is freed after 20 idle
+minutes (about 700 MB for Parakeet), so dictate uses almost no memory while
+you are not dictating. Change this under **Free model memory** in the tray
+icon's menu or the Settings window, or set `unload_after` to `"never"`,
+`"5"`, `"20"`, `"30"` or `"60"` idle minutes (default `"20"`). The next
+dictation reloads the model in a few seconds; your speech is recorded
+meanwhile and typed once it has loaded.
 
 Nemotron uses `mode = "live"` and `model = "nemotron"`. Streaming selections
 also retain `batch_model` (standard, fluid, or whisper), the last Whole/Pauses

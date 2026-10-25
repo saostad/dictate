@@ -193,6 +193,11 @@ pub(crate) enum Job {
     /// Swap in the Moonshine runtime/model (a switch to moonshine); drops the
     /// other models, then acks [`UserEvent::ModeSwapped`].
     SwapMoonshine(crate::moonshine::Moonshine),
+    /// Free the resident speech model after the idle time set in Settings.
+    Unload,
+    /// Load back the model freed by [`Job::Unload`]; sent when a recording
+    /// starts, so its audio queues behind the load instead of being lost.
+    Reload,
 }
 
 impl std::fmt::Debug for Job {
@@ -211,6 +216,8 @@ impl std::fmt::Debug for Job {
             Job::SwapAsr(_) => "SwapAsr",
             Job::SwapLive(_) => "SwapLive",
             Job::SwapMoonshine(_) => "SwapMoonshine",
+            Job::Unload => "Unload",
+            Job::Reload => "Reload",
         };
         write!(f, "{name}")
     }
@@ -274,6 +281,9 @@ pub(crate) enum UserEvent {
     /// Background mode-switch progress changed; repaint the Settings window
     /// if it is open.
     SettingsRefresh,
+    /// Periodic wake-up to free the speech model once it has been idle for
+    /// the time set in Settings.
+    IdleTick,
     #[cfg(target_os = "linux")]
     WaylandShortcut(u64, crate::wayland_shortcut::Event),
     #[cfg(target_os = "linux")]
@@ -599,6 +609,7 @@ fn run_daemon_inner() -> anyhow::Result<()> {
         event_loop.create_proxy(),
     );
     setup_hotkey(&event_loop, hotkey, &mut app);
+    spawn_idle_ticker(event_loop.create_proxy());
     let result = event_loop
         .run_app(&mut app)
         .context("The daemon event loop failed");
@@ -610,6 +621,100 @@ fn run_daemon_inner() -> anyhow::Result<()> {
     socket::remove_socket_file(&socket_file);
     result
 }
+
+/// How often the daemon checks whether the speech model has idled long
+/// enough to free it (the shortest choice is 5 minutes).
+const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(30);
+
+/// Wake the event loop every [`IDLE_CHECK_INTERVAL`] for the idle unload
+/// check; the thread ends with the event loop.
+fn spawn_idle_ticker(proxy: EventLoopProxy<UserEvent>) {
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(IDLE_CHECK_INTERVAL);
+            if proxy.send_event(UserEvent::IdleTick).is_err() {
+                break;
+            }
+        }
+    });
+}
+
+/// Which engine the worker freed, so [`Job::Reload`] loads the same one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ResidentModel {
+    Asr,
+    Live,
+    Moonshine,
+}
+
+impl WorkerModels {
+    /// The engine currently loaded, if any.
+    fn resident(&self) -> Option<ResidentModel> {
+        if self.asr.is_some() {
+            Some(ResidentModel::Asr)
+        } else if self.live.is_some() {
+            Some(ResidentModel::Live)
+        } else if self.moonshine.is_some() {
+            Some(ResidentModel::Moonshine)
+        } else {
+            None
+        }
+    }
+
+    /// Drop every model and hand the freed heap back to the OS.
+    fn unload(&mut self) {
+        self.asr = None;
+        self.live = None;
+        self.moonshine = None;
+        release_freed_memory();
+    }
+}
+
+/// Load `kind` back after an idle unload. The Live speed gate already passed
+/// when it was first loaded, so it is not run again.
+fn reload_model(models: &mut WorkerModels, kind: ResidentModel) -> anyhow::Result<()> {
+    match kind {
+        ResidentModel::Asr => {
+            models.asr = Some(crate::asr::Asr::load_configured()?);
+        }
+        ResidentModel::Live => {
+            let dir = crate::model::live_model_dir_checked()?;
+            let env = crate::asr::shared_environment()?;
+            models.live = Some(crate::live::Live::load(
+                &dir,
+                &env,
+                crate::asr::intra_threads(),
+            )?);
+        }
+        ResidentModel::Moonshine => {
+            crate::model::check_moonshine_ready()?;
+            let dir = crate::model::moonshine_model_dir_checked()?;
+            let threads =
+                crate::moonshine::Threads::for_setting(crate::config::inference_threads());
+            models.moonshine = Some(crate::moonshine::Session::new(
+                crate::moonshine::Moonshine::load(&dir, threads)?,
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Return freed heap pages to the OS. glibc keeps a freed model's memory in
+/// the process heap otherwise, so the unload would not lower RSS.
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+fn release_freed_memory() {
+    unsafe extern "C" {
+        fn malloc_trim(pad: usize) -> i32;
+    }
+    // SAFETY: malloc_trim only releases free heap memory; it has no
+    // preconditions and its return value (whether anything was released)
+    // needs no handling.
+    unsafe { malloc_trim(0) };
+}
+
+/// Other allocators return large freed blocks to the OS themselves.
+#[cfg(not(all(target_os = "linux", target_env = "gnu")))]
+fn release_freed_memory() {}
 
 /// Models owned by the transcription worker. Only the selected engine is
 /// resident; a successful Settings/tray switch replaces it with the new one.
@@ -821,6 +926,12 @@ struct DaemonApp {
     loaded_asr_model: Option<crate::config::SpeechModel>,
     /// A model switch loading on a background thread, if any.
     mode_switch: Option<ModelSwitch>,
+    /// When the speech model was last used (recording, transcription or a
+    /// model switch); the idle unload counts from here.
+    last_activity: Instant,
+    /// The worker freed the speech model after idling; the next recording
+    /// reloads it.
+    models_unloaded: bool,
     tray: Option<crate::tray::Tray>,
     tray_attempted: bool,
     /// The open Settings window, if any. `None` while closed: the window, GL
@@ -896,6 +1007,8 @@ impl DaemonApp {
             live_fallback,
             loaded_asr_model,
             mode_switch: None,
+            last_activity: Instant::now(),
+            models_unloaded: false,
             tray: None,
             tray_attempted: false,
             settings_window: None,
@@ -1083,6 +1196,10 @@ impl DaemonApp {
                 self.state,
                 crate::config::effective_selection(&self.settings),
                 self.settings.inference_threads,
+                crate::tray::MemoryStatus {
+                    unload_after: self.settings.unload_after,
+                    unloaded: self.models_unloaded,
+                },
                 self.mode_switch.is_some(),
                 self.tray_mic().as_deref(),
             )
@@ -1195,6 +1312,9 @@ impl DaemonApp {
             Some(crate::tray::TrayAction::SelectInferenceThreads(threads)) => {
                 self.switch_inference_threads(threads)
             }
+            Some(crate::tray::TrayAction::SelectUnloadAfter(choice)) => {
+                self.switch_unload_after(choice)
+            }
         }
         self.refresh_settings();
     }
@@ -1241,6 +1361,69 @@ impl DaemonApp {
             false,
         );
         self.sync_tray();
+    }
+
+    /// Change how long the speech model may sit idle before it is freed. The
+    /// idle clock restarts, so a shorter choice never unloads right away.
+    fn switch_unload_after(&mut self, choice: crate::config::UnloadAfter) {
+        if choice == self.settings.unload_after {
+            return;
+        }
+        self.settings.unload_after = choice;
+        self.last_activity = Instant::now();
+        self.report_save_error(crate::config::save(&self.settings));
+        Self::confirm_settings_change(&crate::tray::SettingsChange::UnloadAfter(choice), false);
+        self.sync_tray();
+    }
+
+    /// Free the speech model when it has been idle for the chosen time. Never
+    /// while recording, transcribing or switching models.
+    fn check_idle_unload(&mut self) {
+        let Some(limit) = self.settings.unload_after.duration() else {
+            return;
+        };
+        if self.models_unloaded
+            || self.state != State::Idle
+            || self.mode_switch.is_some()
+            || self.last_activity.elapsed() < limit
+        {
+            return;
+        }
+        if self.to_worker.send(Job::Unload).is_err() {
+            // The command path reports a dead worker itself.
+            return;
+        }
+        self.models_unloaded = true;
+        dlog!(
+            "Speech model idle for {} min: freeing its memory (unload_after = {})",
+            limit.as_secs() / 60,
+            self.settings.unload_after.as_str()
+        );
+        self.sync_tray();
+        self.refresh_settings();
+    }
+
+    /// Before a recording: when the model was freed, have the worker load it
+    /// back first. The audio queues behind the load, so nothing is lost; the
+    /// slower first result is logged and shown.
+    fn reload_if_unloaded(&mut self) {
+        self.last_activity = Instant::now();
+        if !self.models_unloaded {
+            return;
+        }
+        if self.to_worker.send(Job::Reload).is_err() {
+            // The command path reports a dead worker itself.
+            return;
+        }
+        self.models_unloaded = false;
+        dlog!(
+            "warning: fallback: true; speech model was freed after idling, reloading it before transcribing this recording"
+        );
+        crate::notify::show(
+            crate::notify::Kind::Info,
+            "dictate: loading the speech model",
+            "It was freed after idling. Keep talking: your words are recorded and typed once it has loaded (a few seconds).",
+        );
     }
 
     /// Flip the `Notifications` setting, update the effective switch, save.
@@ -1832,6 +2015,7 @@ impl DaemonApp {
             PageAction::SelectMode(mode) => self.switch_mode(mode),
             PageAction::SelectSpeechModel(model) => self.switch_speech_model(model),
             PageAction::SelectInferenceThreads(threads) => self.switch_inference_threads(threads),
+            PageAction::SelectUnloadAfter(choice) => self.switch_unload_after(choice),
             PageAction::SelectShortcut(display) => self.switch_hotkey(&display),
             PageAction::ConfigureShortcut =>
             {
@@ -1922,6 +2106,7 @@ impl DaemonApp {
         match self.mic_session.start(mic.as_deref()) {
             Ok(started) => {
                 self.active_mic = Some(started.mic_name().to_string());
+                self.reload_if_unloaded();
                 match self.current_mode() {
                     crate::config::Mode::Pauses => self.start_pauses_feeder(&started),
                     crate::config::Mode::Live => self.start_live_feeder(&started),
@@ -2195,6 +2380,7 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
                 self.state,
                 crate::config::effective_selection(&self.settings),
                 self.settings.inference_threads,
+                self.settings.unload_after,
                 self.tray_mic().as_deref(),
                 self.menu_proxy.clone(),
             ) {
@@ -2273,6 +2459,7 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
                 }
             }
             UserEvent::WorkerDone => {
+                self.last_activity = Instant::now();
                 self.state = State::Idle;
                 self.tap_armed = false;
                 self.sync_tray();
@@ -2282,6 +2469,9 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
                 // One switch at a time; a stale ack with nothing pending is
                 // ignored.
                 if let Some(target) = self.mode_switch.as_ref().map(|switch| switch.target) {
+                    // The swap put a freshly loaded model in the worker.
+                    self.models_unloaded = false;
+                    self.last_activity = Instant::now();
                     self.complete_switch(target);
                 }
                 self.refresh_settings();
@@ -2297,6 +2487,7 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
             UserEvent::Menu(event) => self.handle_menu(event, event_loop),
             UserEvent::OpenSettings => self.open_settings(event_loop),
             UserEvent::SettingsRefresh => self.refresh_settings(),
+            UserEvent::IdleTick => self.check_idle_unload(),
             #[cfg(target_os = "linux")]
             UserEvent::WaylandShortcut(generation, event) => {
                 if generation == self.wayland_generation {
@@ -3219,6 +3410,8 @@ fn transcribe_worker(
     // Per-recording live and Moonshine state.
     let mut live = LiveRun::new();
     let mut moonshine = MoonshineRun::default();
+    // The engine freed by an idle unload, until a reload or swap replaces it.
+    let mut unloaded: Option<ResidentModel> = None;
     let worker_done =
         |proxy: &EventLoopProxy<UserEvent>| proxy.send_event(UserEvent::WorkerDone).is_err();
     'worker: loop {
@@ -3633,7 +3826,41 @@ fn transcribe_worker(
                     break;
                 }
             }
+            Job::Unload => {
+                if let Some(kind) = models.resident() {
+                    live.reset();
+                    moonshine.reset();
+                    models.unload();
+                    unloaded = Some(kind);
+                    dlog!("Speech model unloaded ({kind:?}); the next recording reloads it");
+                }
+            }
+            Job::Reload => {
+                let Some(kind) = unloaded.take() else {
+                    continue;
+                };
+                if models.resident().is_some() {
+                    continue;
+                }
+                let start = Instant::now();
+                match reload_model(&mut models, kind) {
+                    Ok(()) => dlog!(
+                        "model reloaded after idle in {} ms",
+                        start.elapsed().as_millis()
+                    ),
+                    Err(err) => {
+                        let message = format!("{err:#}");
+                        dlog!("error: dictate: could not reload the speech model: {message}");
+                        crate::notify::show(
+                            crate::notify::Kind::Error,
+                            "dictate: could not reload the speech model",
+                            &message,
+                        );
+                    }
+                }
+            }
             Job::SwapAsr(model) => {
+                unloaded = None;
                 models.asr = Some(model);
                 models.live = None;
                 models.moonshine = None;
@@ -3643,6 +3870,7 @@ fn transcribe_worker(
                 }
             }
             Job::SwapLive(model) => {
+                unloaded = None;
                 models.live = Some(model);
                 models.asr = None;
                 models.moonshine = None;
@@ -3652,6 +3880,7 @@ fn transcribe_worker(
                 }
             }
             Job::SwapMoonshine(model) => {
+                unloaded = None;
                 // Dropping the old session closes any stream it still holds.
                 models.moonshine = Some(crate::moonshine::Session::new(model));
                 models.asr = None;

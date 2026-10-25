@@ -7,7 +7,9 @@
 //! (`"standard"`/`"fluid"`/`"whisper"`/`"nemotron"`/`"moonshine"`), `hotkey`
 //! (string, default `Ctrl+Shift+Space`), `microphone` (string, default `""` =
 //! the system default input) and `inference_threads` (`"auto"`, `"1"` or
-//! `"2"`, default `"auto"`). A missing
+//! `"2"`, default `"auto"`) and `unload_after` (`"never"`, `"5"`, `"20"`,
+//! `"30"` or `"60"` idle minutes before the daemon frees the speech model,
+//! default `"20"`). A missing
 //! file means defaults, never an error. Legacy `mode = "moonshine"` and Live
 //! configs are migrated to a mode/model pair; `batch_model` retains their
 //! previous offline model for startup fallback. On macOS the hotkey modifiers are
@@ -211,6 +213,66 @@ impl InferenceThreads {
     }
 }
 
+/// Idle minutes before the daemon frees the speech model's memory. The next
+/// recording reloads it (a few seconds) while the audio is already captured.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum UnloadAfter {
+    Never,
+    Minutes5,
+    #[default]
+    Minutes20,
+    Minutes30,
+    Minutes60,
+}
+
+impl UnloadAfter {
+    pub(crate) const ALL: [UnloadAfter; 5] = [
+        UnloadAfter::Never,
+        UnloadAfter::Minutes5,
+        UnloadAfter::Minutes20,
+        UnloadAfter::Minutes30,
+        UnloadAfter::Minutes60,
+    ];
+
+    pub(crate) fn as_str(self) -> &'static str {
+        match self {
+            UnloadAfter::Never => "never",
+            UnloadAfter::Minutes5 => "5",
+            UnloadAfter::Minutes20 => "20",
+            UnloadAfter::Minutes30 => "30",
+            UnloadAfter::Minutes60 => "60",
+        }
+    }
+
+    pub(crate) fn display_name(self) -> &'static str {
+        match self {
+            UnloadAfter::Never => "Never (keep loaded)",
+            UnloadAfter::Minutes5 => "After 5 minutes idle",
+            UnloadAfter::Minutes20 => "After 20 minutes idle (default)",
+            UnloadAfter::Minutes30 => "After 30 minutes idle",
+            UnloadAfter::Minutes60 => "After 1 hour idle",
+        }
+    }
+
+    pub(crate) fn parse(value: &str) -> Option<Self> {
+        Self::ALL
+            .into_iter()
+            .find(|choice| choice.as_str() == value)
+    }
+
+    /// The idle time before unloading, `None` for Never.
+    pub(crate) fn duration(self) -> Option<std::time::Duration> {
+        let minutes = match self {
+            UnloadAfter::Never => return None,
+            UnloadAfter::Minutes5 => 5,
+            UnloadAfter::Minutes20 => 20,
+            UnloadAfter::Minutes30 => 30,
+            UnloadAfter::Minutes60 => 60,
+        };
+        Some(std::time::Duration::from_secs(minutes * 60))
+    }
+}
+
 /// Settings from the file (before env overrides).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Settings {
@@ -219,6 +281,7 @@ pub(crate) struct Settings {
     pub mode: Mode,
     pub model: SpeechModel,
     pub inference_threads: InferenceThreads,
+    pub unload_after: UnloadAfter,
     pub hotkey: String,
     pub microphone: String,
 }
@@ -231,6 +294,7 @@ impl Default for Settings {
             mode: Mode::Whole,
             model: SpeechModel::Standard,
             inference_threads: InferenceThreads::Auto,
+            unload_after: UnloadAfter::Minutes20,
             hotkey: crate::hotkey::DEFAULT_HOTKEY.to_string(),
             microphone: String::new(),
         }
@@ -684,6 +748,18 @@ pub(crate) fn parse(text: &str) -> Result<Settings, String> {
                     )
                 })?;
             }
+            "unload_after" => {
+                let parsed = parse_string(value).map_err(|problem| {
+                    format!(
+                        "config.toml line {line_number}: invalid value for \"unload_after\": {problem}"
+                    )
+                })?;
+                settings.unload_after = UnloadAfter::parse(&parsed).ok_or_else(|| {
+                    format!(
+                        "config.toml line {line_number}: invalid value for \"unload_after\": expected \"never\", \"5\", \"20\", \"30\" or \"60\""
+                    )
+                })?;
+            }
             "hotkey" => {
                 settings.hotkey = parse_string(value).map_err(|problem| {
                     format!(
@@ -777,12 +853,13 @@ fn escape(value: &str) -> String {
 fn render(settings: &Settings) -> String {
     let selection = Selection::from_settings(settings);
     let mut text = format!(
-        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Dictation mode: \"whole\" (type once at stop), \"pauses\" (type at pauses), or \"live\" (stream while speaking).\nmode = \"{}\"\n# Speech model for whole/pauses: \"standard\" (Parakeet), \"fluid\" or \"whisper\". Live: \"nemotron\" or \"moonshine\".\nmodel = \"{}\"\n# Inference threads: \"auto\" (Whisper up to 2, Moonshine single-thread), \"1\" or \"2\" (Moonshine 2 = default threading, not exactly 2). Restart the daemon after changing it.\ninference_threads = \"{}\"\n# Global hotkey: tap to toggle, hold to talk. macOS names: Cmd, Option, Ctrl, Shift (e.g. Cmd+Option+Space); modifier-only shortcuts (at least two modifiers, macOS only, need Input Monitoring; pressing another key cancels).\nhotkey = \"{}\"\n# Microphone: \"\" means the system default input, or a device id (see \"dictate mics\").\nmicrophone = \"{}\"\n",
+        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Dictation mode: \"whole\" (type once at stop), \"pauses\" (type at pauses), or \"live\" (stream while speaking).\nmode = \"{}\"\n# Speech model for whole/pauses: \"standard\" (Parakeet), \"fluid\" or \"whisper\". Live: \"nemotron\" or \"moonshine\".\nmodel = \"{}\"\n# Inference threads: \"auto\" (Whisper up to 2, Moonshine single-thread), \"1\" or \"2\" (Moonshine 2 = default threading, not exactly 2). Restart the daemon after changing it.\ninference_threads = \"{}\"\n# Free the speech model's memory after this many idle minutes: \"never\", \"5\", \"20\" (default), \"30\" or \"60\". The next recording reloads it.\nunload_after = \"{}\"\n# Global hotkey: tap to toggle, hold to talk. macOS names: Cmd, Option, Ctrl, Shift (e.g. Cmd+Option+Space); modifier-only shortcuts (at least two modifiers, macOS only, need Input Monitoring; pressing another key cancels).\nhotkey = \"{}\"\n# Microphone: \"\" means the system default input, or a device id (see \"dictate mics\").\nmicrophone = \"{}\"\n",
         settings.sounds,
         settings.notifications,
         selection.mode.as_str(),
         selection.model.as_str(),
         settings.inference_threads.as_str(),
+        settings.unload_after.as_str(),
         escape(&settings.hotkey),
         escape(&settings.microphone)
     );
@@ -1109,6 +1186,21 @@ mod tests {
     }
 
     #[test]
+    fn unload_after_parses_presets_only() {
+        assert_eq!(Settings::default().unload_after, UnloadAfter::Minutes20);
+        assert_eq!(
+            parse("unload_after = \"30\"\n").unwrap().unload_after,
+            UnloadAfter::Minutes30
+        );
+        assert!(parse("unload_after = \"7\"\n").is_err());
+        assert_eq!(UnloadAfter::Never.duration(), None);
+        assert_eq!(
+            UnloadAfter::Minutes5.duration(),
+            Some(std::time::Duration::from_secs(300))
+        );
+    }
+
+    #[test]
     fn repeated_key_keeps_last_value() {
         let settings = parse("sounds = false\nsounds = true\n").unwrap();
         assert!(settings.sounds);
@@ -1124,6 +1216,7 @@ mod tests {
                 mode: Mode::Pauses,
                 model: SpeechModel::Fluid,
                 inference_threads: InferenceThreads::Two,
+                unload_after: UnloadAfter::Minutes20,
                 hotkey: "say \"hi\" \\ now".to_string(),
                 microphone: "pulseaudio:alsa_input.pci".to_string(),
             },
@@ -1343,6 +1436,7 @@ mod tests {
             mode: Mode::Whole,
             model: SpeechModel::Standard,
             inference_threads: InferenceThreads::Auto,
+            unload_after: UnloadAfter::Never,
             hotkey: "F8".to_string(),
             microphone: String::new(),
         };

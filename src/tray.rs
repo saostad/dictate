@@ -9,7 +9,7 @@ use anyhow::Context;
 use tray_icon::menu::{CheckMenuItem, Menu, MenuId, MenuItem, PredefinedMenuItem, Submenu};
 use tray_icon::{Icon, TrayIcon, TrayIconBuilder};
 
-use crate::config::{DictationMode, InferenceThreads, Mode, ModelChoice, Selection};
+use crate::config::{DictationMode, InferenceThreads, Mode, ModelChoice, Selection, UnloadAfter};
 use crate::daemon::State;
 
 /// Icon edge length in pixels.
@@ -30,6 +30,9 @@ pub(crate) const TRAY_ID: &str = "dictate";
 /// Text of the disabled status label while a mode switch loads in the
 /// background.
 pub(crate) const LOADING_TEXT: &str = "dictate — Loading…";
+
+/// Suffix of the Idle status label while the speech model is unloaded.
+pub(crate) const UNLOADED_SUFFIX: &str = " · model unloaded";
 
 /// Pixels, width and height of the tray icon for `state`: a filled circle in
 /// the state color on a transparent background.
@@ -112,6 +115,7 @@ pub(crate) enum SettingsChange {
     SpeechModel(ModelChoice),
     Selection(Selection),
     InferenceThreads(crate::config::InferenceThreads),
+    UnloadAfter(UnloadAfter),
     Shortcut(String),
     Microphone { id: String, name: String },
 }
@@ -135,6 +139,9 @@ impl SettingsChange {
             ),
             SettingsChange::InferenceThreads(threads) => {
                 format!("Inference threads: {}", threads.display_name())
+            }
+            SettingsChange::UnloadAfter(choice) => {
+                format!("Free model memory: {}", choice.display_name())
             }
             SettingsChange::Shortcut(display) => format!(
                 "Shortcut: {}",
@@ -160,6 +167,9 @@ impl SettingsChange {
             ),
             SettingsChange::InferenceThreads(threads) => {
                 format!("settings: inference_threads = {}", threads.as_str())
+            }
+            SettingsChange::UnloadAfter(choice) => {
+                format!("settings: unload_after = {}", choice.as_str())
             }
             SettingsChange::Shortcut(display) => format!("settings: hotkey = {display}"),
             SettingsChange::Microphone { id, .. } => {
@@ -188,6 +198,7 @@ pub(crate) enum TrayAction {
     SelectMode(DictationMode),
     SelectSpeechModel(ModelChoice),
     SelectInferenceThreads(InferenceThreads),
+    SelectUnloadAfter(UnloadAfter),
 }
 
 /// Everything selectable from the tray's mode, speech-model and inference
@@ -246,6 +257,18 @@ pub(crate) const THREADS_MENU: [(InferenceThreads, &str, &str); 3] = [
     ),
 ];
 
+/// The idle-unload setting and whether the model is unloaded right now.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct MemoryStatus {
+    pub unload_after: UnloadAfter,
+    pub unloaded: bool,
+}
+
+/// Stable menu id of each "Free model memory" choice.
+fn unload_menu_id(choice: UnloadAfter) -> String {
+    format!("dictate-unload-{}", choice.as_str())
+}
+
 /// The tray icon and every menu item the daemon updates or matches.
 pub(crate) struct Tray {
     icon: TrayIcon,
@@ -257,6 +280,7 @@ pub(crate) struct Tray {
     mode_items: Vec<(DictationMode, CheckMenuItem)>,
     model_items: Vec<(ModelChoice, CheckMenuItem)>,
     thread_items: Vec<(InferenceThreads, CheckMenuItem)>,
+    unload_items: Vec<(UnloadAfter, CheckMenuItem)>,
 }
 
 /// Build the tray icon with its short menu, and forward menu clicks to the
@@ -265,6 +289,7 @@ pub(crate) fn build_tray(
     state: State,
     selected: Selection,
     threads: InferenceThreads,
+    unload_after: UnloadAfter,
     mic: Option<&str>,
     proxy: winit::event_loop::EventLoopProxy<crate::daemon::UserEvent>,
 ) -> anyhow::Result<Tray> {
@@ -318,6 +343,21 @@ pub(crate) fn build_tray(
             .context("Could not build the tray menu")?;
         thread_items.push((value, item));
     }
+    let unload_menu = Submenu::new("Free model memory", true);
+    let mut unload_items = Vec::new();
+    for value in UnloadAfter::ALL {
+        let item = CheckMenuItem::with_id(
+            unload_menu_id(value),
+            value.display_name(),
+            true,
+            unload_after == value,
+            None,
+        );
+        unload_menu
+            .append(&item)
+            .context("Could not build the tray menu")?;
+        unload_items.push((value, item));
+    }
     menu.append(&status)
         .context("Could not build the tray menu")?;
     menu.append(&toggle)
@@ -331,6 +371,8 @@ pub(crate) fn build_tray(
     menu.append(&model_menu)
         .context("Could not build the tray menu")?;
     menu.append(&threads_menu)
+        .context("Could not build the tray menu")?;
+    menu.append(&unload_menu)
         .context("Could not build the tray menu")?;
     menu.append(&PredefinedMenuItem::separator())
         .context("Could not build the tray menu")?;
@@ -372,6 +414,7 @@ pub(crate) fn build_tray(
         mode_items,
         model_items,
         thread_items,
+        unload_items,
     })
 }
 
@@ -385,6 +428,7 @@ impl Tray {
         state: State,
         selected: Selection,
         threads: InferenceThreads,
+        memory: MemoryStatus,
         loading: bool,
         mic: Option<&str>,
     ) -> anyhow::Result<()> {
@@ -399,6 +443,9 @@ impl Tray {
             .map_err(|err| anyhow::anyhow!("Could not update the tray tooltip: {err}"))?;
         if loading {
             self.status.set_text(LOADING_TEXT);
+        } else if memory.unloaded && state == State::Idle {
+            self.status
+                .set_text(format!("{}{UNLOADED_SUFFIX}", status_text(state, mic)));
         } else {
             self.status.set_text(status_text(state, mic));
         }
@@ -421,6 +468,9 @@ impl Tray {
         for (value, item) in &self.thread_items {
             item.set_checked(*value == threads);
             item.set_enabled(can_switch);
+        }
+        for (value, item) in &self.unload_items {
+            item.set_checked(*value == memory.unload_after);
         }
         Ok(())
     }
@@ -452,6 +502,11 @@ impl Tray {
         for (threads, item) in &self.thread_items {
             if *id == *item.id() {
                 return Some(TrayAction::SelectInferenceThreads(*threads));
+            }
+        }
+        for (choice, item) in &self.unload_items {
+            if *id == *item.id() {
+                return Some(TrayAction::SelectUnloadAfter(*choice));
             }
         }
         None

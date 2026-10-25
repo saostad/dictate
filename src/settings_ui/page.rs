@@ -91,6 +91,7 @@ pub(crate) enum PageAction {
     SelectMode(Mode),
     SelectSpeechModel(SpeechModel),
     SelectInferenceThreads(InferenceThreads),
+    SelectUnloadAfter(crate::config::UnloadAfter),
     SelectShortcut(String),
     ConfigureShortcut,
     ToggleSounds,
@@ -633,6 +634,19 @@ fn speech_model_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<Pa
     explain(
         ui,
         "Applies to Whisper and Moonshine. Auto: up to 2 threads for Whisper, single-thread for Moonshine. 1: one thread. 2: Whisper uses exactly 2; Moonshine uses its default threading, not exactly 2. Restart the daemon after changing this.",
+    );
+    heading(ui, "Free model memory");
+    for choice in crate::config::UnloadAfter::ALL {
+        if ui
+            .radio(view.settings.unload_after == choice, choice.display_name())
+            .clicked()
+        {
+            actions.push(PageAction::SelectUnloadAfter(choice));
+        }
+    }
+    explain(
+        ui,
+        "Frees the speech model's memory (about 700 MB for Parakeet) after this much idle time. The next dictation reloads it in a few seconds; your speech is recorded meanwhile and typed once it has loaded.",
     );
 }
 
