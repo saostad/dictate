@@ -321,7 +321,8 @@ impl Whisper {
     pub fn load(path: &Path, threads: usize) -> anyhow::Result<Self> {
         quiet_whisper_logs();
         let mut params = WhisperContextParameters::default();
-        params.use_gpu(false);
+        // Uses the GPU when a GPU backend is compiled in (Vulkan on Windows); whisper.cpp falls back to the CPU when no device is found.
+        params.use_gpu(crate::config::gpu_on());
         params.flash_attn(false);
         let context = WhisperContext::new_with_params(path, params).with_context(|| {
             format!(

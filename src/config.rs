@@ -9,7 +9,7 @@
 //! the system default input) and `inference_threads` (`"auto"`, `"1"` or
 //! `"2"`, default `"auto"`) and `unload_after` (`"never"`, `"5"`, `"20"`,
 //! `"30"` or `"60"` idle minutes before the daemon frees the speech model,
-//! default `"20"`). A missing
+//! default `"20"`) and `gpu` (bool, default true). A missing
 //! file means defaults, never an error. Legacy `mode = "moonshine"` and Live
 //! configs are migrated to a mode/model pair; `batch_model` retains their
 //! previous offline model for startup fallback. On macOS the hotkey modifiers are
@@ -20,8 +20,8 @@
 //! cancels that recording. They are not available on Windows/Linux.
 //!
 //! The environment still wins: `DICTATE_SOUNDS`, `DICTATE_NOTIFY`, `DICTATE_MODE`,
-//! `DICTATE_SPEECH_MODEL`, `DICTATE_INFERENCE_THREADS`, `DICTATE_HOTKEY` and
-//! `DICTATE_MICROPHONE` override the
+//! `DICTATE_SPEECH_MODEL`, `DICTATE_INFERENCE_THREADS`, `DICTATE_HOTKEY`,
+//! `DICTATE_GPU` and `DICTATE_MICROPHONE` override the
 //! file (`DICTATE_STREAMING` still works when `DICTATE_MODE` is unset). The
 //! daemon resolves file + env once
 //! at startup into the effective switches below, which `cue`, `notify` and the
@@ -284,6 +284,7 @@ pub(crate) struct Settings {
     pub unload_after: UnloadAfter,
     pub hotkey: String,
     pub microphone: String,
+    pub gpu: bool,
 }
 
 impl Default for Settings {
@@ -297,6 +298,7 @@ impl Default for Settings {
             unload_after: UnloadAfter::Minutes20,
             hotkey: crate::hotkey::DEFAULT_HOTKEY.to_string(),
             microphone: String::new(),
+            gpu: true,
         }
     }
 }
@@ -311,6 +313,8 @@ static MODE: AtomicU8 = AtomicU8::new(0);
 static SPEECH_MODEL: AtomicU8 = AtomicU8::new(0);
 /// Effective inference-thread setting for the small engines (file + env).
 static INFERENCE_THREADS: AtomicU8 = AtomicU8::new(0);
+/// Effective "use the GPU" switch (file + `DICTATE_GPU`), read at model load.
+static GPU_ON: AtomicBool = AtomicBool::new(true);
 
 /// Combine one bool setting with its env override: unset env keeps the file
 /// value, `"0"` turns it off, anything else turns it on.
@@ -401,6 +405,7 @@ fn mode_env_now() -> (Option<String>, Option<String>, Option<String>) {
 /// environment. The daemon calls this once with the loaded file; short-lived
 /// processes call it with defaults so `DICTATE_*=0` still applies.
 pub(crate) fn init_effective(settings: &Settings) {
+    refresh_gpu(settings.gpu);
     refresh_from(
         settings.sounds,
         settings.notifications,
@@ -455,6 +460,19 @@ pub(crate) fn speech_model() -> SpeechModel {
 /// Effective inference-thread setting for Whisper/Moonshine.
 pub(crate) fn inference_threads() -> InferenceThreads {
     InferenceThreads::from_discriminant(INFERENCE_THREADS.load(Ordering::SeqCst))
+}
+
+/// Effective GPU switch; models loaded after a change pick it up.
+pub(crate) fn gpu_on() -> bool {
+    GPU_ON.load(Ordering::SeqCst)
+}
+
+/// Update the effective GPU switch from the file value (env still wins).
+pub(crate) fn refresh_gpu(file_value: bool) {
+    GPU_ON.store(
+        apply_env(file_value, std::env::var("DICTATE_GPU").ok().as_deref()),
+        Ordering::SeqCst,
+    );
 }
 
 /// Concrete Whisper thread count, based on the effective setting and the
@@ -678,7 +696,7 @@ pub(crate) fn parse(text: &str) -> Result<Settings, String> {
         let key = key.trim();
         let value = value.trim();
         match key {
-            "sounds" | "notifications" => {
+            "sounds" | "notifications" | "gpu" => {
                 let parsed = match value {
                     "true" => true,
                     "false" => false,
@@ -690,6 +708,8 @@ pub(crate) fn parse(text: &str) -> Result<Settings, String> {
                 };
                 if key == "sounds" {
                     settings.sounds = parsed;
+                } else if key == "gpu" {
+                    settings.gpu = parsed;
                 } else {
                     settings.notifications = parsed;
                 }
@@ -866,6 +886,10 @@ fn render(settings: &Settings) -> String {
     if settings.mode.is_streaming() {
         text.push_str(&format!("# Last Whole/Pauses model, retained for returning from Live and startup fallback.\nbatch_model = \"{}\"\n", settings.model.as_str()));
     }
+    text.push_str(&format!(
+        "# Run Whisper on the GPU when one is available. Applies the next time a model loads.\ngpu = {}\n",
+        settings.gpu
+    ));
     text
 }
 
@@ -1219,6 +1243,7 @@ mod tests {
                 unload_after: UnloadAfter::Minutes20,
                 hotkey: "say \"hi\" \\ now".to_string(),
                 microphone: "pulseaudio:alsa_input.pci".to_string(),
+                gpu: false,
             },
             Settings {
                 mode: Mode::Live,
@@ -1439,6 +1464,7 @@ mod tests {
             unload_after: UnloadAfter::Never,
             hotkey: "F8".to_string(),
             microphone: String::new(),
+            gpu: true,
         };
         save_to(&path, &settings).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();

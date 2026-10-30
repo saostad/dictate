@@ -554,7 +554,10 @@ fn run_daemon_inner() -> anyhow::Result<()> {
     };
     let load_start = Instant::now();
     let switch_progress = Arc::new(Mutex::new(SwitchProgress::default()));
+    let loading_notice =
+        crate::notify::delayed_status(BUSY_NOTICE_DELAY, "Loading the speech model…");
     let (models, live_fallback) = load_daemon_models(dictation_mode(), &switch_progress)?;
+    drop(loading_notice);
     #[cfg(unix)]
     let socket_file = {
         let path = socket::socket_path()?;
@@ -932,6 +935,8 @@ struct DaemonApp {
     /// The worker freed the speech model after idling; the next recording
     /// reloads it.
     models_unloaded: bool,
+    /// Pending "Transcribing…" status; dropped when the worker finishes.
+    busy_notice: Option<crate::notify::DelayedStatus>,
     tray: Option<crate::tray::Tray>,
     tray_attempted: bool,
     /// The open Settings window, if any. `None` while closed: the window, GL
@@ -1009,6 +1014,7 @@ impl DaemonApp {
             mode_switch: None,
             last_activity: Instant::now(),
             models_unloaded: false,
+            busy_notice: None,
             tray: None,
             tray_attempted: false,
             settings_window: None,
@@ -1327,6 +1333,15 @@ impl DaemonApp {
         self.report_save_error(crate::config::save(&self.settings));
         Self::confirm_settings_change(&crate::tray::SettingsChange::Sounds(new), false);
         self.sync_tray();
+    }
+
+    /// Flip the `Use GPU` setting and save; models loaded from now on use it.
+    fn flip_gpu(&mut self) {
+        let new = !self.settings.gpu;
+        self.settings.gpu = new;
+        crate::config::refresh_gpu(new);
+        self.report_save_error(crate::config::save(&self.settings));
+        Self::confirm_settings_change(&crate::tray::SettingsChange::Gpu(new), false);
     }
 
     /// Change the small-engine inference threads. The setting is saved and
@@ -2026,6 +2041,7 @@ impl DaemonApp {
             }
             PageAction::ToggleSounds => self.flip_sounds(),
             PageAction::ToggleNotifications => self.flip_notifications(),
+            PageAction::ToggleGpu => self.flip_gpu(),
             PageAction::SetAutostart(on) => self.apply_autostart(on),
             PageAction::OpenLog => self.open_daemon_log(),
             PageAction::OpenReleases => self.open_releases(),
@@ -2083,7 +2099,7 @@ impl DaemonApp {
     /// Run the state-machine action, updating `state`, and return the reply.
     /// I/O failures are logged and turn the reply into `err ...`.
     fn run_action(&mut self, action: Action, new_state: State, ok_reply: &str) -> String {
-        match action {
+        let reply = match action {
             Action::None => {
                 self.state = new_state;
                 ok_reply.to_string()
@@ -2091,7 +2107,14 @@ impl DaemonApp {
             Action::StartRecording => self.start_recording(new_state, ok_reply),
             Action::StopRecording => self.stop_recording(new_state, ok_reply),
             Action::CancelRecording => self.cancel_recording(new_state, ok_reply),
+        };
+        if self.state == State::Transcribing {
+            self.busy_notice = Some(crate::notify::delayed_status(
+                BUSY_NOTICE_DELAY,
+                "Transcribing your recording…",
+            ));
         }
+        reply
     }
 
     /// Start the mic, plus a feeder thread in pauses/live mode. Pauses mode
@@ -2459,6 +2482,7 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
                 }
             }
             UserEvent::WorkerDone => {
+                self.busy_notice = None;
                 self.last_activity = Instant::now();
                 self.state = State::Idle;
                 self.tap_armed = false;
@@ -2529,6 +2553,10 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
 /// Milestone percentages notified during a background model download.
 const DOWNLOAD_MILESTONES: [u64; 3] = [25, 50, 75];
 
+/// How long background work may run before a status notification explains
+/// the wait; quicker work stays silent.
+const BUSY_NOTICE_DELAY: std::time::Duration = std::time::Duration::from_millis(1_500);
+
 /// How many of the 25/50/75 milestones `percent` has reached.
 fn milestones_reached(percent: u64) -> usize {
     DOWNLOAD_MILESTONES
@@ -2571,10 +2599,18 @@ fn run_model_switch_loader(
     proxy: &EventLoopProxy<UserEvent>,
     progress: &Mutex<SwitchProgress>,
 ) {
-    if download_first && download_for_switch(target, proxy, progress).is_err() {
-        return;
+    let name = model_download_name(target);
+    if download_first {
+        crate::notify::show_progress(&format!("Downloading {name}…"));
+        if download_for_switch(target, proxy, progress).is_err() {
+            return;
+        }
     }
-    let swap = match load_switch_model(target, previous, proxy, progress) {
+    let loading_notice =
+        crate::notify::delayed_status(BUSY_NOTICE_DELAY, &format!("Loading {name}…"));
+    let loaded = load_switch_model(target, previous, proxy, progress);
+    drop(loading_notice);
+    let swap = match loaded {
         Ok(swap) => swap,
         Err(()) => {
             send_switch_failed(proxy);
@@ -2737,6 +2773,7 @@ fn load_live_for_switch(
     };
     lock_progress(progress).checking_speed = true;
     send_settings_refresh(proxy);
+    crate::notify::show_progress("Checking whether this computer is fast enough for Live mode…");
     let median = check_live_speed(&mut live, progress);
     lock_progress(progress).checking_speed = false;
     send_settings_refresh(proxy);

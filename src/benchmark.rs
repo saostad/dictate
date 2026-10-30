@@ -194,6 +194,8 @@ pub(crate) fn run(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         return Ok(());
     }
     let options = parse_args(&args)?;
+    // Ignores config.toml like the rest of the benchmark; DICTATE_GPU=0 measures the CPU.
+    crate::config::refresh_gpu(true);
     if let Some(root) = &options.model_dir {
         apply_model_root(root)?;
     }

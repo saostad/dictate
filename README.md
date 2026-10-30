@@ -143,6 +143,19 @@ match the MSVC ABI. `.cargo/config.toml` builds ggml for the x86_64 baseline (AV
 `-march=native`); override the `GGML_*`/`WHISPER_*` variables in your shell
 when targeting a different CPU class.
 
+On Windows, Whisper runs on the GPU through Vulkan, so the build also needs
+the [Vulkan SDK](https://vulkan.lunarg.com/) (`VULKAN_SDK` set by its
+installer). From PowerShell:
+
+```powershell
+winget install -e --id LLVM.LLVM
+winget install -e --id Kitware.CMake
+winget install -e --id KhronosGroup.VulkanSDK
+[Environment]::SetEnvironmentVariable('LIBCLANG_PATH', 'C:\Program Files\LLVM\bin', 'User')
+```
+
+Then open a new terminal so the new variables apply.
+
 ```sh
 cargo build --release
 ```

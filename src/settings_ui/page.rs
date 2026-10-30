@@ -96,6 +96,7 @@ pub(crate) enum PageAction {
     ConfigureShortcut,
     ToggleSounds,
     ToggleNotifications,
+    ToggleGpu,
     SetAutostart(bool),
     OpenLog,
     OpenReleases,
@@ -1136,6 +1137,14 @@ fn general_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAct
     explain(
         ui,
         "Show desktop notifications for errors and empty recordings.",
+    );
+    let mut gpu = view.settings.gpu;
+    if ui.checkbox(&mut gpu, "Use GPU").changed() {
+        actions.push(PageAction::ToggleGpu);
+    }
+    explain(
+        ui,
+        "Run Whisper on the graphics card when available. Restart Dictate to apply.",
     );
 }
 

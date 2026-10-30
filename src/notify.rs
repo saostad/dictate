@@ -8,7 +8,9 @@
 //! the notification is delivered before the process exits), and notification
 //! failures only warn once per process.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::Duration;
 
 /// Severity of a notification: a critical error, or a passing info.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -69,13 +71,14 @@ pub(crate) fn show_forced(kind: Kind, summary: &str, body: &str) {
     });
 }
 
-/// Fixed id for the Live-download progress notification: re-showing with
-/// the same id replaces the previous milestone instead of stacking (notify-rust
-/// `Notification::id`, supported on XDG, Windows and non-preview macOS).
-/// Large enough to never collide with server-issued ids.
-const LIVE_DOWNLOAD_ID: u32 = 0xD1C7_A7E5;
+/// Fixed id for background-status notifications (download progress, loading,
+/// transcribing): re-showing with the same id replaces the previous status
+/// instead of stacking (notify-rust `Notification::id`, supported on XDG,
+/// Windows and non-preview macOS). Large enough to never collide with
+/// server-issued ids.
+const STATUS_ID: u32 = 0xD1C7_A7E5;
 
-/// Show the Live-download progress, replacing the previous milestone.
+/// Show the download progress, replacing the previous status.
 /// Blocking: the download thread is already a background thread, and blocking
 /// keeps milestones ordered. Respects the notification switch; failures warn
 /// once per process.
@@ -83,20 +86,49 @@ pub(crate) fn show_progress(body: &str) {
     if !enabled_now() {
         return;
     }
-    if let Err(err) = show_progress_blocking(body) {
+    if let Err(err) = show_status_blocking(body) {
         warn_once(&err);
     }
 }
 
-/// Show one progress notification on the calling thread.
-fn show_progress_blocking(body: &str) -> anyhow::Result<()> {
+/// A status notification that appears only if the work outlasts its delay.
+/// Dropping it before then cancels the notification.
+pub(crate) struct DelayedStatus(Arc<AtomicBool>);
+
+impl Drop for DelayedStatus {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::SeqCst);
+    }
+}
+
+/// Show `body` as a status after `delay`, unless the returned guard is
+/// dropped first. Keeps quick operations silent while slow ones explain the
+/// wait.
+pub(crate) fn delayed_status(delay: Duration, body: &str) -> DelayedStatus {
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&cancelled);
+    let body = body.to_owned();
+    std::thread::spawn(move || {
+        std::thread::sleep(delay);
+        if flag.load(Ordering::SeqCst) || !enabled_now() {
+            return;
+        }
+        if let Err(err) = show_status_blocking(&body) {
+            warn_once(&err);
+        }
+    });
+    DelayedStatus(cancelled)
+}
+
+/// Show one status notification on the calling thread.
+fn show_status_blocking(body: &str) -> anyhow::Result<()> {
     let mut notification = notify_rust::Notification::new();
     notification
         .appname("dictate")
         .summary("dictate")
         .body(body)
         .timeout(notify_rust::Timeout::Milliseconds(6_000))
-        .id(LIVE_DOWNLOAD_ID);
+        .id(STATUS_ID);
     #[cfg(all(unix, not(target_os = "macos")))]
     notification.urgency(notify_rust::Urgency::Normal);
     notification

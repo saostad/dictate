@@ -111,6 +111,7 @@ pub(crate) fn system_default_label(default_name: Option<&str>) -> String {
 pub(crate) enum SettingsChange {
     Sounds(bool),
     Notifications(bool),
+    Gpu(bool),
     Mode(DictationMode),
     SpeechModel(ModelChoice),
     Selection(Selection),
@@ -127,6 +128,9 @@ impl SettingsChange {
             SettingsChange::Sounds(on) => format!("Sound cues: {}", on_off(*on)),
             SettingsChange::Notifications(on) => {
                 format!("Notifications: {}", on_off(*on))
+            }
+            SettingsChange::Gpu(on) => {
+                format!("Use GPU: {} (restart Dictate to apply)", on_off(*on))
             }
             SettingsChange::Mode(mode) => format!("Mode: {}", mode.display_name()),
             SettingsChange::SpeechModel(model) => {
@@ -156,6 +160,7 @@ impl SettingsChange {
         match self {
             SettingsChange::Sounds(on) => format!("settings: sounds = {on}"),
             SettingsChange::Notifications(on) => format!("settings: notifications = {on}"),
+            SettingsChange::Gpu(on) => format!("settings: gpu = {on}"),
             SettingsChange::Mode(mode) => format!("settings: mode = {}", mode.as_str()),
             SettingsChange::SpeechModel(model) => {
                 format!("settings: model = {}", model.as_str())
@@ -438,8 +443,13 @@ impl Tray {
         self.icon
             .set_icon(Some(icon))
             .map_err(|err| anyhow::anyhow!("Could not update the tray icon: {err}"))?;
+        let tooltip = if loading {
+            LOADING_TEXT.to_string()
+        } else {
+            tooltip_text(state, selected.runtime_mode(), mic)
+        };
         self.icon
-            .set_tooltip(Some(tooltip_text(state, selected.runtime_mode(), mic)))
+            .set_tooltip(Some(tooltip))
             .map_err(|err| anyhow::anyhow!("Could not update the tray tooltip: {err}"))?;
         if loading {
             self.status.set_text(LOADING_TEXT);
