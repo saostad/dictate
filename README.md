@@ -715,13 +715,17 @@ weights and the Moonshine v0.1.5 runtime are MIT, downloaded at runtime by
 `dictate download --moonshine` — not bundled. See
 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for exact pins and notices.
 
-### Whisper GPU on Linux
+### Whisper GPU (Linux and Windows)
 
 Linux x86_64 and aarch64 builds support Vulkan, alongside Windows Vulkan support.
-macOS is unchanged. Linux binaries require `libvulkan.so.1` even with GPU disabled:
-install `libvulkan1` on Ubuntu/Debian or `vulkan-icd-loader` on Arch, plus a Vulkan
-ICD driver for your GPU. Source builds also need Vulkan headers and `glslc`
-(Ubuntu: `libvulkan-dev glslc`; Arch: `vulkan-headers shaderc`).
+macOS is unchanged. Linux and Windows releases include the Vulkan loader beside
+the executable, so they start without a system Vulkan installation. Keep the
+bundled libraries with the binary. The pinned loader takes precedence over the
+system loader; it remains compatible with older GPU drivers. GPU acceleration
+still needs a Vulkan ICD driver for your GPU. Without one, Whisper runs on the
+CPU and reports the fallback reason. Source builds still need the Vulkan loader,
+headers, `glslc`, and libclang (Ubuntu: `libvulkan-dev glslc libclang-dev`;
+Arch: `vulkan-headers vulkan-icd-loader shaderc clang`).
 
 `dictate transcribe --whisper file.wav` prints the actual Whisper device on stderr.
 The daemon logs every load; Settings > General shows “Whisper last ran on” next
@@ -738,6 +742,6 @@ compiles shaders and takes a few seconds longer).
 
 Use `dictate config set gpu on|off` (default on), or override it for a process
 with `DICTATE_GPU=0` / `DICTATE_GPU=1`. Changes apply at the next model load.
-The Vulkan loader is a hard runtime dependency: whisper-rs-sys 0.16 statically
+The bundled Vulkan loader satisfies a hard runtime dependency: whisper-rs-sys statically
 links ggml backends; its dynamic backend mode requires shared ggml libraries
 and a different build/packaging arrangement.

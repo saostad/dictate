@@ -1,13 +1,19 @@
-// Link the Clang OS X runtime on macOS release builds.
+// Locate bundled Linux runtimes and link the macOS Clang runtime.
 //
 // Clang emits a reference to `___isPlatformVersionAtLeast` (for `@available`
 // in ONNX Runtime's Obj-C/CoreML code) that lives in `libclang_rt.osx.a`,
 // which rustc's `-nodefaultlibs` link leaves out, failing the release link
 // with `Undefined symbols for architecture arm64`. Pointing rustc at the
 // static runtime fixes it. Failures only warn (debug builds link without
-// it), and non-macOS targets are untouched.
+// it).
 fn main() {
     println!("cargo:rerun-if-changed=build.rs");
+    // Keep bundled runtime libraries beside the real executable, including when
+    // invoked through the installer's ~/.local/bin symlink. RUNPATH prefers our
+    // pinned Vulkan loader over system directories (LD_LIBRARY_PATH still wins).
+    if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("linux") {
+        println!("cargo:rustc-link-arg-bins=-Wl,-rpath,$ORIGIN");
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() != Ok("macos") {
         return;
     }

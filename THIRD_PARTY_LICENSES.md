@@ -39,6 +39,25 @@ platform integration). Dependencies for the small engines are `flate2` (MIT/Apac
 `whisper-rs-sys` (Unlicense, <https://unlicense.org>; Rust bindings to the
 MIT-licensed whisper.cpp above).
 
+## Bundled beside the binary
+
+### Vulkan loader (Linux and Windows)
+
+- Project and corresponding source: <https://github.com/KhronosGroup/Vulkan-Loader/tree/v1.4.363>
+- Version: 1.4.363 (Windows SDK/runtime 1.4.363.0)
+- License: Apache-2.0, with permissive exceptions; complete upstream license
+  texts are shipped as `LICENSE-vulkan-loader.txt`.
+- Linux builds use the unmodified Khronos source and matching Vulkan-Headers
+  v1.4.363 on Ubuntu 24.04 (x86_64 and aarch64), preserving the release's
+  glibc 2.39 floor. Source tarball SHA-256:
+  - Vulkan-Loader: `cc520304a4d8de9a6a1699553d6090aef0c25f87ef6cbc16b7c84ebd99093264`
+  - Vulkan-Headers: `cbaf687d3c59b9666fe080e7f8396b6b4f4d344a768ee6b337c59852f4526b68`
+- Windows uses `runtime/x64/vulkan-1.dll` from the pinned LunarG SDK installed
+  by CI, with an exact DLL version check before packaging.
+- The application directory loader takes precedence over system directories
+  on both platforms. A recent loader supports older ICDs; GPU drivers are
+  supplied by the user, not bundled. No ICD means a visible CPU fallback.
+
 ## Downloaded models and runtimes
 
 ### Whisper Tiny English
