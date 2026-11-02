@@ -37,6 +37,7 @@ mod vad;
 #[cfg(target_os = "linux")]
 mod wayland_shortcut;
 mod whisper;
+mod whisper_device;
 
 use std::path::Path;
 

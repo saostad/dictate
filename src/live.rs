@@ -16,7 +16,6 @@ use parakeet_rs::{ExecutionConfig, Nemotron};
 /// Audio samples per streaming chunk: 8960 = 560 ms at 16 kHz.
 pub(crate) const CHUNK_SAMPLES: usize = 8960;
 /// Audio duration of one chunk, in milliseconds.
-#[cfg(test)]
 pub(crate) const CHUNK_MS: u64 = 560;
 /// Zero chunks fed after the padded remainder to flush the final words.
 pub(crate) const FLUSH_CHUNKS: usize = 3;
@@ -29,7 +28,6 @@ pub(crate) fn is_fast_enough(median: Duration) -> bool {
 }
 
 /// Real-time factor of an average chunk time: processing time / audio time.
-#[cfg(test)]
 pub(crate) fn rtf(avg_ms: f64) -> f64 {
     avg_ms / CHUNK_MS as f64
 }

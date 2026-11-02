@@ -507,6 +507,7 @@ fn repair_autostart() {
 
 /// Load the model, bind the socket (Unix), serve commands.
 fn run_daemon_inner() -> anyhow::Result<()> {
+    crate::whisper_device::daemon_started();
     let (file_settings, settings_problem) = crate::config::load();
     if settings_problem.is_none() {
         match crate::config::migrate_selection(&file_settings) {
@@ -1094,6 +1095,14 @@ impl DaemonApp {
         // recording the worker has no model for yet.
         if self.mode_switch.is_some() && matches!(cmd, Command::Start | Command::Toggle) {
             return self.model_loading_refused();
+        }
+        if cmd == Command::Status
+            && !self.models_unloaded
+            && self.settings.model == crate::config::SpeechModel::Whisper
+            && let Some(device) = crate::whisper_device::last()
+        {
+            let (_, _, reply) = next(self.state, cmd);
+            return format!("{reply}; Whisper: {device}");
         }
         let (new_state, action, ok_reply) = next(self.state, cmd);
         let reply = self.run_action(action, new_state, ok_reply);

@@ -144,17 +144,20 @@ impl Output {
 #[allow(clippy::large_enum_variant)]
 enum Engine {
     Batch(asr::Asr, bool),
-    Live(live::Live),
+    Live(live::Live, LiveTiming),
     Moonshine(moonshine::Session<moonshine::Moonshine>),
 }
 impl Engine {
     fn load(name: &str) -> anyhow::Result<Self> {
         Ok(match name {
-            "nemotron" => Self::Live(live::Live::load(
-                &model::live_model_dir_checked()?,
-                &asr::shared_environment()?,
-                asr::intra_threads(),
-            )?),
+            "nemotron" => Self::Live(
+                live::Live::load(
+                    &model::live_model_dir_checked()?,
+                    &asr::shared_environment()?,
+                    asr::intra_threads(),
+                )?,
+                LiveTiming::default(),
+            ),
             "moonshine" => {
                 let threads = moonshine::Threads::for_setting(config::inference_threads());
                 moonshine::configure_threads(threads);
@@ -205,25 +208,20 @@ impl Engine {
                     Ok((piece.words.join(" "), None))
                 }
             }
-            Self::Live(live) => {
+            Self::Live(live, timing) => {
                 let mut text = String::new();
                 let mut first = true;
                 let chunk = live.chunk_samples();
                 for samples in segment.audio.chunks(chunk) {
                     let mut padded = samples.to_vec();
                     padded.resize(chunk, 0.0);
-                    crate::append_live_output(
-                        &mut text,
-                        &mut first,
-                        &live.transcribe_chunk(&padded)?,
-                    );
+                    let out = timing.time(|| live.transcribe_chunk(&padded))?;
+                    crate::append_live_output(&mut text, &mut first, &out);
                 }
+                let zeros = vec![0.0; chunk];
                 for _ in 0..live::FLUSH_CHUNKS {
-                    crate::append_live_output(
-                        &mut text,
-                        &mut first,
-                        &live.transcribe_chunk(&vec![0.0; chunk])?,
-                    );
+                    let out = timing.time(|| live.transcribe_chunk(&zeros))?;
+                    crate::append_live_output(&mut text, &mut first, &out);
                 }
                 live.reset();
                 Ok((text, None))
@@ -238,6 +236,31 @@ impl Engine {
                 Ok((text, None))
             }
         }
+    }
+}
+
+/// Per-chunk timing of the Live (Nemotron) engine, reported as its real-time
+/// factor once the file is done (scripts/check-real-models.py reads it).
+#[derive(Default)]
+struct LiveTiming {
+    chunks: u128,
+    total_ms: u128,
+}
+impl LiveTiming {
+    fn time<T>(&mut self, f: impl FnOnce() -> anyhow::Result<T>) -> anyhow::Result<T> {
+        let start = std::time::Instant::now();
+        let out = f()?;
+        self.total_ms += start.elapsed().as_millis();
+        self.chunks += 1;
+        Ok(out)
+    }
+    fn line(&self) -> String {
+        let avg_ms = self.total_ms / self.chunks.max(1);
+        format!(
+            "live: avg {avg_ms} ms per {} ms chunk (RTF {:.2})",
+            live::CHUNK_MS,
+            live::rtf(self.total_ms as f64 / self.chunks.max(1) as f64)
+        )
     }
 }
 
@@ -307,17 +330,33 @@ struct Run<'a> {
     expected_duration: Option<f64>,
     typed: Vec<String>,
     pending: Option<char>,
+    /// Segments come from the pause feeder (long file or --segmented).
+    segmented: bool,
+    /// Feeder segments seen so far, including ones without speech.
+    seq: usize,
 }
+/// Typed words kept for joining the next segment (the old feeder window).
+const TYPED_TAIL_WORDS: usize = 8;
 impl Run<'_> {
     fn segment(&mut self, engine: &mut Engine, segment: segment::Segment) -> anyhow::Result<()> {
         if segment.audio.is_empty() {
             return Ok(());
         }
         let joined_batch = self.format == "txt" && matches!(engine, Engine::Batch(_, _));
+        self.seq += 1;
+        let started = std::time::Instant::now();
+        let mut decode = match engine {
+            Engine::Batch(..) if self.format != "txt" => "word-timestamp decode",
+            Engine::Batch(..) => "context decode",
+            Engine::Live(..) | Engine::Moonshine(..) => "streaming decode",
+        };
         let (text, words) = if self.format == "txt" {
             if let Engine::Batch(asr, _) = engine {
                 let piece =
                     asr.transcribe_segment_pieces(&segment.context, &segment.audio, segment.start)?;
+                if piece.disjoint {
+                    decode = "disjoint decode";
+                }
                 let (text, pending) = asr::join_piece(
                     &self.typed,
                     self.pending,
@@ -327,6 +366,9 @@ impl Run<'_> {
                 );
                 self.pending = pending;
                 asr::append_typed_words(&mut self.typed, &text);
+                // join_piece only needs the last few typed words; keep memory flat.
+                let excess = self.typed.len().saturating_sub(TYPED_TAIL_WORDS);
+                self.typed.drain(..excess);
                 (text, None)
             } else {
                 engine.decode(&segment, false)?
@@ -336,6 +378,17 @@ impl Run<'_> {
         };
         if asr::is_empty_transcript(&text) {
             return Ok(());
+        }
+        if self.segmented {
+            // Same per-segment diagnostics as the daemon's Pauses path.
+            eprintln!(
+                "segment {}: {:.1} s audio (context {:.1} s, {}, {decode}), transcribed in {} ms",
+                self.seq,
+                segment.audio.len() as f32 / audio::TARGET_SAMPLE_RATE as f32,
+                segment.context.len() as f32 / audio::TARGET_SAMPLE_RATE as f32,
+                segment.start.label(),
+                started.elapsed().as_millis()
+            );
         }
         let text = if joined_batch {
             text.as_str()
@@ -415,6 +468,8 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
         expected_duration: None,
         typed: Vec::new(),
         pending: None,
+        segmented: false,
+        seq: 0,
     };
     let mut source = media::Audio::open(options.path)?;
     run.expected_duration = source.duration;
@@ -460,6 +515,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
                 audio::TARGET_SAMPLE_RATE,
                 vad::Vad::load_default()?,
             )?);
+            run.segmented = true;
         }
         if let Some(feeder) = &mut feeder {
             for piece in feeder.push(&buffer)? {
@@ -485,6 +541,9 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
         if done {
             break;
         }
+    }
+    if let Engine::Live(_, timing) = &engine {
+        eprintln!("{}", timing.line());
     }
     if let Some(punct) = run.pending
         && options.format == "txt"
@@ -537,6 +596,20 @@ mod tests {
             );
         }
         assert!(Options::parse(&["-".into()]).is_ok());
+    }
+    #[test]
+    fn live_timing_line_matches_the_check_script() {
+        let mut timing = LiveTiming {
+            chunks: 4,
+            total_ms: 1120,
+        };
+        assert_eq!(
+            timing.line(),
+            "live: avg 280 ms per 560 ms chunk (RTF 0.50)"
+        );
+        timing.time(|| Ok(())).unwrap();
+        assert_eq!(timing.chunks, 5);
+        assert!(LiveTiming::default().line().starts_with("live: avg 0 ms"));
     }
     #[test]
     fn standard_subtitle_times_and_escaping() {

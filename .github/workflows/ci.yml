@@ -59,22 +59,33 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-24.04, ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config libvulkan-dev glslc libclang-dev
+      - name: Install the Vulkan SDK (Windows)
+        # whisper-rs's vulkan feature needs VULKAN_SDK (headers, glslc,
+        # vulkan-1.lib) at build time; the runtime DLL lets smoke tests start.
+        if: runner.os == 'Windows'
+        uses: jakoch/install-vulkan-sdk-action@v1.7.0
+        with:
+          vulkan_version: 1.4.363.0
+          install_runtime: true
+          cache: true
+          stripdown: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
-      - name: Use whisper-rs-sys's bundled bindings (non-Windows)
-        # The checked-in bindings were generated on 64-bit Linux and do not
-        # match the Windows MSVC ABI (c_long is 4 bytes there), so Windows
-        # generates its own bindings with bindgen and the runner's libclang.
-        if: runner.os != 'Windows'
+      - name: Use whisper-rs-sys's bundled bindings (macOS)
+        # The checked-in bindings were generated on 64-bit Linux without
+        # Vulkan. Windows (MSVC ABI: c_long is 4 bytes) and Linux (the Vulkan
+        # build needs the ggml-vulkan declarations) generate their own with
+        # bindgen and libclang; only macOS uses the bundled file.
+        if: runner.os == 'macOS'
         shell: bash
         run: echo "WHISPER_DONT_GENERATE_BINDINGS=1" >> "$GITHUB_ENV"
       - name: Check formatting
@@ -121,7 +132,17 @@ jobs:
         run: sh scripts/set-version.sh "${{ needs.version.outputs.version }}"
       - name: Install Linux dependencies
         if: runner.os == 'Linux'
-        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-dev pkg-config libvulkan-dev glslc libclang-dev
+      - name: Install the Vulkan SDK (Windows)
+        # whisper-rs's vulkan feature needs VULKAN_SDK (headers, glslc,
+        # vulkan-1.lib) at build time; the runtime DLL lets smoke tests start.
+        if: runner.os == 'Windows'
+        uses: jakoch/install-vulkan-sdk-action@v1.7.0
+        with:
+          vulkan_version: 1.4.363.0
+          install_runtime: true
+          cache: true
+          stripdown: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -165,11 +186,12 @@ jobs:
           fi
           mkdir -p /tmp/ort
           tar -xzf /tmp/ort.tgz -C /tmp/ort
-      - name: Use whisper-rs-sys's bundled bindings (non-Windows)
-        # The checked-in bindings were generated on 64-bit Linux and do not
-        # match the Windows MSVC ABI (c_long is 4 bytes there), so Windows
-        # generates its own bindings with bindgen and the runner's libclang.
-        if: runner.os != 'Windows'
+      - name: Use whisper-rs-sys's bundled bindings (macOS)
+        # The checked-in bindings were generated on 64-bit Linux without
+        # Vulkan. Windows (MSVC ABI: c_long is 4 bytes) and Linux (the Vulkan
+        # build needs the ggml-vulkan declarations) generate their own with
+        # bindgen and libclang; only macOS uses the bundled file.
+        if: runner.os == 'macOS'
         shell: bash
         run: echo "WHISPER_DONT_GENERATE_BINDINGS=1" >> "$GITHUB_ENV"
       - name: Build

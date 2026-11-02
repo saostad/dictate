@@ -1144,8 +1144,11 @@ fn general_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAct
     }
     explain(
         ui,
-        "Run Whisper on the graphics card when available. Restart Dictate to apply.",
+        "Run Whisper on the graphics card when available. Applies the next time Whisper loads.",
     );
+    if let Some(device) = crate::whisper_device::last() {
+        ui.label(format!("Whisper last ran on: {device}"));
+    }
 }
 
 fn about_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {

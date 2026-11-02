@@ -968,6 +968,9 @@ fn benchmark_asr(
         memory_after_load,
         model_load_ms,
     );
+    if options.engine == Engine::Whisper {
+        document["device"] = json!(crate::whisper_device::last().map(|device| device.json()));
+    }
     let mut errors = Vec::new();
 
     // One warmed decode, with the first decode timed separately from load.

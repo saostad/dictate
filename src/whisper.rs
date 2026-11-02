@@ -24,6 +24,7 @@ use whisper_rs::whisper_rs_sys::{
 };
 use whisper_rs::{
     FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperSegment,
+    WhisperState,
 };
 
 /// One token with whisper.cpp's token-level timing (seconds). Only used
@@ -249,6 +250,9 @@ unsafe extern "C" fn log_warnings_and_errors(
     text: *const c_char,
     _user_data: *mut c_void,
 ) {
+    if !text.is_null() {
+        crate::whisper_device::log_line(&unsafe { CStr::from_ptr(text) }.to_string_lossy());
+    }
     if should_log_ggml(level) && !text.is_null() {
         let bytes = unsafe { CStr::from_ptr(text) }.to_bytes();
         let _ = std::io::stderr().write_all(bytes);
@@ -271,6 +275,8 @@ fn quiet_whisper_logs() {
 pub struct Whisper {
     context: WhisperContext,
     threads: usize,
+    initial_state: Option<WhisperState>,
+    gpu_requested: bool,
 }
 
 /// Encoder positions needed for a standalone clip, with one second of margin.
@@ -321,8 +327,12 @@ impl Whisper {
     pub fn load(path: &Path, threads: usize) -> anyhow::Result<Self> {
         quiet_whisper_logs();
         let mut params = WhisperContextParameters::default();
-        // Uses the GPU when a GPU backend is compiled in (Vulkan on Windows); whisper.cpp falls back to the CPU when no device is found.
-        params.use_gpu(crate::config::gpu_on());
+        crate::whisper_device::begin();
+        let gpu_requested = crate::config::gpu_on();
+        params.use_gpu(gpu_requested);
+        if gpu_requested {
+            params.gpu_device(crate::whisper_device::preferred_gpu_device());
+        }
         params.flash_attn(false);
         let context = WhisperContext::new_with_params(path, params).with_context(|| {
             format!(
@@ -330,8 +340,17 @@ impl Whisper {
                 path.display()
             )
         })?;
+        let initial_state = context
+            .create_state()
+            .context("Could not initialize a Whisper decoder state")?;
+        crate::whisper_device::finish(gpu_requested, true);
         eprintln!("whisper: using {threads} threads");
-        Ok(Self { context, threads })
+        Ok(Self {
+            context,
+            threads,
+            initial_state: Some(initial_state),
+            gpu_requested,
+        })
     }
 
     pub fn transcribe(&mut self, samples: &[f32]) -> anyhow::Result<String> {
@@ -435,15 +454,22 @@ impl Whisper {
     }
 
     fn decode(
-        &self,
+        &mut self,
         samples: &[f32],
         token_timestamps: bool,
         audio_ctx: i32,
     ) -> anyhow::Result<Vec<DecodedSegment>> {
-        let mut state = self
-            .context
-            .create_state()
-            .context("Could not create a Whisper decoder state")?;
+        let mut state = if let Some(state) = self.initial_state.take() {
+            state
+        } else {
+            crate::whisper_device::begin();
+            let state = self
+                .context
+                .create_state()
+                .context("Could not create a Whisper decoder state")?;
+            crate::whisper_device::finish(self.gpu_requested, false);
+            state
+        };
         let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
         params.set_n_threads(self.threads as i32);
         params.set_audio_ctx(audio_ctx);

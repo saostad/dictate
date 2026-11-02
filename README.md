@@ -136,10 +136,12 @@ Whisper has a separate CPU baseline; see
 The build compiles whisper.cpp through `whisper-rs`, so it needs **CMake** and
 a C++ compiler (C++17) in addition to the Rust toolchain. By default
 `whisper-rs-sys` generates its bindings with bindgen, which needs libclang
-(install clang, or LLVM on Windows). On 64-bit Linux and macOS you can skip
-libclang by exporting `WHISPER_DONT_GENERATE_BINDINGS=1` to use the crate's
-checked-in bindings; do not do this on Windows, where those bindings do not
-match the MSVC ABI. `.cargo/config.toml` builds ggml for the x86_64 baseline (AVX/AVX2/FMA/F16C off, no
+(install clang, or LLVM on Windows). On macOS you can skip libclang by
+exporting `WHISPER_DONT_GENERATE_BINDINGS=1` to use the crate's checked-in
+bindings. Do not do this on Linux, where the Vulkan build needs declarations
+those bindings lack, or on Windows, where they do not match the MSVC ABI. If you
+switch a Linux checkout away from that variable, run
+`cargo clean -p whisper-rs-sys` once so the bindings are regenerated. `.cargo/config.toml` builds ggml for the x86_64 baseline (AVX/AVX2/FMA/F16C off, no
 `-march=native`); override the `GGML_*`/`WHISPER_*` variables in your shell
 when targeting a different CPU class.
 
@@ -164,7 +166,7 @@ Linux builds also need ALSA and libxkbcommon development packages plus
 `pkg-config`. On Ubuntu, install the build dependencies with:
 
 ```sh
-sudo apt-get install build-essential cmake pkg-config libasound2-dev libxkbcommon-dev
+sudo apt-get install build-essential cmake pkg-config libasound2-dev libxkbcommon-dev libvulkan-dev glslc libclang-dev
 ```
 
 ## Usage
@@ -712,3 +714,30 @@ downloaded/built at runtime or build time — the model is not bundled. Moonshin
 weights and the Moonshine v0.1.5 runtime are MIT, downloaded at runtime by
 `dictate download --moonshine` — not bundled. See
 [THIRD_PARTY_LICENSES.md](THIRD_PARTY_LICENSES.md) for exact pins and notices.
+
+### Whisper GPU on Linux
+
+Linux x86_64 and aarch64 builds support Vulkan, alongside Windows Vulkan support.
+macOS is unchanged. Linux binaries require `libvulkan.so.1` even with GPU disabled:
+install `libvulkan1` on Ubuntu/Debian or `vulkan-icd-loader` on Arch, plus a Vulkan
+ICD driver for your GPU. Source builds also need Vulkan headers and `glslc`
+(Ubuntu: `libvulkan-dev glslc`; Arch: `vulkan-headers shaderc`).
+
+`dictate transcribe --whisper file.wav` prints the actual Whisper device on stderr.
+The daemon logs every load; Settings > General shows “Whisper last ran on” next
+to Use GPU, and `dictate status` includes the device while Whisper is loaded.
+Benchmark JSON includes `device`. If GPU initialization falls back to CPU, a
+warning explains why; the daemon also sends one notification per run.
+
+With several GPUs, Whisper uses the first discrete GPU (for example the NVIDIA
+card in a hybrid laptop), else the integrated one. To choose a device yourself,
+set ggml's `GGML_VK_VISIBLE_DEVICES` to its Vulkan index (e.g. `0`). On a
+laptop with an Intel HD 530 and a GTX 960M, an 11 s clip took 1.8 s on the CPU,
+0.8 s on the Intel GPU and 0.43 s on the NVIDIA GPU (the first GPU run also
+compiles shaders and takes a few seconds longer).
+
+Use `dictate config set gpu on|off` (default on), or override it for a process
+with `DICTATE_GPU=0` / `DICTATE_GPU=1`. Changes apply at the next model load.
+The Vulkan loader is a hard runtime dependency: whisper-rs-sys 0.16 statically
+links ggml backends; its dynamic backend mode requires shared ggml libraries
+and a different build/packaging arrangement.

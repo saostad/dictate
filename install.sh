@@ -61,6 +61,15 @@ actual="$(sha256 "$tmp/$asset.tar.gz")"
 tar -xzf "$tmp/$asset.tar.gz" -C "$tmp"
 [ -x "$tmp/$asset/dictate" ] || fail "archive has no dictate binary"
 
+# Check the actual binary with the system loader before replacing an install.
+if [ "$os" = "Linux" ]; then
+    command -v ldd >/dev/null 2>&1 || fail "ldd is required to check the Vulkan runtime"
+    linked="$(ldd "$tmp/$asset/dictate")" || fail "could not inspect binary runtime dependencies"
+    if echo "$linked" | grep -q 'libvulkan.so.1 => not found'; then
+        fail "libvulkan.so.1 is required: install libvulkan1 (Ubuntu/Debian) or vulkan-icd-loader (Arch), plus your GPU's Vulkan driver"
+    fi
+fi
+
 # Clear any quarantine flag (e.g. inherited from a quarantined parent process).
 if [ "$os" = "Darwin" ]; then
     xattr -dr com.apple.quarantine "$tmp/$asset" 2>/dev/null || true
