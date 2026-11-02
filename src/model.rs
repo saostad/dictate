@@ -450,7 +450,7 @@ pub fn download_fluid() -> anyhow::Result<()> {
     download()?;
     download_fluid_files_with_progress(|_, _| {})?;
     let dir = fluid_model_dir()?;
-    println!("Fluid Speech Mini ready in {}", dir.display());
+    eprintln!("Fluid Speech Mini ready in {}", dir.display());
     Ok(())
 }
 
@@ -459,7 +459,7 @@ pub fn download_fluid() -> anyhow::Result<()> {
 pub fn download_whisper() -> anyhow::Result<()> {
     download_whisper_files_with_progress(|_, _| {})?;
     let dir = whisper_model_dir()?;
-    println!("Whisper Tiny English ready in {}", dir.display());
+    eprintln!("Whisper Tiny English ready in {}", dir.display());
     Ok(())
 }
 
@@ -475,7 +475,7 @@ pub fn download_moonshine() -> anyhow::Result<()> {
     download_moonshine_files_with_progress(|_, _| {})?;
     let dir = moonshine_model_dir()?;
     let runtime = moonshine_runtime_dir()?;
-    println!(
+    eprintln!(
         "Moonshine Tiny Streaming ready in {} (runtime in {})",
         dir.display(),
         runtime.display()
@@ -539,7 +539,7 @@ where
     let dest = dir.join(WHISPER_FILE_NAME);
     let total = WHISPER_FILE_SIZE;
     if file_matches(&dest, WHISPER_FILE_SIZE, Some(WHISPER_FILE_SHA256))? {
-        println!("{WHISPER_FILE_NAME}: already present");
+        eprintln!("{WHISPER_FILE_NAME}: already present");
         download_vad()?;
         progress(total, total);
         return Ok(());
@@ -598,7 +598,7 @@ where
     let mut completed: u64 = 0;
 
     if runtime_present {
-        println!("{MOONSHINE_RUNTIME_FILE}: already present");
+        eprintln!("{MOONSHINE_RUNTIME_FILE}: already present");
         completed += asset.size;
         progress(completed, total);
     } else {
@@ -629,7 +629,7 @@ where
     for (name, size, sha256) in MOONSHINE_FILES {
         let dest = model_dir.join(name);
         if file_matches(&dest, *size, Some(sha256))? {
-            println!("{name}: already present");
+            eprintln!("{name}: already present");
             completed += size;
             progress(completed, total);
             continue;
@@ -779,7 +779,7 @@ fn download_inner(with_live: bool) -> anyhow::Result<()> {
                 .len()
                 > 0;
         if present {
-            println!("{name}: already present");
+            eprintln!("{name}: already present");
             continue;
         }
         let url = format!("{HF_BASE_URL}/{HF_REVISION}/{name}");
@@ -790,7 +790,7 @@ fn download_inner(with_live: bool) -> anyhow::Result<()> {
     if with_live {
         download_live_files()?;
     }
-    println!("Model ready in {}", dir.display());
+    eprintln!("Model ready in {}", dir.display());
     Ok(())
 }
 
@@ -845,7 +845,7 @@ where
         let dest = dir.join(name);
         let present_len = dest.metadata().map(|metadata| metadata.len()).unwrap_or(0);
         if dest.is_file() && present_len == *size {
-            println!("{name}: already present");
+            eprintln!("{name}: already present");
             completed += size;
             continue;
         }
@@ -879,7 +879,7 @@ pub(crate) fn download_vad() -> anyhow::Result<()> {
     }
     let present_len = dest.metadata().map(|metadata| metadata.len()).unwrap_or(0);
     if dest.is_file() && present_len == VAD_FILE_SIZE {
-        println!("{VAD_FILE_NAME}: already present");
+        eprintln!("{VAD_FILE_NAME}: already present");
         return Ok(());
     }
     if dest.is_file() {

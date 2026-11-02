@@ -16,12 +16,6 @@ pub fn load_wav_16k_mono(path: &Path) -> anyhow::Result<Vec<f32>> {
     load_inner(path).with_context(|| format!("Could not read WAV {}", path.display()))
 }
 
-/// Load a WAV file as mono f32 samples in [-1, 1] at the file's own sample
-/// rate, for callers (like the streaming feeder) that resample themselves.
-pub(crate) fn load_wav_mono(path: &Path) -> anyhow::Result<(Vec<f32>, u32)> {
-    load_native(path).with_context(|| format!("Could not read WAV {}", path.display()))
-}
-
 fn load_inner(path: &Path) -> anyhow::Result<Vec<f32>> {
     let (mono, sample_rate) = load_native(path)?;
     if sample_rate == TARGET_SAMPLE_RATE || mono.is_empty() {

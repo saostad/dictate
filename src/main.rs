@@ -12,12 +12,15 @@ mod asr;
 mod audio;
 mod autostart;
 mod benchmark;
+mod cli;
 mod config;
+mod config_cli;
 mod cue;
 mod daemon;
 mod fluid;
 mod hotkey;
 mod live;
+mod media;
 mod mic;
 mod model;
 #[cfg(target_os = "macos")]
@@ -27,6 +30,7 @@ mod notify;
 mod segment;
 mod selection;
 mod settings_ui;
+mod transcription;
 mod tray;
 mod typer;
 mod vad;
@@ -40,6 +44,10 @@ use anyhow::Context;
 
 fn main() -> anyhow::Result<()> {
     if let Err(err) = run() {
+        if err.is::<cli::UsageError>() {
+            eprintln!("{err}");
+            std::process::exit(2);
+        }
         eprintln!("error: {err:#}");
         std::process::exit(1);
     }
@@ -47,146 +55,82 @@ fn main() -> anyhow::Result<()> {
 }
 
 fn run() -> anyhow::Result<()> {
-    let mut args = std::env::args().skip(1);
-    let Some(command) = args.next() else {
-        // Opened as Dictate.app (Finder, Spotlight, login item): run the daemon.
-        if launched_as_macos_app() {
-            return run_daemon(false);
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let (command, rest) = match cli::parse(&args)? {
+        cli::Action::NoArgs => {
+            // Opened as Dictate.app (Finder, Spotlight, login item): run the daemon.
+            if launched_as_macos_app() {
+                return run_daemon(false);
+            }
+            return Err(cli::UsageError(usage().to_owned()).into());
         }
-        eprintln!("{}", usage());
-        std::process::exit(2);
+        cli::Action::Help(help) => {
+            println!("{help}");
+            if args.first().is_some_and(|arg| arg == "config") {
+                config_cli::print_values();
+            }
+            return Ok(());
+        }
+        cli::Action::Version => {
+            println!("dictate {}", env!("CARGO_PKG_VERSION"));
+            if args.first().is_some_and(|arg| arg == "version") {
+                println!("{}", settings_ui::page::RELEASES_URL);
+            }
+            return Ok(());
+        }
+        cli::Action::Run(command, rest) => (command, rest),
     };
-    match command.as_str() {
-        "download" => {
-            let (mut live, mut fluid, mut whisper, mut moonshine) = (false, false, false, false);
-            loop {
-                match args.next().as_deref() {
-                    None => break,
-                    Some("--live") => live = true,
-                    Some("--fluid") => fluid = true,
-                    Some("--whisper") => whisper = true,
-                    Some("--moonshine") => moonshine = true,
-                    Some(_) => {
-                        eprintln!(
-                            "Usage: dictate download [--live | --fluid | --whisper | --moonshine]"
-                        );
-                        std::process::exit(2);
-                    }
-                }
-            }
-            let selected = [live, fluid, whisper, moonshine]
-                .into_iter()
-                .filter(|selected| *selected)
-                .count();
-            if selected > 1 {
-                eprintln!("Usage: dictate download [--live | --fluid | --whisper | --moonshine]");
-                std::process::exit(2);
-            }
-            if live {
-                model::download_live()
-            } else if fluid {
-                model::download_fluid()
-            } else if whisper {
-                model::download_whisper()
-            } else if moonshine {
-                model::download_moonshine()
-            } else {
-                model::download()
-            }
-        }
+    // The pure CLI parser has validated command names, flags and arity.
+    match command {
+        "download" => match rest.first().map(String::as_str) {
+            Some("--live") => model::download_live(),
+            Some("--fluid") => model::download_fluid(),
+            Some("--whisper") => model::download_whisper(),
+            Some("--moonshine") => model::download_moonshine(),
+            _ => model::download(),
+        },
         "listen" => listen(),
         "mics" => mics(),
-        "autostart" => {
-            let Some(action) = args.next() else {
-                eprintln!("Usage: dictate autostart on|off|status");
-                std::process::exit(2);
-            };
-            if args.next().is_some() {
-                eprintln!("Usage: dictate autostart on|off|status");
-                std::process::exit(2);
+        "config" => config_cli::run(rest),
+        "log" => {
+            let path = daemon::daemon_log_path()?;
+            println!("{}", path.display());
+            if !rest.is_empty() {
+                tray::open_target(&path.to_string_lossy())?;
             }
-            autostart_cmd(&action)
-        }
-        "daemon" => {
-            let background = match args.next().as_deref() {
-                None => false,
-                Some("--background") => true,
-                Some(_) => {
-                    eprintln!("Usage: dictate daemon [--background]");
-                    std::process::exit(2);
-                }
-            };
-            if args.next().is_some() {
-                eprintln!("Usage: dictate daemon [--background]");
-                std::process::exit(2);
-            }
-            run_daemon(background)
-        }
-        "toggle" | "start" | "stop" | "cancel" | "status" | "settings" => run_client(&command),
-        #[cfg(target_os = "linux")]
-        "shortcut" => {
-            let display = args
-                .next()
-                .context("Usage: dictate shortcut <Ctrl+Shift+Space|other shortcut>")?;
-            anyhow::ensure!(args.next().is_none(), "Usage: dictate shortcut <shortcut>");
-            hotkey::resolve_file_hotkey(&display, false).map_err(anyhow::Error::msg)?;
-            run_client(&format!("shortcut {display}"))
-        }
-        "benchmark" => benchmark::run(args),
-        "transcribe" => {
-            let Some(first) = args.next() else {
-                eprintln!(
-                    "Usage: dictate transcribe [--live | --fluid | --whisper | --moonshine] <file.wav>"
-                );
-                std::process::exit(2);
-            };
-            match first.as_str() {
-                "--segmented" => {
-                    let Some(file) = args.next() else {
-                        eprintln!("Usage: dictate transcribe [--segmented] <file.wav>");
-                        std::process::exit(2);
-                    };
-                    transcribe_segmented(Path::new(&file))
-                }
-                "--live" => {
-                    let Some(file) = args.next() else {
-                        eprintln!("Usage: dictate transcribe [--live] <file.wav>");
-                        std::process::exit(2);
-                    };
-                    transcribe_live(Path::new(&file))
-                }
-                "--fluid" => {
-                    let Some(file) = args.next() else {
-                        eprintln!("Usage: dictate transcribe [--fluid] <file.wav>");
-                        std::process::exit(2);
-                    };
-                    transcribe(Path::new(&file), Some(config::SpeechModel::Fluid))
-                }
-                "--whisper" => {
-                    let Some(file) = args.next() else {
-                        eprintln!("Usage: dictate transcribe [--whisper] <file.wav>");
-                        std::process::exit(2);
-                    };
-                    transcribe(Path::new(&file), Some(config::SpeechModel::Whisper))
-                }
-                "--moonshine" => {
-                    let Some(file) = args.next() else {
-                        eprintln!("Usage: dictate transcribe [--moonshine] <file.wav>");
-                        std::process::exit(2);
-                    };
-                    transcribe_moonshine(Path::new(&file))
-                }
-                _ => transcribe(Path::new(&first), None),
-            }
-        }
-        "help" | "--help" => {
-            println!("{}", usage());
             Ok(())
         }
-        unknown => {
-            eprintln!("Unknown command \"{unknown}\". Run \"dictate help\" for usage.");
-            std::process::exit(2);
+        "autostart" => autostart_cmd(&rest[0]),
+        "daemon" => run_daemon(!rest.is_empty()),
+        "toggle" | "start" | "stop" | "cancel" | "status" | "settings" => run_client(command),
+        #[cfg(target_os = "linux")]
+        "shortcut" => {
+            if rest.is_empty() {
+                config_cli::run(&["get".into(), "shortcut".into()])?;
+                if hotkey::hyprland_session() {
+                    for bind in daemon::query_hyprland_binds()? {
+                        println!("{bind}");
+                    }
+                }
+                return Ok(());
+            }
+            if rest[0] == "--configure" {
+                let reply =
+                    daemon::socket::set_if_running("configure-shortcut")?.ok_or_else(|| {
+                        anyhow::anyhow!("Start the daemon first to configure desktop shortcuts")
+                    })?;
+                println!("{reply}");
+                return Ok(());
+            }
+            let display = &rest[0];
+            hotkey::resolve_file_hotkey(display, false).map_err(|err| {
+                cli::UsageError(format!("{err}\n{}", cli::command_usage(command).unwrap()))
+            })?;
+            run_client(&format!("shortcut {display}"))
         }
+        "benchmark" => benchmark::run(rest.iter().cloned()),
+        "transcribe" => transcription::run(rest),
+        _ => unreachable!("validated command"),
     }
 }
 
@@ -196,222 +140,6 @@ fn init_config() {
     if let Some(problem) = problem {
         eprintln!("error: {problem} Using defaults.");
     }
-}
-
-fn transcribe(path: &Path, model: Option<config::SpeechModel>) -> anyhow::Result<()> {
-    init_config();
-    let samples = audio::load_wav_16k_mono(path)?;
-    let start = std::time::Instant::now();
-    let mut asr = match model {
-        Some(config::SpeechModel::Fluid) => {
-            asr::Asr::load_fluid(&model::fluid_model_dir_checked()?)?
-        }
-        Some(config::SpeechModel::Standard) => asr::Asr::load(&model::model_dir_checked()?)?,
-        Some(config::SpeechModel::Whisper) => {
-            asr::Asr::load_whisper(&model::whisper_model_dir_checked()?)?
-        }
-        None => asr::Asr::load_configured()?,
-    };
-    eprintln!("model loaded in {} ms", start.elapsed().as_millis());
-    let seconds = samples.len() as f32 / 16_000.0;
-    let start = std::time::Instant::now();
-    let text = asr.transcribe(&samples)?;
-    eprintln!(
-        "transcribed {seconds:.1} s of audio in {} ms",
-        start.elapsed().as_millis()
-    );
-    if asr::is_empty_transcript(&text) {
-        eprintln!("{}", asr::no_speech_message(seconds));
-        return Ok(());
-    }
-    println!("{text}");
-    Ok(())
-}
-
-/// Test hook: transcribe a file through the same feeder path the streaming
-/// daemon uses (100 ms pushes at the file's rate, per-segment transcribe,
-/// same join rule). Prints the joined text to stdout and per-segment timings
-/// to stderr.
-fn transcribe_segmented(path: &Path) -> anyhow::Result<()> {
-    init_config();
-    let (mono, rate) = audio::load_wav_mono(path)?;
-    let vad = vad::Vad::load_default()?;
-    let start = std::time::Instant::now();
-    let mut asr = asr::Asr::load_configured()?;
-    eprintln!("model loaded in {} ms", start.elapsed().as_millis());
-    let mut feeder = segment::Feeder::new(rate, vad)?;
-    let mut run = SegmentRun::default();
-    let chunk = (rate as usize / 10).max(1);
-    for piece in mono.chunks(chunk) {
-        let segments = feeder.push(piece)?;
-        transcribe_segments(&mut asr, &segments, &mut run)?;
-    }
-    let segments = feeder.finish()?;
-    transcribe_segments(&mut asr, &segments, &mut run)?;
-    if run.joined.is_empty() {
-        let seconds = mono.len() as f32 / rate.max(1) as f32;
-        eprintln!("{}", asr::no_speech_message(seconds));
-        return Ok(());
-    }
-    if let Some(punct) = run.pending {
-        run.joined.push(punct);
-    }
-    println!("{}", run.joined);
-    Ok(())
-}
-
-/// Joined-text state for one `--segmented` run.
-#[derive(Default)]
-struct SegmentRun {
-    seq: usize,
-    joined: String,
-    typed_words: Vec<String>,
-    pending: Option<char>,
-}
-
-/// Transcribe feeder segments like the daemon worker: decode with left
-/// context, skip empties silently, join with the same rule, log per-segment
-/// timings to stderr.
-fn transcribe_segments(
-    asr: &mut asr::Asr,
-    segments: &[segment::Segment],
-    run: &mut SegmentRun,
-) -> anyhow::Result<()> {
-    for segment in segments {
-        run.seq += 1;
-        let seconds = segment.audio.len() as f32 / 16_000.0;
-        let context_s = segment.context.len() as f32 / 16_000.0;
-        let start = std::time::Instant::now();
-        let piece =
-            asr.transcribe_segment_pieces(&segment.context, &segment.audio, segment.start)?;
-        let ms = start.elapsed().as_millis();
-        if piece.words.is_empty() {
-            continue;
-        }
-        let decode = if piece.disjoint {
-            "disjoint decode"
-        } else {
-            "context decode"
-        };
-        eprintln!(
-            "segment {}: {seconds:.1} s audio (context {context_s:.1} s, {}, {decode}), transcribed in {ms} ms",
-            run.seq,
-            segment.start.label()
-        );
-        let tail_start = run.typed_words.len().saturating_sub(8);
-        let (to_type, new_pending) = asr::join_piece(
-            &run.typed_words[tail_start..],
-            run.pending,
-            piece.boundary,
-            &piece.words,
-            asr::JoinMode::from_disjoint(piece.disjoint),
-        );
-        run.pending = new_pending;
-        if to_type.is_empty() {
-            continue;
-        }
-        run.joined.push_str(&to_type);
-        asr::append_typed_words(&mut run.typed_words, &to_type);
-    }
-    Ok(())
-}
-
-/// Transcribe a file with the Live streaming model: the same chunk loop the
-/// daemon runs (8960-sample chunks, padded remainder, 3 zero chunks to flush).
-/// Prints the text to stdout and the average chunk time to stderr.
-fn transcribe_live(path: &Path) -> anyhow::Result<()> {
-    init_config();
-    let dir = model::live_model_dir_checked()?;
-    let samples = audio::load_wav_16k_mono(path)?;
-    let env = asr::shared_environment()?;
-    let threads = asr::intra_threads();
-    let start = std::time::Instant::now();
-    let mut live = live::Live::load(&dir, &env, threads)?;
-    eprintln!("model loaded in {} ms", start.elapsed().as_millis());
-    let chunk = live.chunk_samples().max(1);
-    let mut text = String::new();
-    let mut first = true;
-    let mut chunks: usize = 0;
-    let mut total_ms: u128 = 0;
-    for piece in samples.chunks(chunk) {
-        let mut full = piece.to_vec();
-        full.resize(chunk, 0.0);
-        let start = std::time::Instant::now();
-        let out = live.transcribe_chunk(&full)?;
-        total_ms += start.elapsed().as_millis();
-        chunks += 1;
-        append_live_output(&mut text, &mut first, &out);
-    }
-    let zeros = vec![0.0; chunk];
-    for _ in 0..live::FLUSH_CHUNKS {
-        let start = std::time::Instant::now();
-        let out = live.transcribe_chunk(&zeros)?;
-        total_ms += start.elapsed().as_millis();
-        chunks += 1;
-        append_live_output(&mut text, &mut first, &out);
-    }
-    live.reset();
-    let avg_ms = total_ms as f64 / chunks.max(1) as f64;
-    eprintln!(
-        "live: avg {} ms per 560 ms chunk (RTF {:.2})",
-        total_ms / chunks.max(1) as u128,
-        live::rtf(avg_ms)
-    );
-    if asr::is_empty_transcript(&text) {
-        let seconds = samples.len() as f32 / 16_000.0;
-        eprintln!("{}", asr::no_speech_message(seconds));
-        return Ok(());
-    }
-    println!("{text}");
-    Ok(())
-}
-
-/// Test hook: stream a WAV through Moonshine in 100 ms chunks, exactly as the
-/// daemon feeder does, and finish the stream the way stop does. Prints only
-/// committed final text; provisional tails go to stderr for inspection.
-fn transcribe_moonshine(path: &Path) -> anyhow::Result<()> {
-    init_config();
-    let threads = moonshine::Threads::for_setting(config::inference_threads());
-    moonshine::configure_threads(threads);
-    let dir = model::moonshine_model_dir_checked()?;
-    model::check_moonshine_runtime()?;
-    let samples = audio::load_wav_16k_mono(path)?;
-    let load_start = std::time::Instant::now();
-    let model = moonshine::Moonshine::load(&dir, threads)?;
-    eprintln!("model loaded in {} ms", load_start.elapsed().as_millis());
-    // Same session lifecycle as the daemon worker: the first chunk opens the
-    // native stream, finish drains the last phrase, cancel discards it.
-    let mut session = moonshine::Session::new(model);
-    let mut text = String::new();
-    let mut total_ms: u128 = 0;
-    let mut calls: usize = 0;
-    for piece in samples.chunks(1_600) {
-        let start = std::time::Instant::now();
-        let update = session.feed(piece)?;
-        total_ms += start.elapsed().as_millis();
-        calls += 1;
-        text.push_str(&update.completed);
-        if let Some(partial) = update.partial {
-            eprintln!("partial: {partial}");
-        }
-    }
-    let start = std::time::Instant::now();
-    let update = session.finish()?;
-    total_ms += start.elapsed().as_millis();
-    text.push_str(&update.completed);
-    let audio_ms = samples.len() as f64 / 16.0;
-    let avg_ms = total_ms as f64 / calls.max(1) as f64;
-    eprintln!(
-        "moonshine: {calls} chunks, avg {avg_ms:.0} ms per 100 ms chunk (RTF {:.2} inference, excluding load)",
-        total_ms as f64 / audio_ms.max(1.0)
-    );
-    if asr::is_empty_transcript(&text) {
-        let seconds = samples.len() as f32 / 16_000.0;
-        eprintln!("{}", asr::no_speech_message(seconds));
-        return Ok(());
-    }
-    println!("{text}");
-    Ok(())
 }
 
 /// Append one Live chunk output: empty outputs are skipped, the first
@@ -488,7 +216,7 @@ fn mics() -> anyhow::Result<()> {
         println!("{line}");
         println!("    {}", mic.id);
     }
-    println!("Choose one in the Settings window.");
+    eprintln!("Choose one in the Settings window.");
     Ok(())
 }
 
@@ -498,10 +226,7 @@ fn autostart_cmd(action: &str) -> anyhow::Result<()> {
         "on" => autostart::enable(),
         "off" => autostart::disable(),
         "status" => autostart_status(),
-        _ => {
-            eprintln!("Usage: dictate autostart on|off|status");
-            std::process::exit(2);
-        }
+        _ => Err(cli::UsageError(cli::command_usage("autostart").unwrap().to_owned()).into()),
     }
 }
 
@@ -564,8 +289,8 @@ pub(crate) fn is_app_bundle_executable(exe: &Path) -> bool {
 }
 
 fn usage() -> &'static str {
-    "Usage: dictate <command> [args]\n\nCommands:\n  download [--live | --fluid | --whisper | --moonshine]  Download the default speech model (about 660 MB), or only the model named by the flag\n  transcribe [--live | --fluid | --whisper | --moonshine] <file.wav>  Transcribe a WAV file with the configured model or the named one\n  transcribe --segmented <file.wav>  Transcribe a WAV through the Pauses streaming path\n  benchmark --engine <name> ...  Measure one local ASR engine and print raw JSON (see docs/model-benchmarks.md)\n  listen                 Record from the microphone and print the text\n  mics                   List the microphones and the selected one\n  daemon [--background]  Run the dictation daemon (keeps the model loaded)
-  autostart on|off|status  Turn start-at-login on or off, or show the setting\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  settings               Open the Settings window via the daemon\n  help                   Show this help"
+    "Usage: dictate <command> [args]\n\nCommands:\n  download [--live | --fluid | --whisper | --moonshine]  Download the default speech model (about 660 MB), or only the model named by the flag\n  transcribe [ENGINE] [--format txt|json|srt|vtt] [-o FILE] <path | ->  Transcribe audio (see transcribe --help)\n  benchmark --engine <name> ...  Measure one local ASR engine and print raw JSON (see docs/model-benchmarks.md)\n  listen                 Record from the microphone and print the text\n  mics                   List the microphones and the selected one\n  daemon [--background]  Run the dictation daemon (keeps the model loaded)
+  autostart on|off|status  Turn start-at-login on or off, or show the setting\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  config [list|get|set|path|values]  Read or change settings (see config --help)\n  log [--open]           Print or open the daemon log\n  settings               Open the Settings window via the daemon\n  shortcut <shortcut>    Set the daemon hotkey (Linux only)\n  help, --help, -h       Show this help\n  version, --version, -V  Show the version\n\nRun dictate <command> --help (or -h) for command usage.\n\nExit codes: 0 success, 2 usage error, 1 runtime failure."
 }
 
 #[cfg(test)]

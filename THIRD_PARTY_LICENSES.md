@@ -17,11 +17,24 @@ downloaded at runtime or compiled in; they are not relicensed by Dictate.
   so the binary runs on the x86_64 baseline. It is statically linked into
   Dictate.
 
+### Symphonia audio decoder
+
+- Project and corresponding source: <https://github.com/pdeljanov/Symphonia/tree/v0.5.5>
+- Version: 0.5.5, including its codec, format, metadata, core and Xiph helper crates
+- License: MPL-2.0, <https://www.mozilla.org/MPL/2.0/>
+- Copyright: `Copyright (c) 2019-2022 The Project Symphonia Developers.`
+- Enabled codecs: AAC, MP3, FLAC, Vorbis, PCM and ADPCM; containers: ISO MP4,
+  Matroska/WebM, OGG and WAV. No ffmpeg or native decoder is linked.
+- Unmodified MPL source files remain MPL-2.0; the separate Dictate code remains
+  MIT. Source for the bundled library is available at the versioned link above
+  and from crates.io under the same crate versions recorded in Cargo.lock.
+
 ### Rust dependencies
 
 Cargo dependencies and their licenses are listed by
 `cargo metadata` / `cargo deny` tooling. The direct dependencies introduced
-for the small engines are `flate2` (MIT/Apache-2.0), `libloading` (ISC),
+for file transcription include `tempfile` (MIT/Apache-2.0; also used for Linux
+platform integration). Dependencies for the small engines are `flate2` (MIT/Apache-2.0), `libloading` (ISC),
 `sha2` (MIT/Apache-2.0), `tar` (MIT/Apache-2.0), and `whisper-rs` /
 `whisper-rs-sys` (Unlicense, <https://unlicense.org>; Rust bindings to the
 MIT-licensed whisper.cpp above).

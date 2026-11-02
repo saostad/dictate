@@ -170,6 +170,9 @@ sudo apt-get install build-essential cmake pkg-config libasound2-dev libxkbcommo
 ## Usage
 
 ```sh
+dictate --version                # also -V; version includes the releases URL
+dictate --help                   # also -h or help
+dictate transcribe --help         # every command accepts --help or -h
 dictate download                  # default NVIDIA Parakeet model
 dictate download --fluid          # Parakeet + optional Fluid Speech Mini
 dictate download --live           # Parakeet + optional Nemotron streaming model
@@ -180,16 +183,63 @@ dictate transcribe --fluid x.wav
 dictate transcribe --whisper x.wav
 dictate transcribe --live x.wav
 dictate transcribe --moonshine x.wav
-dictate transcribe --segmented x.wav  # configured Whole/Pauses model, with pause segmentation
+dictate transcribe --segmented x.wav  # also use pause segmentation for short clips
 dictate listen
 dictate mics
 ```
+
+Help and version output go to stdout. Transcripts and command results go to
+stdout; progress, timings, and errors go to stderr, so `dictate transcribe x.wav > out.txt`
+and `dictate listen | xclip` produce clean text. Exit codes are 0 for success,
+2 for usage errors, and 1 for runtime failures. With no arguments, terminal
+launches print usage to stderr and exit 2 (launching the macOS app runs the daemon).
 
 `download --whisper` fetches Whisper and the pause detector without Parakeet;
 `download --moonshine` fetches its own model and runtime without Parakeet.
 The `--fluid` and `--live` download commands also fetch the default Parakeet
 model and pause detector if missing. Downloads need a network connection;
 transcription uses the local files.
+
+### Transcribe audio files
+
+`dictate transcribe <path>` accepts WAV, MP3, AAC-LC (raw AAC or M4A),
+FLAC and OGG/Vorbis, plus a supported audio track from MP4, MOV, MKV or WebM.
+Decoding is pure Rust; no ffmpeg installation is needed. Opus is not supported
+by the bundled Symphonia 0.5 decoder (including Opus tracks in OGG/WebM).
+Unsupported codecs and corrupt input report the filename and reason.
+`-` reads stdin, spooling compressed input to a temporary file for seeking.
+
+```sh
+dictate transcribe interview.mp3
+dictate transcribe meeting.m4a --format json -o meeting.json
+dictate transcribe --whisper movie.mp4 --format srt --output movie.srt
+dictate transcribe --format vtt lecture.flac > lecture.vtt
+cat interview.mp3 | dictate transcribe -
+```
+
+Flags can appear before or after the path. `--format txt|json|srt|vtt` defaults
+to plain text. `-o` / `--output` saves atomically after successful transcription;
+the input file cannot be overwritten. Without it, results stream to stdout.
+Progress appears only on a terminal stderr. Empty speech exits successfully,
+prints “No speech recognized” on stderr and emits an empty result (JSON still
+has its document fields; VTT still has its header).
+
+Clips up to the existing 15-second segment limit use whole-clip decoding to
+preserve short-clip text. Longer files stream through the same resampler and
+pause detector as Pauses mode, with bounded audio buffers and per-segment
+output. `--segmented` also applies this pipeline to short clips. Long files
+need the local Silero pause detector; no model is downloaded automatically.
+Nemotron and Moonshine also finish/reset at these boundaries to bound their
+session state. JSON retains transcript text and segment metadata in memory;
+decoded audio is bounded regardless of recording length.
+
+JSON contains `file`, `engine`, `duration_s`, `segments` and combined `text`.
+Segments have `start`, `end`, `text`, and `words` when available (each word has
+`start`, `end`, `text`). All times are seconds relative to the input file.
+Parakeet and Fluid provide word timestamps; Whisper, Nemotron and Moonshine
+use audio segment boundaries and report that timestamp fallback on stderr.
+SRT/VTT contain one cue per recognized segment. Engine flags override the
+configured model for that invocation only.
 
 ## Use it
 
@@ -285,6 +335,51 @@ restarting the daemon:
   Wayland desktops confirm the actual binding through their portal.
 - **General**: start at login, sound cues, notifications.
 - **About**: version, open the log, check for updates.
+
+### Settings from the command line
+
+`dictate settings` opens the Settings window. All its controls also have CLI commands:
+
+| Settings control | CLI command |
+| --- | --- |
+| Microphone | `dictate config set microphone <id>` (`default` or `""` restores system default) |
+| Refresh microphones | `dictate mics` |
+| Mode | `dictate config set mode <value>` |
+| Speech model | `dictate config set model <value>` |
+| Inference threads | `dictate config set inference-threads <value>` |
+| Unload after idle | `dictate config set unload-after <value>` |
+| Shortcut / enable shortcut | `dictate config set shortcut Ctrl+Shift+Space` |
+| Refresh Hyprland binds | `dictate shortcut` (Linux; shows shortcut and current Hyprland binds) |
+| Desktop shortcut settings | `dictate shortcut --configure` (Linux desktop shortcut service) |
+| Sound cues | `dictate config set sounds on` / `off` |
+| Notifications | `dictate config set notifications on` / `off` |
+| Use GPU | `dictate config set gpu on` / `off` (applies the next time a model loads) |
+| Start at login | `dictate config set autostart on` / `off` (also `dictate autostart on\|off\|status`) |
+| Open log | `dictate log --open` (`dictate log` prints its path) |
+| Check for updates | `dictate version` prints the version and releases URL; `dictate --version` prints only the version |
+
+`dictate config` (or `config list`) prints every setting, with file values and
+any environment overrides. `dictate config --json` provides the same information
+as JSON. `dictate config get <key>` prints just the effective value resolved from
+the file and this process's environment; a daemon started with a different
+environment can have different effective values. `dictate config path` prints
+the config file path. `dictate config values` lists supported values, as does
+`dictate config --help`.
+
+Changes apply through the running daemon and refresh an open Settings window.
+Model changes can download and load in the background: the acknowledgement means
+the switch started, not that loading succeeded. Check `dictate status`, Settings,
+notifications and `dictate log` for progress or errors. Mode/model compatibility
+matches the UI: Live requires Nemotron or Moonshine; selecting a model chooses a
+compatible mode. Loaded inference engines use new thread settings on their next
+load. Environment overrides retain precedence.
+
+Without a daemon, changes are saved for its next start; this command never starts
+one. A connected daemon error or timeout fails without writing the file. Windows
+has no control socket: settings are saved and a running daemon must be restarted.
+Autostart changes apply directly even without a daemon. Invalid arguments exit 2;
+runtime errors exit 1. Boolean settings accept `on/off/true/false`; autostart
+accepts `on/off`. Microphone ids come from `dictate mics`.
 
 ## Start at login
 

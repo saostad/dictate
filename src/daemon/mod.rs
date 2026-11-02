@@ -127,7 +127,7 @@ fn mic_listing_changed(old: &[crate::mic::Mic], new: &[crate::mic::Mic]) -> bool
 
 /// Run `hyprctl binds -j` and format the binds mentioning dictate
 /// (`Super+Alt+D — Toggle dictate` lines). Only called on Hyprland.
-fn query_hyprland_binds() -> anyhow::Result<Vec<String>> {
+pub(crate) fn query_hyprland_binds() -> anyhow::Result<Vec<String>> {
     let output = std::process::Command::new("hyprctl")
         .args(["binds", "-j"])
         .output()
@@ -290,6 +290,8 @@ pub(crate) enum UserEvent {
     WaylandShortcutInstalled(String, Result<PathBuf, String>),
     #[cfg(target_os = "linux")]
     SetShortcut(String, mpsc::Sender<String>),
+    #[cfg(unix)]
+    SetConfig(crate::settings_ui::page::PageAction, mpsc::Sender<String>),
 }
 
 /// Progress of a background model switch, shared between the loader thread and
@@ -961,6 +963,7 @@ struct DaemonApp {
     autostart_cache: Option<bool>,
     /// Last start-at-login error, shown inline in the Settings page.
     autostart_error: Option<String>,
+    settings_save_error: Option<String>,
     /// Cached `hyprctl binds` lines mentioning dictate, for the Settings
     /// page (`None` when not on Hyprland, or when the query failed — the
     /// page shows generic text then). Queried when the window opens and on
@@ -1025,6 +1028,7 @@ impl DaemonApp {
             last_shortcut_error: None,
             autostart_cache: None,
             autostart_error: None,
+            settings_save_error: None,
             hyprland_binds: None,
             wayland_shortcut_status: None,
             shortcut_busy: false,
@@ -1070,6 +1074,21 @@ impl DaemonApp {
                 self.sync_tray();
             }
             return "err transcription worker stopped; restart \"dictate daemon\"".to_string();
+        }
+        if cmd == Command::Status
+            && let Some(switch) = &self.mode_switch
+        {
+            let percent = lock_progress(&self.switch_progress).percent;
+            return format!(
+                "ok switching to {} / {}: {} ({percent}%)",
+                switch.target.mode.as_str(),
+                switch.target.model.as_str(),
+                if switch.downloading {
+                    "downloading"
+                } else {
+                    "loading"
+                }
+            );
         }
         // A switch only starts from Idle, so every start here is a fresh
         // recording the worker has no model for yet.
@@ -1325,9 +1344,8 @@ impl DaemonApp {
         self.refresh_settings();
     }
 
-    /// Flip the `Sound cues` setting, update the effective switch, save.
-    fn flip_sounds(&mut self) {
-        let new = !self.settings.sounds;
+    /// Set the `Sound cues` setting, update the effective switch, save.
+    fn set_sounds(&mut self, new: bool) {
         self.settings.sounds = new;
         crate::config::refresh_sounds(new);
         self.report_save_error(crate::config::save(&self.settings));
@@ -1335,9 +1353,8 @@ impl DaemonApp {
         self.sync_tray();
     }
 
-    /// Flip the `Use GPU` setting and save; models loaded from now on use it.
-    fn flip_gpu(&mut self) {
-        let new = !self.settings.gpu;
+    /// Set the `Use GPU` setting and save; models loaded from now on use it.
+    fn set_gpu(&mut self, new: bool) {
         self.settings.gpu = new;
         crate::config::refresh_gpu(new);
         self.report_save_error(crate::config::save(&self.settings));
@@ -1441,9 +1458,8 @@ impl DaemonApp {
         );
     }
 
-    /// Flip the `Notifications` setting, update the effective switch, save.
-    fn flip_notifications(&mut self) {
-        let new = !self.settings.notifications;
+    /// Set the `Notifications` setting, update the effective switch, save.
+    fn set_notifications(&mut self, new: bool) {
         self.settings.notifications = new;
         crate::config::refresh_notifications(new);
         self.report_save_error(crate::config::save(&self.settings));
@@ -1596,8 +1612,10 @@ impl DaemonApp {
     }
 
     /// Log and notify a settings-save failure (the in-memory value stays).
-    fn report_save_error(&self, result: anyhow::Result<()>) {
+    fn report_save_error(&mut self, result: anyhow::Result<()>) {
+        self.settings_save_error = None;
         if let Err(err) = result {
+            self.settings_save_error = Some(format!("Could not save settings: {err:#}"));
             dlog!("error: {err:#}");
             crate::notify::show(
                 crate::notify::Kind::Error,
@@ -1980,7 +1998,14 @@ impl DaemonApp {
             Ok(delay) => {
                 let changed = !actions.is_empty();
                 for action in actions {
-                    self.apply_page_action(action);
+                    if let Err(err) = self.apply_page_action(action) {
+                        dlog!("error: Settings change failed: {err:#}");
+                        crate::notify::show(
+                            crate::notify::Kind::Error,
+                            "dictate",
+                            &err.to_string(),
+                        );
+                    }
                 }
                 window.capture = capture;
                 // egui-winit turns keys into clipboard events when it receives
@@ -2021,7 +2046,94 @@ impl DaemonApp {
 
     /// Apply one Settings-page intent through the daemon's settings code
     /// paths (save, notify, the background model-switch threads).
-    fn apply_page_action(&mut self, action: crate::settings_ui::page::PageAction) {
+    fn apply_page_action(
+        &mut self,
+        action: crate::settings_ui::page::PageAction,
+    ) -> anyhow::Result<String> {
+        use crate::settings_ui::page::PageAction::*;
+        let mut proposed = self.settings.clone();
+        match &action {
+            ConfigureShortcut => {
+                #[cfg(target_os = "linux")]
+                anyhow::ensure!(
+                    self.wayland_portal.is_some(),
+                    "Desktop shortcut service is unavailable"
+                );
+                #[cfg(not(target_os = "linux"))]
+                anyhow::bail!("Desktop shortcut configuration is Linux only");
+            }
+            SelectMic(id) => {
+                anyhow::ensure!(
+                    self.state != State::Recording,
+                    "Finish the current dictation first"
+                );
+                if !id.is_empty() {
+                    crate::config_cli::validate_mic(id, &self.mic_session.list_microphones()?)?;
+                }
+            }
+            SelectMode(_) | SelectSpeechModel(_) => {
+                anyhow::ensure!(
+                    !self.worker.is_finished(),
+                    "Transcription worker stopped; restart the daemon"
+                );
+                anyhow::ensure!(
+                    self.state == State::Idle && self.mode_switch.is_none(),
+                    "Finish the current dictation or model switch first"
+                );
+                crate::config_cli::edit(&mut proposed, &action)?;
+                anyhow::ensure!(
+                    crate::config::effective_selection(&proposed)
+                        == crate::config::Selection::from_settings(&proposed),
+                    "Environment overrides this selection"
+                );
+            }
+            SelectInferenceThreads(value) => {
+                if let Some(pinned) = std::env::var("DICTATE_INFERENCE_THREADS")
+                    .ok()
+                    .and_then(|v| crate::config::InferenceThreads::parse(&v))
+                {
+                    anyhow::ensure!(
+                        pinned == *value,
+                        "DICTATE_INFERENCE_THREADS overrides this setting"
+                    );
+                }
+            }
+            SelectShortcut(value) => {
+                crate::config_cli::parse("shortcut", value)?;
+            }
+            _ => {}
+        }
+        let selection = matches!(action, SelectMode(_) | SelectSpeechModel(_));
+        let configure = matches!(action, ConfigureShortcut);
+        let shortcut = matches!(action, SelectShortcut(_));
+        let autostart = matches!(action, SetAutostart(_));
+        self.settings_save_error = None;
+        self.apply_page_action_inner(action);
+        self.refresh_settings();
+        if let Some(error) = &self.settings_save_error {
+            anyhow::bail!("{error}");
+        }
+        if shortcut {
+            if let Some(error) = &self.last_shortcut_error {
+                anyhow::bail!("{error}");
+            }
+            if self.shortcut_busy {
+                return Ok("ok shortcut setup started; see Settings for progress".into());
+            }
+        }
+        if autostart && let Some(error) = &self.autostart_error {
+            anyhow::bail!("{error}");
+        }
+        if configure {
+            return Ok("ok desktop shortcut configuration requested".into());
+        }
+        if selection && self.mode_switch.is_some() {
+            return Ok("ok switch started; dictate status / Settings shows progress; failures are reported via notifications and the daemon log".into());
+        }
+        Ok("ok saved; environment overrides still apply; loaded inference engines use new threads on their next load".into())
+    }
+
+    fn apply_page_action_inner(&mut self, action: crate::settings_ui::page::PageAction) {
         use crate::settings_ui::page::PageAction;
         match action {
             PageAction::SelectMic(id) => self.switch_microphone(&id),
@@ -2039,9 +2151,9 @@ impl DaemonApp {
                     portal.configure();
                 }
             }
-            PageAction::ToggleSounds => self.flip_sounds(),
-            PageAction::ToggleNotifications => self.flip_notifications(),
-            PageAction::ToggleGpu => self.flip_gpu(),
+            PageAction::SetSounds(on) => self.set_sounds(on),
+            PageAction::SetNotifications(on) => self.set_notifications(on),
+            PageAction::SetGpu(on) => self.set_gpu(on),
             PageAction::SetAutostart(on) => self.apply_autostart(on),
             PageAction::OpenLog => self.open_daemon_log(),
             PageAction::OpenReleases => self.open_releases(),
@@ -2536,13 +2648,26 @@ impl ApplicationHandler<UserEvent> for DaemonApp {
                 self.refresh_hyprland_binds();
                 self.refresh_settings();
             }
+            #[cfg(unix)]
+            UserEvent::SetConfig(action, reply) => {
+                let message = self.apply_page_action(action).unwrap_or_else(|error| {
+                    dlog!("error: Config change failed: {error:#}");
+                    format!("err {error:#}")
+                });
+                if reply.send(message).is_err() {
+                    dlog!("error: Config client disconnected before reply");
+                }
+            }
             #[cfg(target_os = "linux")]
             UserEvent::SetShortcut(display, reply) => {
-                self.switch_hotkey(&display);
-                let message = self.last_shortcut_error.as_ref().map_or_else(
-                    || "ok shortcut setup requested".to_string(),
-                    |error| format!("err {error}"),
-                );
+                let message = self
+                    .apply_page_action(crate::settings_ui::page::PageAction::SelectShortcut(
+                        display,
+                    ))
+                    .unwrap_or_else(|error| {
+                        dlog!("error: Shortcut change failed: {error:#}");
+                        format!("err {error:#}")
+                    });
                 let _ = reply.send(message);
                 self.refresh_settings();
             }

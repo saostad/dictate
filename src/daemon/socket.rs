@@ -143,6 +143,47 @@ fn client_command_inner(cmd: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Settings writes never start a daemon or write a file after a connected error.
+pub(crate) fn set_if_running(command: &str) -> anyhow::Result<Option<String>> {
+    let path = socket_path()?;
+    let mut stream = match UnixStream::connect(&path) {
+        Ok(stream) => stream,
+        Err(err)
+            if matches!(
+                err.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused
+            ) =>
+        {
+            return Ok(None);
+        }
+        Err(err) => return Err(err).context("Could not connect to daemon; config was not written"),
+    };
+    stream.set_read_timeout(Some(reply_timeout(Command::Status)))?;
+    stream.set_write_timeout(Some(reply_timeout(Command::Status)))?;
+    writeln!(stream, "{command}")?;
+    let mut reply = String::new();
+    BufReader::new(stream)
+        .read_line(&mut reply)
+        .context("Daemon did not reply; config was not written")?;
+    let reply = reply.trim();
+    anyhow::ensure!(
+        reply.starts_with("ok "),
+        "Daemon rejected settings change: {reply}"
+    );
+    Ok(Some(reply.to_owned()))
+}
+
+fn parse_set(line: &str) -> Result<crate::settings_ui::page::PageAction, crate::cli::UsageError> {
+    let rest = line
+        .trim_end_matches(['\r', '\n'])
+        .strip_prefix("set ")
+        .ok_or_else(|| crate::cli::UsageError("Expected set <key> <value>".into()))?;
+    let (key, value) = rest
+        .split_once(' ')
+        .ok_or_else(|| crate::cli::UsageError("Expected set <key> <value>".into()))?;
+    crate::config_cli::parse(key, value)
+}
+
 /// Start the daemon on demand and connect to it: spawn `dictate daemon`
 /// detached with its output appended to the daemon log, notify, then poll
 /// the socket every 200 ms for up to 30 s.
@@ -273,6 +314,34 @@ fn handle_connection_inner(
         // `dictate daemon`. Close it with no reply and no log.
         return Ok(());
     }
+    if line.starts_with("set ") || line.trim() == "set" || line.trim() == "configure-shortcut" {
+        let parsed = if line.trim() == "configure-shortcut" {
+            Ok(crate::settings_ui::page::PageAction::ConfigureShortcut)
+        } else {
+            parse_set(&line)
+        };
+        let reply = match parsed {
+            Err(error) => {
+                dlog!("error: Invalid config request: {error}");
+                format!("err {error}")
+            }
+            Ok(action) => {
+                let (tx, rx) = mpsc::channel();
+                proxy
+                    .send_event(UserEvent::SetConfig(action, tx))
+                    .map_err(|_| anyhow::anyhow!("Daemon event loop closed"))?;
+                match rx.recv_timeout(reply_timeout(Command::Status)) {
+                    Ok(reply) => reply,
+                    Err(error) => {
+                        dlog!("error: Config reply failed: {error}");
+                        "err daemon did not answer; outcome unknown, check Settings".into()
+                    }
+                }
+            }
+        };
+        writeln!(&stream, "{reply}")?;
+        return Ok(());
+    }
     #[cfg(target_os = "linux")]
     if let Some(display) = line.trim().strip_prefix("shortcut ") {
         let (reply_tx, reply_rx) = mpsc::channel();
@@ -326,6 +395,33 @@ fn forward_command(cmd: Command, proxy: &EventLoopProxy<UserEvent>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn set_lines_validate_and_preserve_values() {
+        use crate::settings_ui::page::PageAction;
+        assert_eq!(
+            parse_set("set sounds off\n").unwrap(),
+            PageAction::SetSounds(false)
+        );
+        assert_eq!(
+            parse_set("set microphone \n").unwrap(),
+            PageAction::SelectMic(String::new())
+        );
+        assert_eq!(
+            parse_set("set microphone host:device with spaces").unwrap(),
+            PageAction::SelectMic("host:device with spaces".into())
+        );
+        for line in [
+            "set",
+            "set sounds",
+            "set sounds bogus",
+            "set unknown off",
+            "set mode bogus",
+            "set shortcut bad",
+        ] {
+            assert!(parse_set(line).is_err(), "{line}");
+        }
+    }
 
     #[test]
     fn socket_path_prefers_runtime_dir() {

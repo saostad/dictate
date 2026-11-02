@@ -94,9 +94,9 @@ pub(crate) enum PageAction {
     SelectUnloadAfter(crate::config::UnloadAfter),
     SelectShortcut(String),
     ConfigureShortcut,
-    ToggleSounds,
-    ToggleNotifications,
-    ToggleGpu,
+    SetSounds(bool),
+    SetNotifications(bool),
+    SetGpu(bool),
     SetAutostart(bool),
     OpenLog,
     OpenReleases,
@@ -1127,12 +1127,12 @@ fn general_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAct
     inline_error(ui, view.autostart_error);
     let mut sounds = view.settings.sounds;
     if ui.checkbox(&mut sounds, "Sound cues").changed() {
-        actions.push(PageAction::ToggleSounds);
+        actions.push(PageAction::SetSounds(sounds));
     }
     explain(ui, "Play a short tone when recording starts and stops.");
     let mut notifications = view.settings.notifications;
     if ui.checkbox(&mut notifications, "Notifications").changed() {
-        actions.push(PageAction::ToggleNotifications);
+        actions.push(PageAction::SetNotifications(notifications));
     }
     explain(
         ui,
@@ -1140,7 +1140,7 @@ fn general_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAct
     );
     let mut gpu = view.settings.gpu;
     if ui.checkbox(&mut gpu, "Use GPU").changed() {
-        actions.push(PageAction::ToggleGpu);
+        actions.push(PageAction::SetGpu(gpu));
     }
     explain(
         ui,
@@ -1169,6 +1169,72 @@ fn about_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageActio
 mod tests {
     use super::*;
     use crate::config::Selection;
+
+    #[test]
+    fn general_checkboxes_emit_explicit_values() {
+        let settings = Settings::default();
+        let view = PageView {
+            settings: &settings,
+            mics: &[],
+            active_mic: None,
+            switch_target: None,
+            downloading: false,
+            download_percent: 0,
+            checking_speed: false,
+            last_speed_check: None,
+            wayland: false,
+            hyprland: false,
+            dictate_binds: None,
+            autostart_on: Some(false),
+            autostart_error: None,
+            shortcut_error: None,
+            shortcut_status: None,
+            shortcut_busy: false,
+            version: "test",
+        };
+        for (label, expected) in [
+            ("Sound cues", PageAction::SetSounds(false)),
+            ("Notifications", PageAction::SetNotifications(false)),
+        ] {
+            let ctx = egui::Context::default();
+            let mut actions = Vec::new();
+            let mut draw = |ui: &mut egui::Ui| {
+                general_section(ui, &view, &mut actions);
+            };
+            let mut output = ctx.run_ui(egui::RawInput::default(), &mut draw);
+            output.textures_delta.clear();
+            let pos = output
+                .shapes
+                .iter()
+                .find_map(|shape| {
+                    if let egui::Shape::Text(text) = &shape.shape
+                        && text.galley.text() == label
+                    {
+                        Some(text.pos + text.galley.size() / 2.0)
+                    } else {
+                        None
+                    }
+                })
+                .expect("checkbox label rendered");
+            for pressed in [true, false] {
+                let input = egui::RawInput {
+                    events: vec![
+                        egui::Event::PointerMoved(pos),
+                        egui::Event::PointerButton {
+                            pos,
+                            button: egui::PointerButton::Primary,
+                            pressed,
+                            modifiers: egui::Modifiers::NONE,
+                        },
+                    ],
+                    ..Default::default()
+                };
+                let mut output = ctx.run_ui(input, &mut draw);
+                output.textures_delta.clear();
+            }
+            assert_eq!(actions, vec![expected]);
+        }
+    }
 
     #[test]
     fn mode_options_cover_every_mode_with_its_text() {

@@ -49,7 +49,7 @@ const SHORT_JFK_SECONDS: usize = 3;
 const LONG_JFK_REPEATS: usize = 4;
 const LONG_JFK_GAP_SAMPLES: usize = SAMPLE_RATE as usize / 4; // 0.25 s
 
-const USAGE: &str = "\
+pub(crate) const USAGE: &str = "\
 Usage: dictate benchmark --engine <standard|fluid|whisper|live|moonshine> [options]
 
 One process measures one engine and one thread setting, loading the model once.
@@ -65,7 +65,7 @@ Options:
   --paced-runs <n>      real-time JFK runs for live/moonshine (default 3)
   --model-dir <dir>     model tree; defaults to DICTATE_MODEL_DIR or the app data dir
   --quick               small smoke run: 1 JFK run, 1 paced run, first 2 corpus clips
-  --help                show this help
+  --help, -h            show this help
 
 The corpus manifest's clip paths are relative to the manifest file. A prepared
 corpus can be built once with scripts/prepare-benchmark-corpus.py; neither this
@@ -193,7 +193,7 @@ pub(crate) fn run(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
         println!("{USAGE}");
         return Ok(());
     }
-    let options = parse_args(&args)?;
+    let options = parse_args(&args).map_err(|err| crate::cli::UsageError(err.to_string()))?;
     // Ignores config.toml like the rest of the benchmark; DICTATE_GPU=0 measures the CPU.
     crate::config::refresh_gpu(true);
     if let Some(root) = &options.model_dir {
@@ -210,7 +210,9 @@ pub(crate) fn run(args: impl Iterator<Item = String>) -> anyhow::Result<()> {
             // readable error row before the process exits nonzero, so the
             // orchestration script can keep the failure instead of dropping it.
             let document = error_document(&options, "benchmark", &err);
-            let _ = emit(&document);
+            emit(&document).context(format!(
+                "benchmark failed: {err:#}; also could not write error JSON"
+            ))?;
             Err(err).context("benchmark failed")
         }
     }

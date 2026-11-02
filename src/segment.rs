@@ -5,9 +5,9 @@
 //! 512-sample frames (32 ms each); speech starts at p >= 0.5 and ends at
 //! p < 0.35 (hysteresis: uncertain frames keep the current state). Cuts land
 //! at the middle of pauses of >= 400 ms, force-cuts at 15 s after the
-//! lowest-prob frame in the last 3 s. Segments are a contiguous, sample-exact
-//! partition of the whole recording: the first starts at sample 0, and only
-//! segments with no speech frames are skipped.
+//! lowest-prob frame in the last 3 s. Segments preserve absolute sample offsets;
+//! silent prefixes are discarded at the segment limit to bound memory, and
+//! tails without speech are skipped.
 //!
 //! `Feeder` is the shared streaming path (daemon + `transcribe --segmented`):
 //! it resamples the continuous stream to 16 kHz once (stateful, so there are
@@ -30,7 +30,7 @@
 /// Non-speech frames that trigger a pause cut: 13 x 32 ms = 416 ms >= 400 ms.
 const SILENCE_CUT_FRAMES: usize = 13;
 /// Segment length that triggers a force-cut: 15 s at 16 kHz.
-const MAX_SEGMENT_SAMPLES: usize = 240_000;
+pub(crate) const MAX_SEGMENT_SAMPLES: usize = 240_000;
 /// Force-cut search window: the lowest-prob frame in the last ~3 s
 /// (93 x 32 ms = 2976 ms).
 const FORCE_SEARCH_FRAMES: usize = 93;
@@ -85,6 +85,7 @@ impl SegmentStart {
 /// One segment emitted by [`Segmenter`], before the feeder attaches context.
 #[derive(Debug)]
 pub(crate) struct Cut {
+    pub(crate) offset: u64,
     pub(crate) audio: Vec<f32>,
     pub(crate) start: SegmentStart,
 }
@@ -94,6 +95,7 @@ pub(crate) struct Cut {
 /// context.
 #[derive(Debug)]
 pub(crate) struct Segment {
+    pub(crate) offset: u64,
     pub(crate) audio: Vec<f32>,
     pub(crate) context: Vec<f32>,
     pub(crate) start: SegmentStart,
@@ -120,6 +122,7 @@ pub(crate) struct Feeder<S> {
     /// Trailing audio of previously emitted segments (at most
     /// `CONTEXT_SAMPLES`), attached as left context to the next one.
     history: Vec<f32>,
+    history_end: u64,
 }
 
 impl<S: Scorer> Feeder<S> {
@@ -138,6 +141,7 @@ impl<S: Scorer> Feeder<S> {
             resampler,
             segmenter: Segmenter::new(scorer),
             history: Vec::new(),
+            history_end: 0,
         })
     }
 
@@ -183,12 +187,21 @@ impl<S: Scorer> Feeder<S> {
     fn wrap(&mut self, cuts: Vec<Cut>) -> Vec<Segment> {
         let mut out = Vec::with_capacity(cuts.len());
         for cut in cuts {
-            let Cut { audio, start } = cut;
+            let Cut {
+                audio,
+                start,
+                offset,
+            } = cut;
+            if offset != self.history_end {
+                self.history.clear();
+            }
+            self.history_end = offset + audio.len() as u64;
             let context = self.history.clone();
             self.history.extend_from_slice(&audio);
             let drop = self.history.len().saturating_sub(CONTEXT_SAMPLES);
             self.history.drain(..drop);
             out.push(Segment {
+                offset,
                 audio,
                 context,
                 start,
@@ -201,6 +214,7 @@ impl<S: Scorer> Feeder<S> {
 /// Splits mono 16 kHz audio at pauses, scored by a [`Scorer`]. Usually driven
 /// through [`Feeder`].
 pub(crate) struct Segmenter<S> {
+    offset: u64,
     scorer: S,
     pending: Vec<f32>,
     samples: Vec<f32>,
@@ -217,6 +231,7 @@ impl<S: Scorer> Segmenter<S> {
     pub(crate) fn new(scorer: S) -> Self {
         Self {
             scorer,
+            offset: 0,
             pending: Vec::new(),
             samples: Vec::new(),
             probs: Vec::new(),
@@ -274,7 +289,11 @@ impl<S: Scorer> Segmenter<S> {
         self.trailing_silence = 0;
         let start = self.start;
         self.start = SegmentStart::Recording;
-        Some(Cut { audio: tail, start })
+        Some(Cut {
+            audio: tail,
+            start,
+            offset: self.offset,
+        })
     }
 
     /// The scorer back.
@@ -302,8 +321,19 @@ impl<S: Scorer> Segmenter<S> {
             self.trailing_silence += 1;
         }
         if !self.has_speech {
-            // No speech yet: keep everything so the first segment starts at
-            // sample 0, and never cut silence alone.
+            // Discard bounded silent prefixes while preserving absolute
+            // offsets. Keep the last CONTEXT_S of it so a soft onset scored
+            // just under the speech threshold is not clipped.
+            if self.samples.len() >= MAX_SEGMENT_SAMPLES {
+                let keep_frames = (CONTEXT_SAMPLES / crate::vad::FRAME_LEN).min(self.speech.len());
+                let drop_frames = self.speech.len() - keep_frames;
+                let drop = drop_frames * crate::vad::FRAME_LEN;
+                self.offset += drop as u64;
+                self.samples.drain(..drop);
+                self.probs.drain(..drop_frames);
+                self.speech.drain(..drop_frames);
+                self.trailing_silence = trailing_count(&self.speech);
+            }
             return Ok(None);
         }
         if self.trailing_silence >= SILENCE_CUT_FRAMES {
@@ -325,6 +355,8 @@ impl<S: Scorer> Segmenter<S> {
         let remainder_frames = silence - keep_in_first;
         let cut = self.samples.len() - remainder_frames * crate::vad::FRAME_LEN;
         let first_frames = self.speech.len() - remainder_frames;
+        let offset = self.offset;
+        self.offset += cut as u64;
         let head = self.samples[..cut].to_vec();
         let remainder = self.samples[cut..].to_vec();
         let remainder_probs = self.probs[first_frames..].to_vec();
@@ -336,7 +368,11 @@ impl<S: Scorer> Segmenter<S> {
         self.trailing_silence = trailing_count(&self.speech);
         let start = self.start;
         self.start = SegmentStart::AfterPause;
-        Cut { audio: head, start }
+        Cut {
+            audio: head,
+            start,
+            offset,
+        }
     }
 
     /// Force-cut a long segment after the lowest-prob frame in the last 3 s.
@@ -357,6 +393,8 @@ impl<S: Scorer> Segmenter<S> {
         let cut = cut_frames * crate::vad::FRAME_LEN;
         let cut = cut.min(self.samples.len());
         let first_has_speech = self.speech[..cut_frames].iter().any(|&speech| speech);
+        let offset = self.offset;
+        self.offset += cut as u64;
         let head = self.samples[..cut].to_vec();
         let remainder = self.samples[cut..].to_vec();
         let remainder_probs = self.probs[cut_frames..].to_vec();
@@ -371,7 +409,11 @@ impl<S: Scorer> Segmenter<S> {
         if !first_has_speech {
             return None;
         }
-        Some(Cut { audio: head, start })
+        Some(Cut {
+            audio: head,
+            start,
+            offset,
+        })
     }
 }
 
@@ -406,6 +448,28 @@ mod tests {
             self.index += 1;
             Ok(prob)
         }
+    }
+
+    #[test]
+    fn long_silence_is_bounded_and_offsets_survive_skips() {
+        let silent_frames = MAX_SEGMENT_SAMPLES.div_ceil(FRAME) * 3;
+        let mut feeder =
+            Feeder::new(RATE, Scripted::new(seq(&[(0.0, silent_frames), (1.0, 20)]))).unwrap();
+        for _ in 0..silent_frames {
+            assert!(feeder.push(&vec![0.0; FRAME]).unwrap().is_empty());
+            assert!(feeder.segmenter.samples.len() < MAX_SEGMENT_SAMPLES);
+        }
+        feeder.push(&vec![0.5; FRAME * 20]).unwrap();
+        let segments = feeder.finish().unwrap();
+        assert_eq!(segments.len(), 1);
+        // Absolute offsets survive the discards: the segment ends at the true end.
+        let end = segments[0].offset + segments[0].audio.len() as u64;
+        assert_eq!(end, ((silent_frames + 20) * FRAME) as u64);
+        // At least CONTEXT_S (whole frames) of pre-roll is kept before speech.
+        let pre_roll = segments[0].audio.len() - FRAME * 20;
+        assert!(pre_roll >= (CONTEXT_SAMPLES / FRAME) * FRAME, "{pre_roll}");
+        assert!(pre_roll < MAX_SEGMENT_SAMPLES);
+        assert!(segments[0].context.is_empty());
     }
 
     /// Prob sequence from (prob, frames) runs.
