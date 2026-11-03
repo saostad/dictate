@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use tiny_http::{Header, Response};
 thread_local! { static RETRY_AFTER: std::cell::Cell<u64> = const { std::cell::Cell::new(1) }; }
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-pub(crate) const USAGE: &str = "Usage: dictate serve [--listen ADDR:PORT] [--token-file PATH] [--max-concurrency N] [--max-queue N] [--max-handlers N] [--read-timeout-secs N] [--max-header-bytes N] [--max-upload-bytes N] [--max-body-bytes N] [--max-duration-secs N] [--idle-unload-secs N] [--accept-poll-ms N] [--retry-after-secs N]\nFlags override persisted server.* settings for one run. No models are downloaded. Without a token, anything that reaches the port can use it.";
+pub(crate) const USAGE: &str = "Usage: dictate serve [--listen ADDR:PORT] [--token-file PATH] [--max-concurrency N] [--max-queue N] [--max-handlers N] [--linger-drain-bytes N] [--linger-secs N] [--max-lingering-rejections N] [--read-timeout-secs N] [--max-header-bytes N] [--max-upload-bytes N] [--max-body-bytes N] [--max-duration-secs N] [--idle-unload-secs N] [--accept-poll-ms N] [--retry-after-secs N]\nFlags override persisted server.* settings for one run. No models are downloaded. Without a token, anything that reaches the port can use it.";
 #[derive(Debug)]
 pub struct ApiError {
     status: u16,
@@ -794,7 +794,9 @@ fn serve_http(
     let handlers = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let mut intake = Vec::new();
     let mut receive_error = None;
+    let mut rejections = Vec::new();
     while !stop.load(Ordering::Relaxed) {
+        rejections.retain(|thread: &std::thread::JoinHandle<()>| !thread.is_finished());
         intake.retain(|thread: &std::thread::JoinHandle<()>| !thread.is_finished());
         let request =
             match server.recv_timeout(Duration::from_millis(settings.server.accept_poll_ms)) {
@@ -805,18 +807,34 @@ fn serve_http(
                     break;
                 }
             };
+        let mut request = request;
+        request.configure_close(
+            settings.server.linger_drain_bytes,
+            Duration::from_secs(settings.server.linger_secs),
+        );
         if handlers.load(Ordering::Acquire) >= settings.server.max_handlers {
-            respond(
-                request,
-                Reply::error(ApiError::new(
-                    429,
-                    None,
-                    "queue_full",
-                    "Service is busy; retry later",
-                )),
-                Instant::now(),
-                0,
-            );
+            if rejections.len() >= settings.server.max_lingering_rejections {
+                eprintln!(
+                    "warn: fallback=true HTTP rejection capacity exhausted; closing connection without response"
+                );
+                drop(request);
+                continue;
+            }
+            let retry_after = settings.server.retry_after_secs;
+            rejections.push(std::thread::spawn(move || {
+                RETRY_AFTER.with(|n| n.set(retry_after));
+                respond(
+                    request,
+                    Reply::error(ApiError::new(
+                        429,
+                        None,
+                        "queue_full",
+                        "Service is busy; retry later",
+                    )),
+                    Instant::now(),
+                    0,
+                );
+            }));
             continue;
         }
         handlers.fetch_add(1, Ordering::AcqRel);
@@ -983,6 +1001,11 @@ fn serve_http(
             }
         }));
     }
+    for rejection in rejections {
+        rejection
+            .join()
+            .map_err(|_| "HTTP rejection handler panicked")?;
+    }
     queue.0.lock().expect("queue lock").closed = true;
     queue.1.notify_all();
     for worker in workers {
@@ -1120,6 +1143,42 @@ mod tests {
             .as_ref()
             .try_into()
             .unwrap()
+    }
+    #[test]
+    fn rejected_upload_does_not_hold_health_while_lingering() {
+        let mut settings = Settings::default();
+        settings.server.max_body_bytes = 16;
+        settings.server.linger_secs = 1;
+        settings.server.linger_drain_bytes = usize::MAX;
+        settings.server.max_handlers = 2;
+        let server = TestServer::start(settings, None, |_| Box::new(Fake));
+        let mut upload = TcpStream::connect(&server.address).unwrap();
+        upload
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        write!(upload, "POST /v1/transcribe HTTP/1.1\r\nContent-Type: multipart/form-data; boundary=x\r\nContent-Length: 100000\r\n\r\npartial").unwrap();
+        let mut response = String::new();
+        upload.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        let json: Value = serde_json::from_str(body).unwrap();
+        assert!(json.get("error").is_some(), "{json}");
+        assert_eq!(server.request("GET", "/v1/health", b"", "").0, 200);
+        let mut sender = upload.try_clone().unwrap();
+        sender
+            .set_write_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let (done, completion) = std::sync::mpsc::channel();
+        let writer = std::thread::spawn(move || {
+            while sender.write_all(&[0; 4096]).is_ok() {}
+            done.send(()).unwrap();
+        });
+        assert_eq!(server.request("GET", "/v1/health", b"", "").0, 200);
+        completion
+            .recv_timeout(Duration::from_secs(3))
+            .expect("continuous upload outlived linger deadline");
+        writer.join().unwrap();
+        assert_eq!(server.request("GET", "/v1/health", b"", "").0, 200);
     }
     #[test]
     fn auth_and_routes() {
@@ -1310,7 +1369,7 @@ mod tests {
         settings.server.max_header_bytes = 256;
         settings.server.max_handlers = 1;
         settings.server.read_timeout_secs = 1;
-        let server = TestServer::start(settings, None, |_| Box::new(Fake));
+        let server = TestServer::start(settings.clone(), None, |_| Box::new(Fake));
         let mut oversized = TcpStream::connect(&server.address).unwrap();
         write!(
             oversized,
@@ -1318,7 +1377,13 @@ mod tests {
             "a".repeat(256)
         )
         .unwrap();
+        oversized.shutdown(std::net::Shutdown::Write).unwrap();
         assert_eq!(read_reply(&mut oversized).0, 400);
+        drop(oversized);
+        drop(server);
+        // A separate instance isolates handler capacity from the header
+        // rejection's lingering cleanup, which runs after sending FIN.
+        let server = TestServer::start(settings, None, |_| Box::new(Fake));
         let mut stalled = TcpStream::connect(&server.address).unwrap();
         stalled
             .set_read_timeout(Some(Duration::from_secs(3)))

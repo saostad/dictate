@@ -801,6 +801,9 @@ list` lists values. Dotted keys are stored in Dictate's small TOML config format
 | `listen` | `127.0.0.1:7342` |
 | `token_file` | empty (auth disabled) |
 | `max_concurrency` / `max_queue` / `max_handlers` | 1 / 4 / 16 |
+| `linger_drain_bytes` / `--linger-drain-bytes` | 1048576 (positive integer) |
+| `linger_secs` / `--linger-secs` | 2 (positive seconds, at most u32::MAX) |
+| `max_lingering_rejections` / `--max-lingering-rejections` | 4 (positive integer) |
 | `read_timeout_secs` / `max_header_bytes` | 60 / 16384 |
 | `max_upload_bytes` / `max_body_bytes` | 52428800 / 52559872 |
 | `max_duration_secs` | 600 |
@@ -835,3 +838,9 @@ Linux user service: copy `packaging/linux/dictate-serve.service` to
 `systemctl --user daemon-reload && systemctl --user enable --now dictate-serve`.
 Configure settings/token before starting; inspect with
 `journalctl --user -u dictate-serve`.
+
+Early HTTP rejections send the full response and FIN, then discard incoming bytes
+until EOF, `server.linger_drain_bytes`, or `server.linger_secs`. Overflow
+rejections run outside the accept loop, bounded by `server.max_lingering_rejections`.
+If both handler and rejection capacity are exhausted, new sockets are closed
+without a response and a warning is logged. Fully consumed requests close immediately.

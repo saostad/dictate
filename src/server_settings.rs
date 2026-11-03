@@ -6,6 +6,9 @@ pub(crate) struct ServerSettings {
     pub max_concurrency: usize,
     pub max_queue: usize,
     pub max_handlers: usize,
+    pub linger_drain_bytes: usize,
+    pub linger_secs: u64,
+    pub max_lingering_rejections: usize,
     pub read_timeout_secs: u64,
     pub max_header_bytes: usize,
     pub max_upload_bytes: usize,
@@ -23,6 +26,9 @@ impl Default for ServerSettings {
             max_concurrency: 1,
             max_queue: 4,
             max_handlers: 16,
+            linger_drain_bytes: 1048576,
+            linger_secs: 2,
+            max_lingering_rejections: 4,
             read_timeout_secs: 60,
             max_header_bytes: 16384,
             max_upload_bytes: 52428800,
@@ -41,6 +47,9 @@ impl ServerSettings {
         "server.max_concurrency",
         "server.max_queue",
         "server.max_handlers",
+        "server.linger_drain_bytes",
+        "server.linger_secs",
+        "server.max_lingering_rejections",
         "server.read_timeout_secs",
         "server.max_header_bytes",
         "server.max_upload_bytes",
@@ -64,6 +73,17 @@ impl ServerSettings {
                 next.max_queue = value
                     .parse()
                     .map_err(|_| "Expected a nonnegative integer")?
+            }
+            "linger_drain_bytes" => {
+                next.linger_drain_bytes =
+                    value.parse().map_err(|_| "Expected a positive integer")?
+            }
+            "linger_secs" => {
+                next.linger_secs = value.parse().map_err(|_| "Expected a positive integer")?
+            }
+            "max_lingering_rejections" => {
+                next.max_lingering_rejections =
+                    value.parse().map_err(|_| "Expected a positive integer")?
             }
             "max_handlers" => {
                 next.max_handlers = value
@@ -117,6 +137,13 @@ impl ServerSettings {
         Ok(())
     }
     pub(crate) fn validate(&self) -> Result<(), String> {
+        if self.linger_secs == 0
+            || self.linger_secs > u32::MAX.into()
+            || self.linger_drain_bytes == 0
+            || self.max_lingering_rejections == 0
+        {
+            return Err("server linger_secs must be positive and at most u32::MAX; linger_drain_bytes and max_lingering_rejections must be positive".into());
+        }
         self.listen
             .parse::<std::net::SocketAddr>()
             .map_err(|_| "listen must be ADDR:PORT")?;
@@ -181,6 +208,9 @@ impl ServerSettings {
             "max_concurrency" => self.max_concurrency.to_string(),
             "max_queue" => self.max_queue.to_string(),
             "max_handlers" => self.max_handlers.to_string(),
+            "linger_drain_bytes" => self.linger_drain_bytes.to_string(),
+            "linger_secs" => self.linger_secs.to_string(),
+            "max_lingering_rejections" => self.max_lingering_rejections.to_string(),
             "read_timeout_secs" => self.read_timeout_secs.to_string(),
             "max_header_bytes" => self.max_header_bytes.to_string(),
             "max_upload_bytes" => self.max_upload_bytes.to_string(),
@@ -207,6 +237,10 @@ mod tests {
         for (key, value) in [
             ("max_concurrency", "0"),
             ("read_timeout_secs", "0"),
+            ("linger_secs", "0"),
+            ("linger_secs", "4294967296"),
+            ("linger_drain_bytes", "0"),
+            ("max_lingering_rejections", "0"),
             ("listen", "localhost"),
             ("max_upload_bytes", "-1"),
             ("max_duration_secs", "NaN"),

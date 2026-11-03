@@ -33,6 +33,8 @@ impl Server {
                     method: Method::Get,
                     path: String::new(),
                     headers: Vec::new(),
+                    headers_complete: false,
+                    linger: None,
                 }))
             }
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -84,8 +86,14 @@ pub(crate) struct Request {
     method: Method,
     path: String,
     headers: Vec<Header>,
+    headers_complete: bool,
+    linger: Option<(usize, Duration)>,
 }
 impl Request {
+    pub(crate) fn configure_close(&mut self, bytes: usize, timeout: Duration) {
+        self.linger = Some((bytes, timeout));
+    }
+
     pub(crate) fn read_headers(&mut self, timeout: Duration, limit: usize) -> io::Result<()> {
         self.input.deadline = Some(Instant::now().checked_add(timeout).ok_or_else(|| {
             io::Error::new(io::ErrorKind::InvalidInput, "read timeout is too large")
@@ -160,6 +168,7 @@ impl Request {
         if self.method == Method::Post && length.is_none() {
             return Err(invalid());
         }
+        self.headers_complete = true;
         self.input.remaining = length.unwrap_or(0);
         Ok(())
     }
@@ -179,14 +188,18 @@ impl Request {
         &mut self.input
     }
     pub(crate) fn respond<R: Read>(mut self, response: Response<R>) -> io::Result<()> {
-        // No body is drained on rejection or drop, and no pipelined writer can block us.
+        let (drain_bytes, timeout) = self.linger.expect("configured connection close");
+        // Overflow requests have not read headers, so also need a write deadline.
         if self.input.deadline.is_none() {
-            self.input.reader.get_ref().set_nonblocking(true)?;
+            self.input
+                .reader
+                .get_ref()
+                .set_write_timeout(Some(timeout))?;
         }
-        self.input.reader.get_ref().shutdown(Shutdown::Read)?;
+        let needs_drain = !self.headers_complete || self.input.remaining != 0;
         let response =
             response.with_header(Header::from_bytes("Connection", "close").expect("fixed header"));
-        if self.input.deadline.is_none() || self.input.remaining != 0 {
+        if needs_drain {
             // Send a complete rejection in one write. Fragmented header writes
             // can remain in Nagle's buffer and be lost when an unread upload
             // forces a reset as the connection closes.
@@ -198,7 +211,7 @@ impl Request {
                 self.method == Method::Head,
                 None,
             )?;
-            self.input.reader.get_mut().write_all(&bytes)
+            self.input.reader.get_mut().write_all(&bytes)?;
         } else {
             response.raw_print(
                 self.input.reader.get_mut(),
@@ -206,14 +219,104 @@ impl Request {
                 &self.headers,
                 self.method == Method::Head,
                 None,
-            )
+            )?;
         }
+        // Send FIN only after the entire response. Keep receiving so an upload
+        // racing the rejection cannot turn the response into a TCP reset.
+        self.input.reader.get_ref().shutdown(Shutdown::Write)?;
+        if needs_drain {
+            self.input.deadline = Some(Instant::now().checked_add(timeout).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "linger timeout is too large")
+            })?);
+            let mut left = drain_bytes;
+            let mut buffer = [0; 8192];
+            while left > 0 {
+                let len = left.min(buffer.len());
+                match self.input.read_socket(&mut buffer[..len]) {
+                    Ok(0) => break,
+                    Ok(n) => left -= n,
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::TimedOut | io::ErrorKind::WouldBlock
+                        ) =>
+                    {
+                        break;
+                    }
+                    Err(e) => return Err(e),
+                }
+            }
+        }
+        Ok(())
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    fn rejected_upload(
+        drain_bytes: usize,
+        timeout: Duration,
+    ) -> (TcpStream, std::thread::JoinHandle<io::Result<()>>) {
+        let server = Server::http("127.0.0.1:0").unwrap();
+        let client = TcpStream::connect(server.server_addr()).unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let handler = std::thread::spawn(move || {
+            let mut request = loop {
+                if let Some(request) = server.recv_timeout(Duration::from_millis(1)).unwrap() {
+                    break request;
+                }
+            };
+            request.configure_close(drain_bytes, timeout);
+            request.read_headers(Duration::from_secs(3), 16384)?;
+            request.respond(
+                Response::from_string(r#"{"error":{"kind":"too_large"}}"#).with_status_code(413),
+            )
+        });
+        (client, handler)
+    }
+    #[test]
+    fn incomplete_upload_receives_full_json_and_fin() {
+        let (mut client, handler) = rejected_upload(1048576, Duration::from_secs(2));
+        let mut request = b"POST / HTTP/1.1\r\nContent-Length: 100000\r\n\r\n".to_vec();
+        // Exceed BufReader's read-ahead so unread bytes also remain in the socket.
+        request.extend_from_slice(&[b'x'; 32768]);
+        client.write_all(&request).unwrap();
+        // Keep the upload half open: the response and FIN must arrive first.
+        let mut response = String::new();
+        client.read_to_string(&mut response).unwrap();
+        assert!(response.starts_with("HTTP/1.1 413"), "{response}");
+        let (_, body) = response.split_once("\r\n\r\n").unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(body).unwrap()["error"]["kind"],
+            "too_large"
+        );
+        client.shutdown(Shutdown::Write).unwrap();
+        handler.join().unwrap().unwrap();
+    }
+    #[test]
+    fn continuous_upload_cannot_extend_absolute_linger_deadline() {
+        let (mut client, handler) = rejected_upload(usize::MAX, Duration::from_millis(50));
+        client
+            .write_all(b"POST / HTTP/1.1\r\nContent-Length: 1000000000\r\n\r\nx")
+            .unwrap();
+        let mut upload = client.try_clone().unwrap();
+        upload
+            .set_write_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let writer = std::thread::spawn(move || while upload.write_all(&[0; 4096]).is_ok() {});
+        let (done, completion) = std::sync::mpsc::channel();
+        let joiner = std::thread::spawn(move || done.send(handler.join().unwrap()).unwrap());
+        completion
+            .recv_timeout(Duration::from_secs(2))
+            .expect("upload extended linger deadline")
+            .unwrap();
+        drop(client);
+        writer.join().unwrap();
+        joiner.join().unwrap();
+    }
     #[test]
     fn expired_body_deadline_fails_without_waiting_for_data() {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
