@@ -88,6 +88,11 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+        with:
+          # whisper-rs-sys doesn't rebuild when the GGML_* settings in
+          # .cargo/config.toml change, so a cached whisper.cpp would keep the
+          # old CPU features. Hashing the file into the key forces a fresh build.
+          key: native-${{ hashFiles('.cargo/config.toml') }}
       - name: Use whisper-rs-sys's bundled bindings (macOS)
         # The checked-in bindings were generated on 64-bit Linux without
         # Vulkan. Windows (MSVC ABI: c_long is 4 bytes) and Linux (the Vulkan
@@ -169,7 +174,9 @@ jobs:
           targets: ${{ matrix.target }}
       - uses: Swatinem/rust-cache@v2
         with:
-          key: release-${{ matrix.asset }}
+          # See the check job: a stale cached whisper.cpp shipped BMI2 in
+          # v0.12.0 and crashed Sandy Bridge CPUs with SIGILL.
+          key: release-${{ matrix.asset }}-${{ hashFiles('.cargo/config.toml') }}
       - uses: actions/cache@v4
         with:
           path: .model
@@ -230,6 +237,9 @@ jobs:
           else
             cargo build --release --locked --target ${{ matrix.target }} ${{ matrix.flags }}
           fi
+      - name: Check whisper.cpp stays on the x86_64 baseline
+        if: matrix.target == 'x86_64-unknown-linux-gnu'
+        run: sh scripts/check-baseline-isa.sh "target/${{ matrix.target }}/release"
       - name: Bundle the Vulkan loader (Linux)
         if: runner.os == 'Linux'
         run: |
