@@ -745,3 +745,93 @@ with `DICTATE_GPU=0` / `DICTATE_GPU=1`. Changes apply at the next model load.
 The bundled Vulkan loader satisfies a hard runtime dependency: whisper-rs-sys statically
 links ggml backends; its dynamic backend mode requires shared ggml libraries
 and a different build/packaging arrangement.
+
+## HTTP API
+
+`dictate serve` runs a headless, offline HTTP/1.1 transcription API (contract 1).
+It never starts the dictation daemon or touches the microphone, tray, clipboard,
+notifications, hotkeys or audio devices. Download models explicitly first:
+
+```sh
+dictate download --whisper
+dictate config set model whisper
+dictate serve                       # 127.0.0.1:7342
+curl http://127.0.0.1:7342/v1/health
+curl http://127.0.0.1:7342/v1/capabilities
+curl -F file=@clip.wav -F language=en http://127.0.0.1:7342/v1/transcribe
+curl -F file=@clip.wav -F segments=true -F model=whisper-tiny-en \
+  http://127.0.0.1:7342/v1/transcribe
+```
+
+The configured default model determines readiness. Capabilities list stable model
+IDs, installation status, disk/download sizes and limits. Today's models support
+English only: `language=fa` returns 422/code 7; `auto` uses English.
+`languageProbability` is `null` because these single-language engines do not
+expose a language detector. Segments, when requested, use audio segment bounds
+rather than estimated word timestamps. Text is transcribed without translation
+or summarization. Requests never download missing models.
+
+WAV (PCM/float, mono/stereo, resampled), MP3, FLAC, Ogg/Vorbis, AAC/M4A and
+supported audio tracks in MP4/MKV/WebM are accepted. Opus is unsupported (415/code
+4); browser clients should convert WebM/Opus to WAV before uploading.
+
+An optional token file enables bearer authentication on every route except health.
+The file is read once at startup, trimmed, and must not be empty. For example:
+
+```sh
+dictate serve --token-file "$HOME/.config/dictate/http-token"
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7342/v1/capabilities
+curl -H "Authorization: Bearer $TOKEN" -F file=@clip.wav -F language=en \
+  http://127.0.0.1:7342/v1/transcribe
+```
+
+Without a token **anything that can reach the port can use it**. Prefer localhost
+or a trusted network such as Tailscale; use TLS termination for untrusted networks.
+A same-machine Docker client needs the service listening on `0.0.0.0` or the
+bridge address (`dictate serve --listen 0.0.0.0:7342`), plus a host firewall rule
+such as `sudo ufw allow from 172.16.0.0/12 to any port 7342 proto tcp`.
+
+All flags are persisted `server.*` settings; use `dictate config set
+server.max_upload_bytes 52428800` or override for one run with
+`--max-upload-bytes 52428800`. `dictate serve --help` lists flags; `dictate config
+list` lists values. Dotted keys are stored in Dictate's small TOML config format.
+
+| Setting / flag (underscores become hyphens) | Default |
+|---|---|
+| `listen` | `127.0.0.1:7342` |
+| `token_file` | empty (auth disabled) |
+| `max_concurrency` / `max_queue` / `max_handlers` | 1 / 4 / 16 |
+| `read_timeout_secs` / `max_header_bytes` | 60 / 16384 |
+| `max_upload_bytes` / `max_body_bytes` | 52428800 / 52559872 |
+| `max_duration_secs` | 600 |
+| `idle_unload_secs` | 1200 (20 minutes; 0 never unloads) |
+| `accept_poll_ms` / `retry_after_secs` | 10 / 1 |
+
+Workers keep models warm until idle unload. At capacity the server immediately
+returns 429 with `Retry-After`. Intake has an absolute read deadline and bounded
+handlers so stalled uploads cannot block accepting other clients. Each connection
+serves one request and closes; bodies require Content-Length (no chunked upload).
+SIGINT/SIGTERM stop accepting and drain accepted worker jobs.
+
+Every error is JSON: `{"contract":1,"error":{"code":3,"kind":"model_missing",
+"message":"…run dictate download…"}}`. Messages are safe for users; logs omit
+request audio, transcripts and bearer tokens.
+
+| HTTP | Code | Meaning |
+|---|---|---|
+| 400 | 2 | Invalid multipart, unknown/duplicate part, model or value, missing Content-Length |
+| 401 | null | Bearer token missing/wrong (`WWW-Authenticate: Bearer`) |
+| 404 / 405 | null | Unknown route / wrong method |
+| 413 | 5 | Body, upload or audio duration exceeds limit |
+| 415 | 4 | Unsupported request type or Opus codec |
+| 422 | 4 | Empty, silent or unreadable audio |
+| 422 | 7 | Language unsupported by model |
+| 429 | null | Busy; retry after the header's seconds |
+| 500 | 6 | Processing failed; check service logs |
+| 503 | 3 / null | Model missing (download command included) / shutting down |
+
+Linux user service: copy `packaging/linux/dictate-serve.service` to
+`~/.config/systemd/user/`, adjust `ExecStart` if needed, then run
+`systemctl --user daemon-reload && systemctl --user enable --now dictate-serve`.
+Configure settings/token before starting; inspect with
+`journalctl --user -u dictate-serve`.

@@ -85,6 +85,18 @@ impl Audio {
             duration,
         })
     }
+    /// Shared CLI/HTTP resampling step, including the final buffered tail.
+    pub(crate) fn resample_packet(
+        resampler: &mut Option<crate::audio::StreamResampler>,
+        decoded: Option<Vec<f32>>,
+    ) -> anyhow::Result<Vec<f32>> {
+        match (resampler, decoded) {
+            (Some(r), Some(samples)) => r.push(&samples),
+            (Some(r), None) => r.finish(),
+            (None, Some(samples)) => Ok(samples),
+            (None, None) => Ok(Vec::new()),
+        }
+    }
     pub(crate) fn next(&mut self) -> anyhow::Result<Option<Vec<f32>>> {
         loop {
             let packet = match self.format.next_packet() {

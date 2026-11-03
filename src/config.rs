@@ -285,6 +285,7 @@ pub(crate) struct Settings {
     pub hotkey: String,
     pub microphone: String,
     pub gpu: bool,
+    pub server: crate::server_settings::ServerSettings,
 }
 
 impl Default for Settings {
@@ -299,6 +300,7 @@ impl Default for Settings {
             hotkey: crate::hotkey::DEFAULT_HOTKEY.to_string(),
             microphone: String::new(),
             gpu: true,
+            server: Default::default(),
         }
     }
 }
@@ -696,6 +698,14 @@ pub(crate) fn parse(text: &str) -> Result<Settings, String> {
         let key = key.trim();
         let value = value.trim();
         match key {
+            key if key.starts_with("server.") => {
+                let value = if value.starts_with('"') {
+                    parse_string(value).map_err(str::to_owned)?
+                } else {
+                    value.to_owned()
+                };
+                settings.server.set(key, &value)?;
+            }
             "sounds" | "notifications" | "gpu" => {
                 let parsed = match value {
                     "true" => true,
@@ -890,6 +900,10 @@ fn render(settings: &Settings) -> String {
         "# Run Whisper on the GPU when one is available. Applies the next time a model loads.\ngpu = {}\n",
         settings.gpu
     ));
+    for key in crate::server_settings::ServerSettings::KEYS {
+        let value = settings.server.value(key).expect("server key");
+        text.push_str(&format!("{key} = \"{}\"\n", escape(&value)));
+    }
     text
 }
 
@@ -1244,6 +1258,7 @@ mod tests {
                 hotkey: "say \"hi\" \\ now".to_string(),
                 microphone: "pulseaudio:alsa_input.pci".to_string(),
                 gpu: false,
+                server: Default::default(),
             },
             Settings {
                 mode: Mode::Live,
@@ -1465,6 +1480,7 @@ mod tests {
             hotkey: "F8".to_string(),
             microphone: String::new(),
             gpu: true,
+            server: Default::default(),
         };
         save_to(&path, &settings).unwrap();
         let text = std::fs::read_to_string(&path).unwrap();

@@ -142,13 +142,13 @@ impl Output {
 }
 
 #[allow(clippy::large_enum_variant)]
-enum Engine {
+pub(crate) enum Engine {
     Batch(asr::Asr, bool),
     Live(live::Live, LiveTiming),
     Moonshine(moonshine::Session<moonshine::Moonshine>),
 }
 impl Engine {
-    fn load(name: &str) -> anyhow::Result<Self> {
+    pub(crate) fn load(name: &str) -> anyhow::Result<Self> {
         Ok(match name {
             "nemotron" => Self::Live(
                 live::Live::load(
@@ -178,7 +178,7 @@ impl Engine {
             _ => Self::Batch(asr::Asr::load(&model::model_dir_checked()?)?, true),
         })
     }
-    fn decode(
+    pub(crate) fn decode(
         &mut self,
         segment: &segment::Segment,
         timestamps: bool,
@@ -242,7 +242,7 @@ impl Engine {
 /// Per-chunk timing of the Live (Nemotron) engine, reported as its real-time
 /// factor once the file is done (scripts/check-real-models.py reads it).
 #[derive(Default)]
-struct LiveTiming {
+pub(crate) struct LiveTiming {
     chunks: u128,
     total_ms: u128,
 }
@@ -502,12 +502,7 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
             .next()
             .with_context(|| format!("Could not decode {}", options.path))?;
         let done = decoded.is_none();
-        let samples = match (&mut resampler, decoded) {
-            (Some(r), Some(samples)) => r.push(&samples)?,
-            (Some(r), None) => r.finish()?,
-            (None, Some(samples)) => samples,
-            (None, None) => Vec::new(),
-        };
+        let samples = media::Audio::resample_packet(&mut resampler, decoded)?;
         total += samples.len() as u64;
         buffer.extend(samples);
         if feeder.is_none() && (options.segmented || buffer.len() > segment::MAX_SEGMENT_SAMPLES) {

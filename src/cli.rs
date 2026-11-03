@@ -26,10 +26,11 @@ pub(crate) fn command_usage(command: &str) -> Option<&'static str> {
         "transcribe" => {
             "Usage: dictate transcribe [--live | --fluid | --whisper | --moonshine] [--segmented] [--format txt|json|srt|vtt] [-o FILE | --output FILE] <path | ->\nFormats: WAV, MP3, AAC-LC/M4A, FLAC, OGG/Vorbis, audio in MP4/MOV/MKV/WebM. Opus is not supported. Stdin (-) is spooled to disk.\nLong files use pause segmentation; --segmented also segments short clips. Whisper/Live/Moonshine use segment timestamps. Output files are saved atomically; input cannot be overwritten."
         }
+        "serve" => crate::server::USAGE,
         "listen" => "Usage: dictate listen",
         "mics" => "Usage: dictate mics",
         "config" => {
-            "Usage: dictate config [list] [--json] | get <key> | set <key> <value> | path | values\nKeys: microphone, mode, model, inference-threads, unload-after, shortcut, sounds, notifications, gpu, autostart\nValues: see dictate config values; microphone: id or default; booleans: on/off/true/false; autostart: on/off"
+            "Usage: dictate config [list] [--json] | get <key> | set <key> <value> | path | values\nKeys: microphone, mode, model, inference-threads, unload-after, shortcut, sounds, notifications, gpu, autostart, server.* (see dictate serve --help and config list)\nValues: see dictate config values; microphone: id or default; booleans: on/off/true/false; autostart: on/off"
         }
         "log" => "Usage: dictate log [--open]",
         "daemon" => "Usage: dictate daemon [--background]",
@@ -83,9 +84,18 @@ pub(crate) fn parse(args: &[String]) -> Result<Action<'_>, UsageError> {
                 .as_slice()
             {
                 [] | ["list"] | ["--json"] | ["list", "--json"] | ["path"] | ["values"] => true,
-                ["get", key] => crate::config_cli::KEYS.contains(key),
+                ["get", key] => {
+                    crate::config_cli::KEYS.contains(key)
+                        || crate::server_settings::ServerSettings::KEYS.contains(key)
+                }
                 ["set", key, value] => {
-                    crate::config_cli::parse(key, value)?;
+                    if key.starts_with("server.") {
+                        crate::server_settings::ServerSettings::default()
+                            .set(key, value)
+                            .map_err(UsageError)?;
+                    } else {
+                        crate::config_cli::parse(key, value)?;
+                    }
                     true
                 }
                 _ => false,
@@ -105,6 +115,14 @@ pub(crate) fn parse(args: &[String]) -> Result<Action<'_>, UsageError> {
                 || rest.len() == 1 && (rest[0] == "--configure" || !rest[0].starts_with('-'))
         }
         // Benchmark owns its detailed option parser and reports UsageError itself.
+        "serve" => {
+            crate::server::parse_flags(
+                &mut crate::server_settings::ServerSettings::default(),
+                rest,
+            )
+            .map_err(UsageError)?;
+            true
+        }
         "benchmark" => true,
         _ => rest.is_empty(),
     };

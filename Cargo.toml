@@ -13,6 +13,10 @@ strip = true
 panic = "abort"
 
 [dependencies]
+tiny_http = "0.12"
+ring = "0.17"
+ctrlc = { version = "3.5", features = ["termination"] }
+
 anyhow = "1.0.104"
 cpal = "0.18.2"
 directories = "6.0.0"

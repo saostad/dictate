@@ -19,6 +19,7 @@ mod cue;
 mod daemon;
 mod fluid;
 mod hotkey;
+mod http_transport;
 mod live;
 mod media;
 mod mic;
@@ -29,6 +30,8 @@ mod moonshine;
 mod notify;
 mod segment;
 mod selection;
+mod server;
+mod server_settings;
 mod settings_ui;
 mod transcription;
 mod tray;
@@ -90,6 +93,7 @@ fn run() -> anyhow::Result<()> {
             Some("--moonshine") => model::download_moonshine(),
             _ => model::download(),
         },
+        "serve" => server::run(rest).map_err(anyhow::Error::msg),
         "listen" => listen(),
         "mics" => mics(),
         "config" => config_cli::run(rest),
@@ -290,7 +294,7 @@ pub(crate) fn is_app_bundle_executable(exe: &Path) -> bool {
 }
 
 fn usage() -> &'static str {
-    "Usage: dictate <command> [args]\n\nCommands:\n  download [--live | --fluid | --whisper | --moonshine]  Download the default speech model (about 660 MB), or only the model named by the flag\n  transcribe [ENGINE] [--format txt|json|srt|vtt] [-o FILE] <path | ->  Transcribe audio (see transcribe --help)\n  benchmark --engine <name> ...  Measure one local ASR engine and print raw JSON (see docs/model-benchmarks.md)\n  listen                 Record from the microphone and print the text\n  mics                   List the microphones and the selected one\n  daemon [--background]  Run the dictation daemon (keeps the model loaded)
+    "Usage: dictate <command> [args]\n\nCommands:\n  download [--live | --fluid | --whisper | --moonshine]  Download the default speech model (about 660 MB), or only the model named by the flag\n  transcribe [ENGINE] [--format txt|json|srt|vtt] [-o FILE] <path | ->  Transcribe audio (see transcribe --help)\n  benchmark --engine <name> ...  Measure one local ASR engine and print raw JSON (see docs/model-benchmarks.md)\n  serve [FLAGS]          Headless HTTP transcription API (see serve --help)\n  listen                 Record from the microphone and print the text\n  mics                   List the microphones and the selected one\n  daemon [--background]  Run the dictation daemon (keeps the model loaded)
   autostart on|off|status  Turn start-at-login on or off, or show the setting\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  config [list|get|set|path|values]  Read or change settings (see config --help)\n  log [--open]           Print or open the daemon log\n  settings               Open the Settings window via the daemon\n  shortcut <shortcut>    Set the daemon hotkey (Linux only)\n  help, --help, -h       Show this help\n  version, --version, -V  Show the version\n\nRun dictate <command> --help (or -h) for command usage.\n\nExit codes: 0 success, 2 usage error, 1 runtime failure."
 }
 

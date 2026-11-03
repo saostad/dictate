@@ -62,7 +62,14 @@ struct Evidence {
     failed: bool,
     no_device: bool,
 }
-thread_local! { static CAPTURE: RefCell<Option<Evidence>> = const { RefCell::new(None) }; }
+thread_local! {
+    static CAPTURE: RefCell<Option<Evidence>> = const { RefCell::new(None) };
+    static THREAD_DEVICE: RefCell<Option<WhisperDevice>> = const { RefCell::new(None) };
+}
+/// The HTTP worker's own engine evidence, unaffected by other workers loading.
+pub(crate) fn last_for_thread() -> Option<WhisperDevice> {
+    THREAD_DEVICE.with(|device| device.borrow().clone())
+}
 static LAST: Mutex<Option<WhisperDevice>> = Mutex::new(None);
 static DAEMON: AtomicBool = AtomicBool::new(false);
 static WARNED: AtomicBool = AtomicBool::new(false);
@@ -225,6 +232,7 @@ pub(crate) fn finish(enabled: bool, report_load: bool) {
             &format!("{line}. Settings > General shows the last Whisper device."),
         );
     }
+    THREAD_DEVICE.with(|last| *last.borrow_mut() = Some(device.clone()));
     *LAST.lock().expect("Whisper device lock poisoned") = Some(device);
 }
 

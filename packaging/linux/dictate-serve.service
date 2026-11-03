@@ -1,0 +1,14 @@
+[Unit]
+Description=Dictate headless HTTP transcription API
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/dictate serve
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=default.target

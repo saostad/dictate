@@ -1022,6 +1022,17 @@ fn download_file_inner(
     Ok(())
 }
 
+/// Pinned download sizes for the HTTP catalog; unknown legacy sizes are zero.
+pub(crate) fn download_size(engine: &str) -> u64 {
+    match engine {
+        "whisper" => WHISPER_FILE_SIZE,
+        "fluid" => FLUID_FILES.iter().map(|(_, size)| size).sum(),
+        "nemotron" => LIVE_FILES.iter().map(|(_, size)| size).sum(),
+        "moonshine" => MOONSHINE_FILES.iter().map(|(_, size, _)| size).sum(),
+        _ => 0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

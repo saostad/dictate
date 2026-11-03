@@ -115,6 +115,9 @@ pub(crate) fn edit(settings: &mut Settings, action: &PageAction) -> anyhow::Resu
 }
 
 pub(crate) fn file_value(settings: &Settings, key: &str) -> anyhow::Result<String> {
+    if key.starts_with("server.") {
+        return settings.server.value(key).map_err(anyhow::Error::msg);
+    }
     Ok(match key {
         "microphone" => {
             if settings.microphone.is_empty() {
@@ -203,6 +206,13 @@ fn effective(settings: &Settings, key: &str) -> anyhow::Result<(String, Vec<Stri
 }
 
 pub(crate) fn print_values() {
+    let server = crate::server_settings::ServerSettings::default();
+    for key in crate::server_settings::ServerSettings::KEYS {
+        println!(
+            "{key}: default {} (see dictate serve --help)",
+            server.value(key).expect("server key")
+        );
+    }
     use crate::settings_ui::page::{INFERENCE_THREAD_OPTIONS, MODE_OPTIONS, SPEECH_MODEL_OPTIONS};
     println!(
         "mode: {}",
@@ -255,6 +265,28 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
         );
         return Ok(());
     }
+    if args.get(1).is_some_and(|key| key.starts_with("server.")) {
+        let (mut settings, problem) = config::load();
+        if let Some(problem) = problem {
+            anyhow::bail!("{problem}");
+        }
+        if args[0] == "set" {
+            settings
+                .server
+                .set(&args[1], &args[2])
+                .map_err(crate::cli::UsageError)?;
+            config::save(&settings)?;
+        } else {
+            println!(
+                "{}",
+                settings
+                    .server
+                    .value(&args[1])
+                    .map_err(anyhow::Error::msg)?
+            );
+        }
+        return Ok(());
+    }
     if args.first().is_some_and(|arg| arg == "set") {
         let action = parse(&args[1], &args[2])?;
         #[cfg(unix)]
@@ -302,7 +334,10 @@ pub(crate) fn run(args: &[String]) -> anyhow::Result<()> {
         return Ok(());
     }
     let mut json = serde_json::Map::new();
-    for key in KEYS {
+    for key in KEYS
+        .iter()
+        .chain(crate::server_settings::ServerSettings::KEYS.iter())
+    {
         let file = file_value(&settings, key)?;
         let (value, overrides) = effective(&settings, key)?;
         if args.iter().any(|arg| arg == "--json") {
