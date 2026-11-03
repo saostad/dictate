@@ -1,6 +1,6 @@
 # Build whisper.cpp (through whisper-rs-sys) for the x86_64 baseline rather
 # than this build machine's CPU. GGML_NATIVE=OFF alone is not enough: ggml
-# still enables AVX/AVX2/FMA/F16C by default on x86_64, which SIGILLs on
+# still enables AVX/AVX2/FMA/F16C/BMI2 by default on x86_64, which SIGILLs on
 # Sandy Bridge and earlier CPUs. whisper-rs-sys forwards every GGML_* / CMAKE_*
 # / WHISPER_* environment variable to CMake as a cache definition.
 #
@@ -17,3 +17,4 @@ GGML_AVX2 = "OFF"
 GGML_AVX512 = "OFF"
 GGML_FMA = "OFF"
 GGML_F16C = "OFF"
+GGML_BMI2 = "OFF"
