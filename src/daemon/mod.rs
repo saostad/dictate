@@ -1973,6 +1973,7 @@ impl DaemonApp {
             return;
         };
         let progress = lock_progress(&self.switch_progress).clone();
+        let dictionary = crate::dictionary::current();
         let view = crate::settings_ui::page::PageView {
             settings: &self.settings,
             mics: &self.mics,
@@ -1993,6 +1994,7 @@ impl DaemonApp {
             autostart_on: self.autostart_cache,
             autostart_error: self.autostart_error.as_deref(),
             shortcut_error: self.last_shortcut_error.as_deref(),
+            dictionary: &dictionary,
             version: env!("CARGO_PKG_VERSION"),
         };
         let mut actions = Vec::new();
@@ -2166,6 +2168,7 @@ impl DaemonApp {
             PageAction::SetAutostart(on) => self.apply_autostart(on),
             PageAction::OpenLog => self.open_daemon_log(),
             PageAction::OpenReleases => self.open_releases(),
+            PageAction::EditDictionary => self.edit_dictionary(),
         }
     }
 
@@ -2201,6 +2204,19 @@ impl DaemonApp {
     fn open_daemon_log(&self) {
         let result =
             daemon_log_path().and_then(|path| crate::tray::open_target(&path.to_string_lossy()));
+        if let Err(err) = result {
+            let message = format!("{err:#}");
+            dlog!("error: {message}");
+            crate::notify::show(crate::notify::Kind::Error, "dictate", &message);
+        }
+    }
+
+    /// Open `dictionary.txt` in the default app, creating it first.
+    fn edit_dictionary(&self) {
+        let result = crate::dictionary::path().and_then(|path| {
+            crate::dictionary::ensure_file(&path)?;
+            crate::tray::open_target(&path.to_string_lossy())
+        });
         if let Err(err) = result {
             let message = format!("{err:#}");
             dlog!("error: {message}");

@@ -39,7 +39,11 @@ impl Typer {
         })
     }
 
+    /// Type `text` into the focused window after applying the custom
+    /// dictionary (see [`crate::dictionary`]).
     pub(crate) fn type_text(&mut self, text: &str) -> anyhow::Result<()> {
+        let replaced = crate::dictionary::for_typing(text);
+        let text = replaced.as_str();
         #[cfg(target_os = "linux")]
         if let Some(typer) = &mut self.wayland {
             return typer.type_text(text);

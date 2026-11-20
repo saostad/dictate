@@ -17,6 +17,7 @@ mod config;
 mod config_cli;
 mod cue;
 mod daemon;
+mod dictionary;
 mod fluid;
 mod hotkey;
 mod http_transport;
@@ -54,6 +55,48 @@ fn main() -> anyhow::Result<()> {
         }
         eprintln!("error: {err:#}");
         std::process::exit(1);
+    }
+    Ok(())
+}
+
+/// `dictate dictionary ...`: list, locate, edit or change replacement rules.
+fn dictionary_cmd(rest: &[String]) -> anyhow::Result<()> {
+    let path = dictionary::path()?;
+    let args: Vec<&str> = rest.iter().map(String::as_str).collect();
+    match args.as_slice() {
+        ["path"] => println!("{}", path.display()),
+        ["edit"] => {
+            dictionary::ensure_file(&path)?;
+            println!("{}", path.display());
+            tray::open_target(&path.to_string_lossy())?;
+        }
+        ["add", from, to] => {
+            dictionary::add(&path, from, to)?;
+            println!("ok {} -> {}", from.trim(), to.trim());
+        }
+        ["remove", from] => match dictionary::remove(&path, from)? {
+            0 => anyhow::bail!("No rule for \"{}\" in {}", from.trim(), path.display()),
+            _ => println!("ok removed {}", from.trim()),
+        },
+        _ => {
+            let (dict, errors) = dictionary::read(&path)?;
+            for rule in dict.rules() {
+                println!("{} -> {}", rule.from, rule.to);
+            }
+            if dict.len() == 0 {
+                eprintln!("No rules yet. Add one: dictate dictionary add \"heard\" \"written\"");
+            }
+            if !errors.is_empty() {
+                for error in &errors {
+                    eprintln!("error: {error}");
+                }
+                anyhow::bail!(
+                    "{} invalid rule(s) in {} are skipped",
+                    errors.len(),
+                    path.display()
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -106,6 +149,7 @@ fn run() -> anyhow::Result<()> {
             }
             Ok(())
         }
+        "dictionary" => dictionary_cmd(rest),
         "autostart" => autostart_cmd(&rest[0]),
         "daemon" => run_daemon(!rest.is_empty()),
         "toggle" | "start" | "stop" | "cancel" | "status" | "settings" => run_client(command),
@@ -296,7 +340,7 @@ pub(crate) fn is_app_bundle_executable(exe: &Path) -> bool {
 
 fn usage() -> &'static str {
     "Usage: dictate <command> [args]\n\nCommands:\n  download [--live | --fluid | --fluid-pro | --whisper | --moonshine]  Download the default speech model (about 660 MB), or only the model named by the flag\n  transcribe [ENGINE] [--format txt|json|srt|vtt] [-o FILE] <path | ->  Transcribe audio (see transcribe --help)\n  benchmark --engine <name> ...  Measure one local ASR engine and print raw JSON (see docs/model-benchmarks.md)\n  serve [FLAGS]          Headless HTTP transcription API (see serve --help)\n  listen                 Record from the microphone and print the text\n  mics                   List the microphones and the selected one\n  daemon [--background]  Run the dictation daemon (keeps the model loaded)
-  autostart on|off|status  Turn start-at-login on or off, or show the setting\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  config [list|get|set|path|values]  Read or change settings (see config --help)\n  log [--open]           Print or open the daemon log\n  settings               Open the Settings window via the daemon\n  shortcut <shortcut>    Set the daemon hotkey (Linux only)\n  help, --help, -h       Show this help\n  version, --version, -V  Show the version\n\nRun dictate <command> --help (or -h) for command usage.\n\nExit codes: 0 success, 2 usage error, 1 runtime failure."
+  autostart on|off|status  Turn start-at-login on or off, or show the setting\n  toggle                 Start/stop recording via the daemon\n  start                  Start recording via the daemon\n  stop                   Stop recording and transcribe via the daemon\n  cancel                 Discard the recording via the daemon\n  status                 Show whether the daemon is recording\n  config [list|get|set|path|values]  Read or change settings (see config --help)\n  log [--open]           Print or open the daemon log\n  dictionary [list|path|edit|add|remove]  Word replacements applied before typing (see dictionary --help)\n  settings               Open the Settings window via the daemon\n  shortcut <shortcut>    Set the daemon hotkey (Linux only)\n  help, --help, -h       Show this help\n  version, --version, -V  Show the version\n\nRun dictate <command> --help (or -h) for command usage.\n\nExit codes: 0 success, 2 usage error, 1 runtime failure."
 }
 
 #[cfg(test)]

@@ -340,6 +340,8 @@ restarting the daemon:
   Hyprland setup checks conflicts and backs up the user config; other
   Wayland desktops confirm the actual binding through their portal.
 - **General**: start at login, sound cues, notifications.
+- **Dictionary**: shows how many word replacements are active and opens
+  `dictionary.txt` for editing (see [Custom dictionary](#custom-dictionary)).
 - **About**: version, open the log, check for updates.
 
 ### Settings from the command line
@@ -362,6 +364,7 @@ restarting the daemon:
 | Use GPU | `dictate config set gpu on` / `off` (applies the next time a model loads) |
 | Start at login | `dictate config set autostart on` / `off` (also `dictate autostart on\|off\|status`) |
 | Open log | `dictate log --open` (`dictate log` prints its path) |
+| Dictionary | `dictate dictionary add "heard" "written"`, `remove "heard"`, `list`, `edit`, `path` |
 | Check for updates | `dictate version` prints the version and releases URL; `dictate --version` prints only the version |
 
 `dictate config` (or `config list`) prints every setting, with file values and
@@ -519,6 +522,42 @@ To compare engines on the same local audio, see the reproducible
 errors, speed, memory, and streaming latency, and saves the raw transcripts.
 The [2026-10-22 comparison on an i7-6700HQ](docs/benchmarks/2026-10-22/README.md)
 includes the original five engines and 14 thread configurations.
+
+## Custom dictionary
+
+Fix names, acronyms and project terms that the speech model keeps getting
+wrong. Every model uses the same rules, and they apply just before the text is
+typed, so no extra model runs. Add a rule from the command line:
+
+```bash
+dictate dictionary add "cooper netties" Kubernetes
+dictate dictionary add "post gress" PostgreSQL
+dictate dictionary                 # list the rules
+dictate dictionary remove "post gress"
+```
+
+Or press **Edit dictionary** in Settings (or run `dictate dictionary edit`) to
+open `dictionary.txt`, next to `config.toml`. It has one rule per line,
+`heard -> written`, and lines starting with `#` are comments:
+
+```text
+cooper netties -> Kubernetes
+jason -> JSON
+um ->
+```
+
+- Matching ignores case and replaces whole words only: `jason` does not change
+  "jasonette". Phrases match across any spacing.
+- The replacement is typed exactly as written. An empty replacement deletes
+  the phrase.
+- When rules overlap, the longest one wins.
+- Changes apply to the next dictation after you save the file; the daemon does
+  not need a restart.
+- Invalid lines are skipped. A notification and the Settings page name the
+  first one, and `dictate dictionary` lists them all and exits with status 1.
+- In Type at pauses and Live modes, each piece is replaced as it is typed, so
+  a phrase split across two pieces is not replaced.
+- `dictate transcribe` and the HTTP API return the model's text unchanged.
 
 ## Advanced: where settings are stored
 

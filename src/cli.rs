@@ -35,6 +35,9 @@ pub(crate) fn command_usage(command: &str) -> Option<&'static str> {
             "Usage: dictate config [list] [--json] | get <key> | set <key> <value> | path | values\nKeys: microphone, mode, model, inference-threads, unload-after, shortcut, sounds, notifications, gpu, autostart, server.* (see dictate serve --help and config list)\nValues: see dictate config values; microphone: id or default; booleans: on/off/true/false; autostart: on/off"
         }
         "log" => "Usage: dictate log [--open]",
+        "dictionary" => {
+            "Usage: dictate dictionary [list] | path | edit | add <heard> <written> | remove <heard>\nReplaces whole words, ignoring case, in dictated text before it is typed. Quote phrases with spaces: dictate dictionary add \"cooper netties\" Kubernetes"
+        }
         "daemon" => "Usage: dictate daemon [--background]",
         "autostart" => "Usage: dictate autostart on|off|status",
         "toggle" => "Usage: dictate toggle",
@@ -107,6 +110,13 @@ pub(crate) fn parse(args: &[String]) -> Result<Action<'_>, UsageError> {
             }
         }
         "log" => rest.is_empty() || rest == ["--open"],
+        "dictionary" => matches!(
+            rest.iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+                .as_slice(),
+            [] | ["list"] | ["path"] | ["edit"] | ["add", _, _] | ["remove", _]
+        ),
         "download" => rest.is_empty() || (rest.len() == 1 && model_flag(&rest[0])),
         "transcribe" => {
             crate::transcription::Options::parse(rest)?;
@@ -156,6 +166,7 @@ mod tests {
             "transcribe",
             "listen",
             "mics",
+            "dictionary",
             "daemon",
             "autostart",
             "toggle",
@@ -178,6 +189,28 @@ mod tests {
             }
         }
         assert_eq!(parse(&[]).unwrap(), Action::NoArgs);
+    }
+
+    #[test]
+    fn dictionary_accepts_only_its_subcommands() {
+        for ok in [
+            vec!["dictionary"],
+            vec!["dictionary", "list"],
+            vec!["dictionary", "path"],
+            vec!["dictionary", "edit"],
+            vec!["dictionary", "add", "post gress", "PostgreSQL"],
+            vec!["dictionary", "remove", "post gress"],
+        ] {
+            assert!(parse(&args(&ok)).is_ok(), "{ok:?}");
+        }
+        for bad in [
+            vec!["dictionary", "add", "only-one"],
+            vec!["dictionary", "remove"],
+            vec!["dictionary", "bogus"],
+            vec!["dictionary", "list", "extra"],
+        ] {
+            assert!(parse(&args(&bad)).is_err(), "{bad:?}");
+        }
     }
 
     #[test]

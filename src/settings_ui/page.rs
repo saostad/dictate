@@ -105,6 +105,7 @@ pub(crate) enum PageAction {
     SetAutostart(bool),
     OpenLog,
     OpenReleases,
+    EditDictionary,
 }
 
 /// Everything the page renders, borrowed from daemon state.
@@ -134,6 +135,8 @@ pub(crate) struct PageView<'a> {
     pub shortcut_error: Option<&'a str>,
     pub shortcut_status: Option<&'a str>,
     pub shortcut_busy: bool,
+    /// Rule count and any problem with `dictionary.txt`.
+    pub dictionary: &'a crate::dictionary::Status,
     pub version: &'static str,
 }
 
@@ -494,6 +497,8 @@ pub(crate) fn show_page(
                 shortcut_section(ui, view, &mut actions, capture);
                 section_gap(ui);
                 general_section(ui, view, &mut actions);
+                section_gap(ui);
+                dictionary_section(ui, view, &mut actions);
                 section_gap(ui);
                 about_section(ui, view, &mut actions);
             });
@@ -1156,6 +1161,25 @@ fn general_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAct
     }
 }
 
+fn dictionary_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
+    heading(ui, "Dictionary");
+    ui.horizontal(|ui| {
+        ui.label(match view.dictionary.dictionary.len() {
+            0 => "No replacements".to_string(),
+            1 => "1 replacement".to_string(),
+            n => format!("{n} replacements"),
+        });
+        if ui.button("Edit dictionary").clicked() {
+            actions.push(PageAction::EditDictionary);
+        }
+    });
+    explain(
+        ui,
+        "Fix names and terms the model gets wrong. One rule per line, like \"cooper netties -> Kubernetes\". Whole words, any case. Applies to the next dictation after you save the file.",
+    );
+    inline_error(ui, view.dictionary.problem.as_deref());
+}
+
 fn about_section(ui: &mut egui::Ui, view: &PageView, actions: &mut Vec<PageAction>) {
     heading(ui, "About");
     ui.label(format!("Dictate {}", view.version));
@@ -1198,6 +1222,7 @@ mod tests {
             shortcut_error: None,
             shortcut_status: None,
             shortcut_busy: false,
+            dictionary: &Default::default(),
             version: "test",
         };
         for (label, expected) in [
