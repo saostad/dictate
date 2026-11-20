@@ -11,7 +11,9 @@
 set -eu
 
 dir="${1:?usage: check-baseline-isa.sh <cargo profile dir, e.g. target/x86_64-unknown-linux-gnu/release>}"
-libs="$(find "$dir/build" -path '*whisper-rs-sys-*/out/lib/*' -name '*.a' | sort)"
+# Cargo before 1.100 uses build/whisper-rs-sys-<hash>/out; 1.100 and later use
+# build/whisper-rs-sys/<hash>/out. Match both.
+libs="$(find "$dir/build" \( -path '*/whisper-rs-sys-*/out/lib/*' -o -path '*/whisper-rs-sys/*/out/lib/*' \) -name '*.a' | sort)"
 [ -n "$libs" ] || { echo "FAIL: no whisper-rs-sys static libraries under $dir/build"; exit 1; }
 
 # VEX/EVEX (AVX, AVX2, FMA, F16C, AVX-512: every mnemonic starts with v) and

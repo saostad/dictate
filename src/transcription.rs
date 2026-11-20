@@ -79,18 +79,19 @@ fn same_file(input: &str, output: &Path) -> anyhow::Result<bool> {
         return Ok(false);
     }
     let input = Path::new(input);
-    if input.canonicalize()? == output.canonicalize()? {
-        return Ok(true);
-    }
+    let same_path = input.canonicalize()? == output.canonicalize()?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        if same_path {
+            return Ok(true);
+        }
         let a = input.metadata()?;
         let b = output.metadata()?;
         Ok(a.dev() == b.dev() && a.ino() == b.ino())
     }
     #[cfg(not(unix))]
-    Ok(false)
+    Ok(same_path)
 }
 
 struct Output {
