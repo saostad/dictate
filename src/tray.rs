@@ -221,7 +221,7 @@ pub(crate) const MODE_MENU: [(DictationMode, &str, &str); 3] = [
     ),
     (DictationMode::Live, "dictate-mode-live", "Live"),
 ];
-pub(crate) const MODEL_MENU: [(ModelChoice, &str, &str); 5] = [
+pub(crate) const MODEL_MENU: [(ModelChoice, &str, &str); 6] = [
     (
         ModelChoice::Parakeet,
         "dictate-model-standard",
@@ -246,6 +246,11 @@ pub(crate) const MODEL_MENU: [(ModelChoice, &str, &str); 5] = [
         ModelChoice::Moonshine,
         "dictate-model-moonshine",
         ModelChoice::Moonshine.display_name(),
+    ),
+    (
+        ModelChoice::FluidPro,
+        "dictate-model-fluid-pro",
+        ModelChoice::FluidPro.display_name(),
     ),
 ];
 pub(crate) const THREADS_MENU: [(InferenceThreads, &str, &str); 3] = [

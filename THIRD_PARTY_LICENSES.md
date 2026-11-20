@@ -60,6 +60,12 @@ MIT-licensed whisper.cpp above).
 
 ## Downloaded models and runtimes
 
+### Fluid Speech Pro INT8 ONNX
+
+- Attribution: Fluid Speech Pro by FluidVoice. Built on NVIDIA Parakeet TDT 0.6B v3 and Moondream Parakeet Ultra.
+- License: CC BY 4.0. [Upstream license](https://huggingface.co/FluidVoice-Labs/fluid-speech-pro-onnx/blob/fa588e9f87f1b9ad0ca2e2d8f7eaf84dc3803581/LICENSE) and [notice](https://huggingface.co/FluidVoice-Labs/fluid-speech-pro-onnx/blob/fa588e9f87f1b9ad0ca2e2d8f7eaf84dc3803581/NOTICE).
+- [Pinned export](https://huggingface.co/FluidVoice-Labs/fluid-speech-pro-onnx/tree/fa588e9f87f1b9ad0ca2e2d8f7eaf84dc3803581) downloads with `dictate download --fluid-pro`.
+
 ### Whisper Tiny English
 
 - File: `ggml-tiny.en-q8_0.bin` (Q8_0 quantization)

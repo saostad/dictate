@@ -47,7 +47,7 @@ pub(crate) const MODE_OPTIONS: [(Mode, &str, &str); 3] = [
 ];
 
 /// All speech models offered on the page, with a radio label and choice guidance.
-pub(crate) const SPEECH_MODEL_OPTIONS: [(SpeechModel, &str, &str); 5] = [
+pub(crate) const SPEECH_MODEL_OPTIONS: [(SpeechModel, &str, &str); 6] = [
     (
         SpeechModel::Parakeet,
         SpeechModel::Parakeet.display_name(),
@@ -72,6 +72,11 @@ pub(crate) const SPEECH_MODEL_OPTIONS: [(SpeechModel, &str, &str); 5] = [
         SpeechModel::Moonshine,
         SpeechModel::Moonshine.display_name(),
         "Low-memory live dictation on Linux; faster final text, but lower accuracy.",
+    ),
+    (
+        SpeechModel::FluidPro,
+        SpeechModel::FluidPro.display_name(),
+        "Automatically detects 25 European languages in Whole and Pauses modes.",
     ),
 ];
 
@@ -1285,7 +1290,8 @@ mod tests {
                 SpeechModel::Fluid,
                 SpeechModel::Whisper,
                 SpeechModel::Nemotron,
-                SpeechModel::Moonshine
+                SpeechModel::Moonshine,
+                SpeechModel::FluidPro,
             ]
         );
         assert_eq!(SPEECH_MODEL_OPTIONS[0].1, "Parakeet TDT 0.6B v2");

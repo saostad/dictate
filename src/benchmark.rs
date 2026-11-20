@@ -50,13 +50,13 @@ const LONG_JFK_REPEATS: usize = 4;
 const LONG_JFK_GAP_SAMPLES: usize = SAMPLE_RATE as usize / 4; // 0.25 s
 
 pub(crate) const USAGE: &str = "\
-Usage: dictate benchmark --engine <standard|fluid|whisper|live|moonshine> [options]
+Usage: dictate benchmark --engine <standard|fluid|fluid-pro|whisper|live|moonshine> [options]
 
 One process measures one engine and one thread setting, loading the model once.
 JSON goes to stdout; progress and diagnostics go to stderr.
 
 Options:
-  --engine <name>       standard, fluid, whisper, live, or moonshine (required)
+  --engine <name>       standard, fluid, fluid-pro, whisper, live, or moonshine (required)
   --threads <setting>   default, 1, 2; moonshine also accepts runtime-default.
                         Moonshine has no exact 2-thread API.
   --corpus <manifest>   portable corpus manifest (default tests/fixtures/benchmark-corpus.json)
@@ -76,6 +76,7 @@ command nor the orchestration script downloads models or corpus audio.";
 enum Engine {
     Standard,
     Fluid,
+    FluidPro,
     Whisper,
     Live,
     Moonshine,
@@ -86,6 +87,7 @@ impl Engine {
         match value {
             "standard" => Some(Self::Standard),
             "fluid" => Some(Self::Fluid),
+            "fluid-pro" => Some(Self::FluidPro),
             "whisper" => Some(Self::Whisper),
             "live" => Some(Self::Live),
             "moonshine" => Some(Self::Moonshine),
@@ -97,6 +99,7 @@ impl Engine {
         match self {
             Self::Standard => "standard",
             Self::Fluid => "fluid",
+            Self::FluidPro => "fluid-pro",
             Self::Whisper => "whisper",
             Self::Live => "live",
             Self::Moonshine => "moonshine",
@@ -107,6 +110,7 @@ impl Engine {
         match self {
             Self::Standard => "Parakeet TDT 0.6B v2 int8",
             Self::Fluid => "Fluid Speech Mini int8",
+            Self::FluidPro => "Fluid Speech Pro int8",
             Self::Whisper => "Whisper Tiny English Q8_0 (whisper.cpp)",
             Self::Live => "Nemotron streaming en 0.6B int8",
             Self::Moonshine => "Moonshine Tiny Streaming (native C)",
@@ -282,8 +286,9 @@ fn parse_args(args: &[String]) -> anyhow::Result<Options> {
         index += 1;
     }
 
-    let engine =
-        engine.context("missing --engine; choose standard, fluid, whisper, live or moonshine")?;
+    let engine = engine.context(
+        "missing --engine; choose standard, fluid, fluid-pro, whisper, live or moonshine",
+    )?;
     if quick {
         runs = 1;
         paced_runs = 1;
@@ -355,7 +360,7 @@ fn apply_model_root(root: &Path) -> anyhow::Result<()> {
 
 fn resolve_threads(engine: Engine, choice: ThreadChoice) -> anyhow::Result<ThreadInfo> {
     match engine {
-        Engine::Standard | Engine::Fluid | Engine::Live => {
+        Engine::Standard | Engine::Fluid | Engine::FluidPro | Engine::Live => {
             let effective = match choice {
                 ThreadChoice::Default => asr::intra_threads(),
                 ThreadChoice::One => 1,
@@ -427,7 +432,7 @@ fn execute(options: &Options) -> anyhow::Result<Value> {
     let preloaded = preload_audio(options)?;
     let threads = resolve_threads(options.engine, options.threads)?;
     match options.engine {
-        Engine::Standard | Engine::Fluid | Engine::Whisper => {
+        Engine::Standard | Engine::Fluid | Engine::FluidPro | Engine::Whisper => {
             benchmark_asr(options, &threads, &preloaded)
         }
         Engine::Live => benchmark_live(options, &threads, &preloaded),
@@ -789,6 +794,7 @@ fn engine_dirs(engine: Engine) -> anyhow::Result<(PathBuf, Vec<PathBuf>)> {
     let dir = match engine {
         Engine::Standard => model::model_dir_checked()?,
         Engine::Fluid => model::fluid_model_dir_checked()?,
+        Engine::FluidPro => model::fluid_pro_model_dir_checked()?,
         Engine::Whisper => model::whisper_model_dir_checked()?,
         Engine::Live => model::live_model_dir_checked()?,
         Engine::Moonshine => {
@@ -955,6 +961,7 @@ fn benchmark_asr(
     let mut asr = match options.engine {
         Engine::Standard => Asr::load_with_threads(&dir, threads.effective.unwrap_or(1))?,
         Engine::Fluid => Asr::load_fluid_with_threads(&dir, threads.effective.unwrap_or(1))?,
+        Engine::FluidPro => Asr::load_with_threads(&dir, threads.effective.unwrap_or(1))?,
         Engine::Whisper => Asr::load_whisper_with_threads(&dir, threads.effective.unwrap_or(1))?,
         _ => unreachable!("benchmark_asr only handles Whole/Pauses engines"),
     };

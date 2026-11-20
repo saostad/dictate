@@ -3,9 +3,10 @@
 Superwhisper-like voice typing in Rust: press a hotkey, speak, release,
 and the text is typed into the focused input. No Tauri, webview or Electron.
 
-Choose from five local speech models: **Parakeet TDT 0.6B v2**, **Fluid
-Speech Mini**, **Whisper Tiny English**, **Nemotron** for Live mode, and
-**Moonshine Tiny Streaming** for phrase-by-phrase dictation (Linux only).
+Choose from six local speech models: **Parakeet TDT 0.6B v2**, **Fluid
+Speech Mini**, **Fluid Speech Pro**, **Whisper Tiny English**, **Nemotron** for
+Live mode, and **Moonshine Tiny Streaming** for phrase-by-phrase dictation
+(Linux only).
 Settings explains which to choose for speed, accuracy, or a weaker computer.
 After the models are downloaded, transcription runs entirely on your machine;
 audio and text are not sent to a remote inference service.
@@ -177,11 +178,13 @@ dictate --help                   # also -h or help
 dictate transcribe --help         # every command accepts --help or -h
 dictate download                  # default NVIDIA Parakeet model
 dictate download --fluid          # Parakeet + optional Fluid Speech Mini
+dictate download --fluid-pro      # Fluid Speech Pro INT8 + pause detector
 dictate download --live           # Parakeet + optional Nemotron streaming model
 dictate download --whisper        # optional Whisper Tiny English
 dictate download --moonshine      # optional Moonshine streaming runtime/model
 dictate transcribe x.wav
 dictate transcribe --fluid x.wav
+dictate transcribe --fluid-pro x.wav
 dictate transcribe --whisper x.wav
 dictate transcribe --live x.wav
 dictate transcribe --moonshine x.wav
@@ -198,6 +201,7 @@ launches print usage to stderr and exit 2 (launching the macOS app runs the daem
 
 `download --whisper` fetches Whisper and the pause detector without Parakeet;
 `download --moonshine` fetches its own model and runtime without Parakeet.
+Like Whisper, `download --fluid-pro` fetches its model and the pause detector.
 The `--fluid` and `--live` download commands also fetch the default Parakeet
 model and pause detector if missing. Downloads need a network connection;
 transcription uses the local files.
@@ -238,8 +242,8 @@ decoded audio is bounded regardless of recording length.
 JSON contains `file`, `engine`, `duration_s`, `segments` and combined `text`.
 Segments have `start`, `end`, `text`, and `words` when available (each word has
 `start`, `end`, `text`). All times are seconds relative to the input file.
-Parakeet and Fluid provide word timestamps; Whisper, Nemotron and Moonshine
-use audio segment boundaries and report that timestamp fallback on stderr.
+Parakeet and both Fluid models provide word timestamps. Whisper, Nemotron and
+Moonshine use audio segment boundaries and report that timestamp fallback on stderr.
 SRT/VTT contain one cue per recognized segment. Engine flags override the
 configured model for that invocation only.
 
@@ -322,8 +326,8 @@ restarting the daemon:
 
 - **Microphone**: pick the microphone (or the system default) and see which
   one the last recording used.
-- **Speech model**: Parakeet TDT 0.6B v2, Fluid Speech Mini, Whisper Tiny
-  English, Nemotron Streaming, or Moonshine Tiny Streaming. Each choice has a
+- **Speech model**: Parakeet TDT 0.6B v2, Fluid Speech Mini, Fluid Speech Pro,
+  Whisper Tiny English, Nemotron Streaming, or Moonshine Tiny Streaming. Each has a
   short explanation of its speed, accuracy, and memory trade-offs.
 - **Dictation mode**: Whole recording, Type at pauses, or Live. Unsupported
   modes are disabled for the selected model. Choosing a different model
@@ -399,26 +403,26 @@ on its next start. The Settings window has a checkbox for this too
 
 | Mode | Setting | Compatible models | What happens |
 |---|---|---|---|
-| Whole recording (default) | `mode = "whole"` | Parakeet, Fluid, Whisper | types once at stop; useful for accuracy and slower computers |
-| Type at pauses | `mode = "pauses"` | Parakeet, Fluid, Whisper | types completed pause segments; Whisper's extra context decoding adds delay |
+| Whole recording (default) | `mode = "whole"` | Parakeet, Fluid Mini, Fluid Pro, Whisper | types once at stop; useful for accuracy and slower computers |
+| Type at pauses | `mode = "pauses"` | Parakeet, Fluid Mini, Fluid Pro, Whisper | types completed pause segments; Whisper's extra context decoding adds delay |
 | Live | `mode = "live"` | Nemotron, Moonshine | types while speaking; Nemotron commits text sooner in our test, Moonshine commits completed phrases with less memory |
 
 Choose the **speech model** first in Settings or the tray, then choose a
-supported dictation mode. All five models are in the same model list; model
+supported dictation mode. All six models are in the same model list; model
 names do not appear as dictation modes. Switching between compatible Whole
 and Pauses modes reuses the loaded model. Switching engines loads on a
 background thread, downloading missing files first. Changes are refused
 while recording, transcribing, or loading another model.
 
-Selecting Nemotron or Moonshine switches to Live. Selecting Parakeet, Fluid,
-or Whisper from Live switches to Whole recording; switching between those
-three batch models preserves Whole or Pauses. A failed download, model load,
+Selecting Nemotron or Moonshine switches to Live. Selecting Parakeet, either
+Fluid model, or Whisper from Live switches to Whole recording. Switching among
+these batch models preserves Whole or Pauses. A failed download, model load,
 or Nemotron speed check keeps the previous complete selection.
 
 Pauses mode finds pauses with the Silero voice detector, which
 `dictate download` fetches (2.3 MB). Cancel can't un-type pieces already
-typed. Parakeet, Fluid and Whisper decode each piece after the first with up
-to 1.5 s of the audio before it, so a word at a cut is occasionally misheard.
+typed. Parakeet, both Fluid models and Whisper decode each piece after the
+first with up to 1.5 s of the audio before it, so a word at a cut is occasionally misheard.
 Whisper removes the repeated context with whisper.cpp's token timestamps.
 Decoding a natural-pause piece alone is cheaper but changed real words on the
 reference clip, so that shortcut is not used. The first piece has no context
@@ -467,13 +471,14 @@ restarts.
 
 ## Speech model
 
-Pick one of five speech models in Settings or the tray under **Speech
+Pick one of six speech models in Settings or the tray under **Speech
 model**. The compatible modes and trade-offs are:
 
 | Speech model | Modes | Download | When to choose it |
 |---|---|---|---|
 | Parakeet TDT 0.6B v2 (default) | Whole / Pauses | about 660 MB | fastest transcription and best measured accuracy; higher memory use and an AVX2 CPU required with the bundled runtime |
 | Fluid Speech Mini | Whole / Pauses | about 300 MB extra | good measured accuracy with less RAM than Parakeet; slower in our test |
+| Fluid Speech Pro | Whole / Pauses | about 801 MB | automatic detection across 25 European languages, including English |
 | Whisper Tiny English | Whole / Pauses | about 42 MB | older CPUs or low RAM; fastest loading, with lower accuracy; Whole avoids its Pauses delay |
 | Nemotron Streaming | Live | about 900 MB extra | accurate streaming text on a fast computer with more RAM |
 | Moonshine Tiny Streaming | Live | about 62 MB including runtime | low-memory streaming and short finalization delay, with lower measured accuracy; Linux only |
@@ -509,11 +514,11 @@ because it changed words on the reference clip. Measured timings and limits
 are in
 [docs/stt-implementation-2026-10-22.md](docs/stt-implementation-2026-10-22.md).
 
-To compare all five engines on the same local audio, see the reproducible
+To compare engines on the same local audio, see the reproducible
 [model benchmark guide](docs/model-benchmarks.md). It measures transcription
 errors, speed, memory, and streaming latency, and saves the raw transcripts.
 The [2026-10-22 comparison on an i7-6700HQ](docs/benchmarks/2026-10-22/README.md)
-includes all five engines and 14 thread configurations.
+includes the original five engines and 14 thread configurations.
 
 ## Advanced: where settings are stored
 
@@ -528,7 +533,7 @@ shortcut). They live in
 
 Saved `mode` values describe behavior: `"whole"`, `"pauses"`, or `"live"`.
 Saved `model` values select the engine: `"standard"` (Parakeet; retained for
-compatibility), `"fluid"`, `"whisper"`, `"nemotron"`, or `"moonshine"`.
+compatibility), `"fluid"`, `"fluid-pro"`, `"whisper"`, `"nemotron"`, or `"moonshine"`.
 For example:
 
 ```toml
@@ -554,7 +559,7 @@ dictation reloads the model in a few seconds; your speech is recorded
 meanwhile and typed once it has loaded.
 
 Nemotron uses `mode = "live"` and `model = "nemotron"`. Streaming selections
-also retain `batch_model` (standard, fluid, or whisper), the last Whole/Pauses
+also retain `batch_model` (standard, fluid, fluid-pro, or whisper), the last Whole/Pauses
 model used for startup fallback and the batch-only `listen` / unflagged
 `transcribe` commands. Use `transcribe --live` or `--moonshine` to explicitly
 transcribe a file with a streaming model.
@@ -626,8 +631,9 @@ Speech recognition uses NVIDIA Parakeet TDT 0.6B v2 (English), released under
 CC-BY-4.0, using the int8 ONNX export by istupakov. The optional Fluid Speech
 Mini model is by FluidVoice, released under CC BY 4.0, built on NVIDIA
 Parakeet TDT 0.6B v3 and Moondream Parakeet Ultra; `dictate download --fluid`
-fetches its ONNX export (about 300 MB). Pause segmentation (pauses mode) uses
-Silero VAD v6, released under MIT; `dictate download` fetches it too (2.3 MB,
+fetches its ONNX export (about 300 MB). Fluid Speech Pro is also from
+FluidVoice and licensed under CC BY 4.0. It uses the INT8 ONNX export.
+Pause segmentation (pauses mode) uses Silero VAD v6, released under MIT; `dictate download` fetches it too (2.3 MB,
 next to the speech model). Live can use NVIDIA Nemotron streaming 0.6B
 (English), int8 ONNX, fetched by `dictate download --live` (about 900 MB, next
 to the speech model).

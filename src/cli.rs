@@ -22,9 +22,11 @@ pub(crate) enum Action<'a> {
 
 pub(crate) fn command_usage(command: &str) -> Option<&'static str> {
     Some(match command {
-        "download" => "Usage: dictate download [--live | --fluid | --whisper | --moonshine]",
+        "download" => {
+            "Usage: dictate download [--live | --fluid | --fluid-pro | --whisper | --moonshine]"
+        }
         "transcribe" => {
-            "Usage: dictate transcribe [--live | --fluid | --whisper | --moonshine] [--segmented] [--format txt|json|srt|vtt] [-o FILE | --output FILE] <path | ->\nFormats: WAV, MP3, AAC-LC/M4A, FLAC, OGG/Vorbis, audio in MP4/MOV/MKV/WebM. Opus is not supported. Stdin (-) is spooled to disk.\nLong files use pause segmentation; --segmented also segments short clips. Whisper/Live/Moonshine use segment timestamps. Output files are saved atomically; input cannot be overwritten."
+            "Usage: dictate transcribe [--live | --fluid | --fluid-pro | --whisper | --moonshine] [--segmented] [--format txt|json|srt|vtt] [-o FILE | --output FILE] <path | ->\nFormats: WAV, MP3, AAC-LC/M4A, FLAC, OGG/Vorbis, audio in MP4/MOV/MKV/WebM. Opus is not supported. Stdin (-) is spooled to disk.\nLong files use pause segmentation; --segmented also segments short clips. Whisper/Live/Moonshine use segment timestamps. Output files are saved atomically; input cannot be overwritten."
         }
         "serve" => crate::server::USAGE,
         "listen" => "Usage: dictate listen",
@@ -51,7 +53,10 @@ pub(crate) fn command_usage(command: &str) -> Option<&'static str> {
 }
 
 fn model_flag(flag: &str) -> bool {
-    matches!(flag, "--live" | "--fluid" | "--whisper" | "--moonshine")
+    matches!(
+        flag,
+        "--live" | "--fluid" | "--fluid-pro" | "--whisper" | "--moonshine"
+    )
 }
 
 pub(crate) fn parse(args: &[String]) -> Result<Action<'_>, UsageError> {

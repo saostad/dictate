@@ -83,6 +83,12 @@ const MODELS: &[Model] = &[
         flag: " --fluid",
     },
     Model {
+        id: "fluid-speech-pro",
+        engine: "fluid-pro",
+        label: "Fluid Speech Pro",
+        flag: " --fluid-pro",
+    },
+    Model {
         id: "nemotron-streaming-en",
         engine: "nemotron",
         label: "Nemotron Streaming English",
@@ -101,6 +107,7 @@ fn installed(m: &Model) -> bool {
         "standard" => model_dir_checked(),
         "whisper" => whisper_model_dir_checked(),
         "fluid" => fluid_model_dir_checked(),
+        "fluid-pro" => fluid_pro_model_dir_checked(),
         "nemotron" => live_model_dir_checked(),
         _ => moonshine_model_dir_checked().and_then(|dir| {
             check_moonshine_runtime()?;
@@ -115,6 +122,7 @@ fn model_dir(m: &Model) -> anyhow::Result<std::path::PathBuf> {
         "standard" => model_dir(),
         "whisper" => whisper_model_dir(),
         "fluid" => fluid_model_dir(),
+        "fluid-pro" => fluid_pro_model_dir(),
         "nemotron" => live_model_dir(),
         _ => moonshine_model_dir(),
     }

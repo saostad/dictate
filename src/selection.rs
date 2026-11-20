@@ -33,12 +33,14 @@ pub(crate) enum ModelChoice {
     Whisper,
     Nemotron,
     Moonshine,
+    FluidPro,
 }
 impl ModelChoice {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Parakeet => "standard",
             Self::Fluid => "fluid",
+            Self::FluidPro => "fluid-pro",
             Self::Whisper => "whisper",
             Self::Nemotron => "nemotron",
             Self::Moonshine => "moonshine",
@@ -48,6 +50,7 @@ impl ModelChoice {
         match self {
             Self::Parakeet => SpeechModel::Standard.display_name(),
             Self::Fluid => SpeechModel::Fluid.display_name(),
+            Self::FluidPro => SpeechModel::FluidPro.display_name(),
             Self::Whisper => SpeechModel::Whisper.display_name(),
             Self::Nemotron => "Nemotron Streaming",
             Self::Moonshine => "Moonshine Tiny Streaming",
@@ -57,6 +60,7 @@ impl ModelChoice {
         match value {
             "standard" | "parakeet" => Some(Self::Parakeet),
             "fluid" => Some(Self::Fluid),
+            "fluid-pro" => Some(Self::FluidPro),
             "whisper" => Some(Self::Whisper),
             "nemotron" => Some(Self::Nemotron),
             "moonshine" => Some(Self::Moonshine),
@@ -67,6 +71,7 @@ impl ModelChoice {
         match self {
             Self::Parakeet => Some(SpeechModel::Standard),
             Self::Fluid => Some(SpeechModel::Fluid),
+            Self::FluidPro => Some(SpeechModel::FluidPro),
             Self::Whisper => Some(SpeechModel::Whisper),
             Self::Nemotron | Self::Moonshine => None,
         }
@@ -127,6 +132,7 @@ impl Selection {
             _ => match batch {
                 SpeechModel::Standard => ModelChoice::Parakeet,
                 SpeechModel::Fluid => ModelChoice::Fluid,
+                SpeechModel::FluidPro => ModelChoice::FluidPro,
                 SpeechModel::Whisper => ModelChoice::Whisper,
             },
         };
@@ -163,6 +169,7 @@ mod tests {
         for model in [
             ModelChoice::Parakeet,
             ModelChoice::Fluid,
+            ModelChoice::FluidPro,
             ModelChoice::Whisper,
             ModelChoice::Nemotron,
             ModelChoice::Moonshine,

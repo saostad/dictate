@@ -133,7 +133,7 @@ class MatrixTests(unittest.TestCase):
         configs = bm.config_matrix(list(bm.THREAD_MATRIX))
         engines = {config["engine"] for config in configs}
         self.assertEqual(engines, set(bm.THREAD_MATRIX))
-        self.assertEqual(len(configs), 14)
+        self.assertEqual(len(configs), 17)
         moonshine = [config for config in configs if config["engine"] == "moonshine"]
         self.assertEqual({config["threads"] for config in moonshine}, {"1", "runtime-default"})
         self.assertNotIn("2", {config["threads"] for config in moonshine})

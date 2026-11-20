@@ -4,7 +4,7 @@
 //! lines, `key = true|false` and `key = "string"`. Keys are `sounds` and
 //! `notifications` (bool, default true), `mode`
 //! (`"whole"`/`"pauses"`/`"live"`, default `"whole"`), `model`
-//! (`"standard"`/`"fluid"`/`"whisper"`/`"nemotron"`/`"moonshine"`), `hotkey`
+//! (`"standard"`/`"fluid"`/`"fluid-pro"`/`"whisper"`/`"nemotron"`/`"moonshine"`), `hotkey`
 //! (string, default `Ctrl+Shift+Space`), `microphone` (string, default `""` =
 //! the system default input) and `inference_threads` (`"auto"`, `"1"` or
 //! `"2"`, default `"auto"`) and `unload_after` (`"never"`, `"5"`, `"20"`,
@@ -110,6 +110,8 @@ pub(crate) enum SpeechModel {
     Fluid,
     /// Whisper Tiny English (whisper.cpp, English-only, greedy).
     Whisper,
+    /// Fluid Speech Pro: multilingual Parakeet TDT.
+    FluidPro,
 }
 
 impl SpeechModel {
@@ -118,6 +120,7 @@ impl SpeechModel {
         match self {
             SpeechModel::Standard => "standard",
             SpeechModel::Fluid => "fluid",
+            SpeechModel::FluidPro => "fluid-pro",
             SpeechModel::Whisper => "whisper",
         }
     }
@@ -127,6 +130,7 @@ impl SpeechModel {
         match self {
             SpeechModel::Standard => "Parakeet TDT 0.6B v2",
             SpeechModel::Fluid => "Fluid Speech Mini",
+            SpeechModel::FluidPro => "Fluid Speech Pro",
             SpeechModel::Whisper => "Whisper Tiny English",
         }
     }
@@ -136,6 +140,7 @@ impl SpeechModel {
         match value {
             "standard" => Some(SpeechModel::Standard),
             "fluid" => Some(SpeechModel::Fluid),
+            "fluid-pro" => Some(SpeechModel::FluidPro),
             "whisper" => Some(SpeechModel::Whisper),
             _ => None,
         }
@@ -145,6 +150,7 @@ impl SpeechModel {
         match value {
             1 => SpeechModel::Fluid,
             2 => SpeechModel::Whisper,
+            3 => SpeechModel::FluidPro,
             _ => SpeechModel::Standard,
         }
     }
@@ -518,7 +524,7 @@ pub(crate) fn refresh_selection(file_mode: Mode, file_model: SpeechModel) {
         && ModelChoice::parse(value).is_none()
     {
         eprintln!(
-            "warning: invalid DICTATE_SPEECH_MODEL {value:?}: expected standard, fluid, whisper, nemotron or moonshine"
+            "warning: invalid DICTATE_SPEECH_MODEL {value:?}: expected standard, fluid, fluid-pro, whisper, nemotron or moonshine"
         );
     }
     let (mode, model) = resolve_selection(
@@ -756,7 +762,7 @@ pub(crate) fn parse(text: &str) -> Result<Settings, String> {
                 })?;
                 chosen_model = Some(ModelChoice::parse(&parsed).ok_or_else(|| {
                     format!(
-                        "config.toml line {line_number}: invalid value for \"model\": expected \"standard\", \"fluid\" or \"whisper\" (Whole/Pauses), or \"nemotron\" / \"moonshine\" (Live)"
+                        "config.toml line {line_number}: invalid value for \"model\": expected \"standard\", \"fluid\" or \"whisper\" or \"fluid-pro\" (Whole/Pauses), or \"nemotron\" / \"moonshine\" (Live)"
                     )
                 })?);
             }
@@ -764,7 +770,7 @@ pub(crate) fn parse(text: &str) -> Result<Settings, String> {
                 let parsed = parse_string(value).map_err(|problem| {
                     format!("config.toml line {line_number}: invalid batch_model: {problem}")
                 })?;
-                batch_model = Some(SpeechModel::parse(&parsed).ok_or_else(|| format!("config.toml line {line_number}: batch_model must be standard, fluid or whisper"))?);
+                batch_model = Some(SpeechModel::parse(&parsed).ok_or_else(|| format!("config.toml line {line_number}: batch_model must be standard, fluid, fluid-pro or whisper"))?);
             }
             "inference_threads" => {
                 let parsed = parse_string(value).map_err(|problem| {
@@ -883,7 +889,7 @@ fn escape(value: &str) -> String {
 fn render(settings: &Settings) -> String {
     let selection = Selection::from_settings(settings);
     let mut text = format!(
-        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Dictation mode: \"whole\" (type once at stop), \"pauses\" (type at pauses), or \"live\" (stream while speaking).\nmode = \"{}\"\n# Speech model for whole/pauses: \"standard\" (Parakeet), \"fluid\" or \"whisper\". Live: \"nemotron\" or \"moonshine\".\nmodel = \"{}\"\n# Inference threads: \"auto\" (Whisper up to 2, Moonshine single-thread), \"1\" or \"2\" (Moonshine 2 = default threading, not exactly 2). Restart the daemon after changing it.\ninference_threads = \"{}\"\n# Free the speech model's memory after this many idle minutes: \"never\", \"5\", \"20\" (default), \"30\" or \"60\". The next recording reloads it.\nunload_after = \"{}\"\n# Global hotkey: tap to toggle, hold to talk. macOS names: Cmd, Option, Ctrl, Shift (e.g. Cmd+Option+Space); modifier-only shortcuts (at least two modifiers, macOS only, need Input Monitoring; pressing another key cancels).\nhotkey = \"{}\"\n# Microphone: \"\" means the system default input, or a device id (see \"dictate mics\").\nmicrophone = \"{}\"\n",
+        "# Play a short tone when recording starts and stops.\nsounds = {}\n# Show desktop notifications for errors and empty recordings.\nnotifications = {}\n# Dictation mode: \"whole\" (type once at stop), \"pauses\" (type at pauses), or \"live\" (stream while speaking).\nmode = \"{}\"\n# Speech model for whole/pauses: \"standard\" (Parakeet), \"fluid\", \"fluid-pro\" or \"whisper\". Live: \"nemotron\" or \"moonshine\".\nmodel = \"{}\"\n# Inference threads: \"auto\" (Whisper up to 2, Moonshine single-thread), \"1\" or \"2\" (Moonshine 2 = default threading, not exactly 2). Restart the daemon after changing it.\ninference_threads = \"{}\"\n# Free the speech model's memory after this many idle minutes: \"never\", \"5\", \"20\" (default), \"30\" or \"60\". The next recording reloads it.\nunload_after = \"{}\"\n# Global hotkey: tap to toggle, hold to talk. macOS names: Cmd, Option, Ctrl, Shift (e.g. Cmd+Option+Space); modifier-only shortcuts (at least two modifiers, macOS only, need Input Monitoring; pressing another key cancels).\nhotkey = \"{}\"\n# Microphone: \"\" means the system default input, or a device id (see \"dictate mics\").\nmicrophone = \"{}\"\n",
         settings.sounds,
         settings.notifications,
         selection.mode.as_str(),
@@ -1275,6 +1281,7 @@ mod tests {
                 SpeechModel::Standard,
                 SpeechModel::Fluid,
                 SpeechModel::Whisper,
+                SpeechModel::FluidPro,
             ] {
                 let settings = Settings {
                     mode,

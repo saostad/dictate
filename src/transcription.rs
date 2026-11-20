@@ -26,7 +26,7 @@ impl<'a> Options<'a> {
         let mut args = args.iter();
         while let Some(arg) = args.next() {
             match arg.as_str() {
-                "--fluid" | "--whisper" | "--live" | "--moonshine" => {
+                "--fluid" | "--fluid-pro" | "--whisper" | "--live" | "--moonshine" => {
                     if options.engine.replace(arg.as_str()).is_some() {
                         return Err(bad());
                     }
@@ -169,6 +169,10 @@ impl Engine {
             }
             "fluid" => Self::Batch(
                 asr::Asr::load_fluid(&model::fluid_model_dir_checked()?)?,
+                true,
+            ),
+            "fluid-pro" => Self::Batch(
+                asr::Asr::load(&model::fluid_pro_model_dir_checked()?)?,
                 true,
             ),
             "whisper" => Self::Batch(

@@ -37,6 +37,17 @@ const FLUID_FILES: &[(&str, u64)] = &[
     ("mel_filters.npy", 131_712),
     ("tokenizer.json", 1_159_959),
 ];
+const FLUID_PRO_REVISION: &str = "fa588e9f87f1b9ad0ca2e2d8f7eaf84dc3803581";
+const FLUID_PRO_BASE_URL: &str =
+    "https://huggingface.co/FluidVoice-Labs/fluid-speech-pro-onnx/resolve";
+const FLUID_PRO_FILES: &[(&str, u64)] = &[
+    ("encoder-model.int8.onnx", 955_592),
+    ("encoder-model.int8.onnx.data", 745_971_712),
+    ("decoder_joint-model.int8.onnx", 8_586),
+    ("decoder_joint-model.int8.onnx.data", 53_817_344),
+    ("vocab.txt", 93_939),
+];
+
 const VAD_URL: &str = "https://github.com/snakers4/silero-vad/raw/1e261b036686cd0017d500ee96acd1c4ba572a9d/src/silero_vad/data/silero_vad.onnx";
 const VAD_DIR_NAME: &str = "silero-vad-v6";
 const VAD_FILE_NAME: &str = "silero_vad.onnx";
@@ -452,6 +463,47 @@ pub fn download_fluid() -> anyhow::Result<()> {
     let dir = fluid_model_dir()?;
     eprintln!("Fluid Speech Mini ready in {}", dir.display());
     Ok(())
+}
+
+pub fn fluid_pro_model_dir() -> anyhow::Result<PathBuf> {
+    Ok(sibling_dir_for(&model_dir()?, "fluid-speech-pro-onnx"))
+}
+
+pub fn fluid_pro_model_dir_checked() -> anyhow::Result<PathBuf> {
+    let dir = fluid_pro_model_dir()?;
+    for (name, size) in FLUID_PRO_FILES {
+        anyhow::ensure!(
+            dir.join(name)
+                .metadata()
+                .is_ok_and(|metadata| metadata.is_file() && metadata.len() == *size),
+            "Model file {name} is missing or incomplete in {}. Run \"dictate download --fluid-pro\".",
+            dir.display()
+        );
+    }
+    Ok(dir)
+}
+
+pub fn download_fluid_pro() -> anyhow::Result<()> {
+    download_fluid_pro_files_with_progress(|_, _| {})?;
+    eprintln!(
+        "Fluid Speech Pro ready in {}",
+        fluid_pro_model_dir()?.display()
+    );
+    Ok(())
+}
+
+pub fn download_fluid_pro_files_with_progress<F>(progress: F) -> anyhow::Result<()>
+where
+    F: FnMut(u64, u64),
+{
+    download_files_with_progress(
+        &fluid_pro_model_dir()?,
+        FLUID_PRO_BASE_URL,
+        FLUID_PRO_REVISION,
+        FLUID_PRO_FILES,
+        progress,
+    )?;
+    download_vad()
 }
 
 /// Download Whisper Tiny English plus the voice detector Pauses needs, without
@@ -1027,6 +1079,7 @@ pub(crate) fn download_size(engine: &str) -> u64 {
     match engine {
         "whisper" => WHISPER_FILE_SIZE,
         "fluid" => FLUID_FILES.iter().map(|(_, size)| size).sum(),
+        "fluid-pro" => FLUID_PRO_FILES.iter().map(|(_, size)| size).sum(),
         "nemotron" => LIVE_FILES.iter().map(|(_, size)| size).sum(),
         "moonshine" => MOONSHINE_FILES.iter().map(|(_, size, _)| size).sum(),
         _ => 0,

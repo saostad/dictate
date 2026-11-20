@@ -41,6 +41,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 ENGINE_LABELS = {
     "standard": "Parakeet TDT 0.6B v2 int8",
     "fluid": "Fluid Speech Mini int8",
+    "fluid-pro": "Fluid Speech Pro int8",
     "whisper": "Whisper Tiny English Q8_0 (whisper.cpp)",
     "live": "Nemotron streaming en 0.6B int8",
     "moonshine": "Moonshine Tiny Streaming (native C)",
@@ -51,6 +52,7 @@ ENGINE_LABELS = {
 THREAD_MATRIX = {
     "standard": ["default", "1", "2"],
     "fluid": ["default", "1", "2"],
+    "fluid-pro": ["default", "1", "2"],
     "whisper": ["default", "1", "2"],
     "live": ["default", "1", "2"],
     "moonshine": ["1", "runtime-default"],
@@ -59,6 +61,7 @@ THREAD_MATRIX = {
 ENGINE_MODEL_DIRS = {
     "standard": ["parakeet-tdt-0.6b-v2-int8"],
     "fluid": ["fluid-speech-mini-onnx"],
+    "fluid-pro": ["fluid-speech-pro-onnx"],
     "whisper": ["whisper-tiny-en"],
     "live": ["nemotron-streaming-en-0.6b-int8"],
     "moonshine": ["moonshine-tiny-streaming-en", "moonshine-runtime-0.1.5"],
@@ -69,6 +72,7 @@ VAD_MODEL_DIR = "silero-vad-v6"
 PUBLIC_MODEL_DIRS = [
     "parakeet-tdt-0.6b-v2-int8",
     "fluid-speech-mini-onnx",
+    "fluid-speech-pro-onnx",
     "whisper-tiny-en",
     "nemotron-streaming-en-0.6b-int8",
     "moonshine-tiny-streaming-en",
@@ -557,7 +561,7 @@ def required_model_dirs(engines: Sequence[str]) -> list[str]:
         for name in ENGINE_MODEL_DIRS[engine]:
             if name not in required:
                 required.append(name)
-    if any(engine in {"standard", "fluid", "whisper"} for engine in engines):
+    if any(engine in {"standard", "fluid", "fluid-pro", "whisper"} for engine in engines):
         if VAD_MODEL_DIR not in required:
             required.append(VAD_MODEL_DIR)
     return required
@@ -2186,7 +2190,7 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     parser.add_argument("--paced-runs", type=int, default=3, help="real-time JFK runs for Live/Moonshine (default 3)")
     parser.add_argument("--quick", action="store_true", help="one JFK run, one paced run, first two corpus clips")
     parser.add_argument("--timeout", type=float, default=2400.0, help="seconds allowed per config (default 2400)")
-    parser.add_argument("--engines", help="comma-separated subset: standard,fluid,whisper,live,moonshine")
+    parser.add_argument("--engines", help="comma-separated subset: standard,fluid,fluid-pro,whisper,live,moonshine")
     parser.add_argument("--threads", help="comma-separated subset: default,1,2,runtime-default")
     parser.add_argument("--sandbox", type=Path, help="optional executable or .py libseccomp/no-network wrapper")
     parser.add_argument("--no-model-hash", action="store_true", help="record model sizes but skip SHA-256 hashing")
@@ -2203,7 +2207,9 @@ def parse_args(argv: Sequence[str]) -> argparse.Namespace:
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
 
-    engines = parse_csv_list(args.engines) or list(THREAD_MATRIX)
+    engines = parse_csv_list(args.engines) or [
+        engine for engine in THREAD_MATRIX if engine != "fluid-pro"
+    ]
     unknown = [engine for engine in engines if engine not in THREAD_MATRIX]
     if unknown:
         parser.error(f"unknown engine(s): {', '.join(unknown)}")

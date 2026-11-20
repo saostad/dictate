@@ -6,6 +6,7 @@
 | --- | --- | --- |
 | `standard` | Parakeet TDT 0.6B v2 int8 | `Asr::transcribe` / segment decode |
 | `fluid` | Fluid Speech Mini int8 | `Asr::transcribe` / segment decode |
+| `fluid-pro` | Fluid Speech Pro INT8 ONNX | `Asr::transcribe` / segment decode |
 | `whisper` | Whisper Tiny English Q8_0 (whisper.cpp) | `Asr::transcribe` / segment decode |
 | `live` | Nemotron streaming en 0.6B int8 | `Live::reset` + `transcribe_chunk` + 3 zero flushes |
 | `moonshine` | Moonshine Tiny Streaming (native C) | `Moonshine::Session` feed/finish/cancel |
@@ -30,6 +31,7 @@ for results, recommendations, raw transcripts and statistics for all five engine
   models root:
   - `parakeet-tdt-0.6b-v2-int8`
   - `fluid-speech-mini-onnx`
+  - `fluid-speech-pro-onnx` (when benchmarking Fluid Speech Pro)
   - `whisper-tiny-en`
   - `nemotron-streaming-en-0.6b-int8`
   - `moonshine-tiny-streaming-en`
@@ -93,7 +95,7 @@ The `args` value is the remaining argument iterator after the command name.
 `benchmark::run` takes `impl Iterator<Item = String>`. `dictate help` lists:
 
 ```text
-dictate benchmark --engine <standard|fluid|whisper|live|moonshine> [options]
+dictate benchmark --engine <standard|fluid|fluid-pro|whisper|live|moonshine> [options]
 ```
 
 Then build:
@@ -129,6 +131,9 @@ python3 scripts/benchmark-models.py \
   --quick \
   --output benchmark-results/quick
 ```
+
+Pass `--engines fluid-pro` to include the optional Fluid Speech Pro model.
+The default matrix uses the original five engines.
 
 Useful filters:
 

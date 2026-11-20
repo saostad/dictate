@@ -2715,6 +2715,7 @@ fn switch_needs_download(target: SwitchTarget) -> bool {
     let model_missing = match target.model {
         ModelChoice::Parakeet => crate::model::model_dir_checked().is_err(),
         ModelChoice::Fluid => crate::model::fluid_model_dir_checked().is_err(),
+        ModelChoice::FluidPro => crate::model::fluid_pro_model_dir_checked().is_err(),
         ModelChoice::Whisper => crate::model::whisper_model_dir_checked().is_err(),
         ModelChoice::Nemotron => crate::model::live_model_dir_checked().is_err(),
         ModelChoice::Moonshine => crate::model::check_moonshine_ready().is_err(),
@@ -2797,6 +2798,9 @@ fn download_for_switch(
         }
         ModelChoice::Fluid => crate::model::download_fluid_files_with_progress(&mut on_progress)
             .and_then(|()| crate::model::download_vad()),
+        ModelChoice::FluidPro => {
+            crate::model::download_fluid_pro_files_with_progress(&mut on_progress)
+        }
         ModelChoice::Whisper => {
             crate::model::download_whisper_files_with_progress(&mut on_progress)
         }
@@ -2857,6 +2861,9 @@ fn load_asr_for_switch(model: crate::config::SpeechModel) -> Result<crate::asr::
         }
         crate::config::SpeechModel::Fluid => crate::model::fluid_model_dir_checked()
             .and_then(|dir| crate::asr::Asr::load_fluid(&dir)),
+        crate::config::SpeechModel::FluidPro => {
+            crate::model::fluid_pro_model_dir_checked().and_then(|dir| crate::asr::Asr::load(&dir))
+        }
         crate::config::SpeechModel::Whisper => crate::model::whisper_model_dir_checked()
             .and_then(|dir| crate::asr::Asr::load_whisper(&dir)),
     };

@@ -441,6 +441,7 @@ impl Asr {
         match crate::config::speech_model() {
             SpeechModel::Standard => Self::load(&crate::model::model_dir_checked()?),
             SpeechModel::Fluid => Self::load_fluid(&crate::model::fluid_model_dir_checked()?),
+            SpeechModel::FluidPro => Self::load(&crate::model::fluid_pro_model_dir_checked()?),
             SpeechModel::Whisper => Self::load_whisper(&crate::model::whisper_model_dir_checked()?),
         }
     }
