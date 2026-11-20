@@ -204,16 +204,19 @@ jobs:
         if: matrix.asset == 'dictate-linux-x86_64'
         run: |
           set -eu
-          URL="https://github.com/microsoft/onnxruntime/releases/download/v1.31.0/onnxruntime-linux-x64-1.31.0.tgz"
-          EXPECTED="cc5c72baf5ae5c8238a6841f0897227be2d02826b9cf98eaf02fdefaeeb03a57"
-          curl -fsSL -o /tmp/ort.tgz "$URL"
-          ACTUAL="$(shasum -a 256 /tmp/ort.tgz | awk '{print $1}')"
+          # Microsoft's official NuGet package. The GitHub release tarball
+          # went away when microsoft/onnxruntime was removed from GitHub
+          # (2026-11-18); the package carries the same CPU build.
+          URL="https://api.nuget.org/v3-flatcontainer/microsoft.ml.onnxruntime/1.31.0/microsoft.ml.onnxruntime.1.31.0.nupkg"
+          EXPECTED="7e35fdb4f5adb62f01e60798e2e5ed05108f5fbbe1cca03fbcc37903cf7c5e3b"
+          curl -fsSL -o /tmp/ort.nupkg "$URL"
+          ACTUAL="$(shasum -a 256 /tmp/ort.nupkg | awk '{print $1}')"
           if [ "$ACTUAL" != "$EXPECTED" ]; then
             echo "SHA256 mismatch for $URL: expected $EXPECTED, got $ACTUAL"
             exit 1
           fi
           mkdir -p /tmp/ort
-          tar -xzf /tmp/ort.tgz -C /tmp/ort
+          unzip -q /tmp/ort.nupkg runtimes/linux-x64/native/libonnxruntime.so LICENSE -d /tmp/ort
       - name: Use whisper-rs-sys's bundled bindings (macOS)
         # The checked-in bindings were generated on 64-bit Linux without
         # Vulkan. Windows (MSVC ABI: c_long is 4 bytes) and Linux (the Vulkan
@@ -309,9 +312,9 @@ jobs:
             echo "  (none)"
           fi
           if [ "$ASSET" = "dictate-linux-x86_64" ]; then
-            cp /tmp/ort/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so.1.31.0 "$ASSET/libonnxruntime.so"
-            cp /tmp/ort/onnxruntime-linux-x64-1.31.0/LICENSE "$ASSET/LICENSE-onnxruntime"
-            echo "  libonnxruntime.so (from Microsoft onnxruntime-linux-x64-1.31.0)"
+            cp /tmp/ort/runtimes/linux-x64/native/libonnxruntime.so "$ASSET/libonnxruntime.so"
+            cp /tmp/ort/LICENSE "$ASSET/LICENSE-onnxruntime"
+            echo "  libonnxruntime.so (from Microsoft.ML.OnnxRuntime 1.31.0, NuGet)"
             echo "  LICENSE-onnxruntime (MIT, Microsoft)"
           fi
           tar -czf "$ASSET.tar.gz" "$ASSET"
@@ -417,7 +420,7 @@ jobs:
         run: |
           set -eu
           if [ "${{ matrix.asset }}" = "dictate-linux-x86_64" ]; then
-            export ORT_DYLIB_PATH=/tmp/ort/onnxruntime-linux-x64-1.31.0/lib/libonnxruntime.so.1.31.0
+            export ORT_DYLIB_PATH=/tmp/ort/runtimes/linux-x64/native/libonnxruntime.so
           fi
           BIN=./target/${{ matrix.target }}/release/dictate
           PYTHON=python3
